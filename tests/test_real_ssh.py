@@ -1,0 +1,669 @@
+from io import BytesIO
+import os
+from pathlib import Path
+import pty
+import select
+import signal
+import subprocess
+import termios
+import threading
+import time
+import tty
+import unittest
+
+from tmuxgate.real_ssh import (
+    DetachedTmuxViewerProcess,
+    SecretPromptPresenter,
+    SshChannelRunner,
+    SubprocessMasterBackend,
+    _discard_pending_terminal_input,
+    secret_prompt_signature,
+)
+from tmuxgate.transport import SshInvocation, TransportError
+
+
+class FakeTerminal(BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def fileno(self):
+        return 99
+
+
+class FlagLock:
+    def __init__(self):
+        self.held = False
+
+    def __enter__(self):
+        if self.held:
+            raise AssertionError("terminal lock was entered recursively")
+        self.held = True
+        return self
+
+    def __exit__(self, *args):
+        self.held = False
+
+
+class FakeAttachProcess:
+    def __init__(self):
+        self.returncode = None
+        self.terminate_count = 0
+        self.kill_count = 0
+        self.wait_count = 0
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.wait_count += 1
+        if self.returncode is None:
+            raise TimeoutError("fake viewer was not detached")
+        return self.returncode
+
+    def terminate(self):
+        self.terminate_count += 1
+        self.returncode = -15
+
+    def kill(self):
+        self.kill_count += 1
+        self.returncode = -9
+
+
+class ScriptedDetachedViewer(DetachedTmuxViewerProcess):
+    def __init__(self, request_suffix):
+        super().__init__(
+            lambda *args, **kwargs: None,
+            Path(f"/tmp/{request_suffix}.sock"),
+            f"tmuxgate-{request_suffix}",
+        )
+        self.prompt = b"[sudo] password for operator:\n"
+        self.process = None
+        self.detached = threading.Event()
+        self.detach_count = 0
+
+    @property
+    def attached(self):
+        return True
+
+    def capture_pane(self):
+        return self.prompt
+
+    def capture_history(self):
+        return self.prompt
+
+    def prompt_signature(self):
+        return secret_prompt_signature(self.prompt)
+
+    def detach_client(self, client_tty):
+        if client_tty != "/dev/pts/test":
+            raise AssertionError("presenter detached the wrong terminal")
+        self.detach_count += 1
+        self.process.returncode = 0
+        self.detached.set()
+
+
+class RealSshProcessTests(unittest.TestCase):
+    def test_prompt_handoff_discards_only_preexisting_terminal_input(self):
+        child = os.fork()
+        if child == 0:
+            status = 1
+            master = slave = None
+            try:
+                os.setsid()
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                master, slave = pty.openpty()
+                tty.setraw(slave)
+                terminal_path = os.ttyname(slave)
+                with open(terminal_path, "r+b", buffering=0) as terminal:
+                    os.write(master, b"stale-enter\n")
+                    if not select.select([slave], [], [], 1)[0]:
+                        status = 2
+                    else:
+                        _discard_pending_terminal_input(terminal, terminal_path)
+                        if select.select([slave], [], [], 0.05)[0]:
+                            status = 3
+                        else:
+                            os.write(master, b"fresh-password")
+                            if not select.select([slave], [], [], 1)[0]:
+                                status = 4
+                            elif os.read(slave, 14) != b"fresh-password":
+                                status = 5
+                            else:
+                                status = 0
+            except BaseException:
+                status = 6
+            finally:
+                if slave is not None:
+                    os.close(slave)
+                if master is not None:
+                    os.close(master)
+                os._exit(status)
+
+        waited, status = os.waitpid(child, 0)
+        self.assertEqual(waited, child)
+        self.assertTrue(os.WIFEXITED(status), status)
+        self.assertEqual(os.WEXITSTATUS(status), 0)
+
+    def test_prompt_handoff_flush_failure_stops_before_attach(self):
+        viewer = ScriptedDetachedViewer("cccccccccccc")
+        attach_calls = []
+
+        def fail_flush(terminal, path):
+            raise TransportError("injected flush failure")
+
+        presenter = SecretPromptPresenter(
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=lambda *args, **kwargs: attach_calls.append((args, kwargs)),
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=fail_flush,
+        )
+        try:
+            with self.assertRaisesRegex(TransportError, "injected flush failure"):
+                presenter._present(viewer)
+            self.assertEqual(attach_calls, [])
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_stale_input_is_flushed_before_the_operator_notice(self):
+        events = []
+        viewer = ScriptedDetachedViewer("cdcdcdcdcdcd")
+
+        class OrderedTerminal(FakeTerminal):
+            def write(self, data):
+                events.append("notice")
+                return super().write(data)
+
+        def popen(argv, **kwargs):
+            events.append("attach")
+            process = FakeAttachProcess()
+            viewer.process = process
+            viewer.prompt = (
+                f"TMUXGATE_AUTH_COMPLETE={viewer.session_name}\n"
+            ).encode("ascii")
+            return process
+
+        presenter = SecretPromptPresenter(
+            terminal_opener=lambda *args, **kwargs: OrderedTerminal(),
+            popen=popen,
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: events.append("flush"),
+            poll_seconds=0.005,
+        )
+        try:
+            presenter._present(viewer)
+            self.assertEqual(events, ["flush", "notice", "attach"])
+            self.assertEqual(viewer.detach_count, 1)
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_secret_prompt_detection_uses_cursor_not_nested_tmux_status(self):
+        pane = (
+            b"remote_before=1785312103.646452555\n"
+            b"[sudo] password for operator:\n"
+            b"\n\n\n"
+            b"[DevWorkstation] tmu0:bash*  2026-07-29 11:01\n"
+        )
+        self.assertEqual(
+            secret_prompt_signature(pane, cursor_y=1),
+            b"[sudo] password for operator:",
+        )
+        self.assertIsNone(secret_prompt_signature(pane, cursor_y=2))
+
+    def test_secret_prompt_detection_uses_only_the_visible_tail(self):
+        self.assertEqual(
+            secret_prompt_signature(b"output\n[sudo] password for operator:   \n"),
+            b"[sudo] password for operator:",
+        )
+        self.assertEqual(
+            secret_prompt_signature(b"Enter passphrase for key '/tmp/id':"),
+            b"Enter passphrase for key '/tmp/id':",
+        )
+        self.assertIsNone(
+            secret_prompt_signature(b"password: historical\ncommand still running\n")
+        )
+
+    def test_secret_prompt_detection_accepts_only_bounded_pwfeedback(self):
+        prefix = b"[sudo] Password for operator: "
+        for feedback in (b"", b"*", b"***", b"**", b"*", b""):
+            with self.subTest(feedback=feedback):
+                self.assertEqual(
+                    secret_prompt_signature(prefix + feedback + b"   \n"),
+                    (prefix + feedback).rstrip(),
+                )
+        self.assertIsNotNone(
+            secret_prompt_signature(prefix + (b"*" * 256))
+        )
+        for rejected in (
+            b"*" * 257,
+            b"***x",
+            "\u2022\u2022\u2022".encode("utf-8"),
+            b"actual-password-text",
+        ):
+            with self.subTest(rejected=rejected):
+                self.assertIsNone(
+                    secret_prompt_signature(prefix + rejected)
+                )
+
+    def test_authentication_marker_uses_history_and_exact_session_line(self):
+        session_name = "tmuxgate-787878787878"
+        controls = []
+        visible = b"[sudo] password for operator:\n"
+        history = (
+            b"TMUXGATE_AUTH_COMPLETE=tmuxgate-999999999999\n"
+            b"prefix TMUXGATE_AUTH_COMPLETE=" + session_name.encode("ascii") + b"\n"
+            b"TMUXGATE_AUTH_COMPLETE=" + session_name.encode("ascii") + b" suffix\n"
+            b"TMUXGATE_AUTH_COMPLETE=" + session_name.encode("ascii") + b" \n"
+            b"TMUXGATE_AUTH_COMPLETE=" + session_name.encode("ascii") + b"\r\n"
+            + (b"later output\n" * 40)
+        )
+
+        def run(argv, **kwargs):
+            controls.append(argv)
+            output = history if argv[3:7] == ("capture-pane", "-p", "-S", "-") else visible
+            return subprocess.CompletedProcess(argv, 0, output, b"")
+
+        viewer = DetachedTmuxViewerProcess(
+            run, Path("/tmp/787878787878.sock"), session_name
+        )
+        self.assertEqual(viewer.capture_pane(), visible)
+        self.assertEqual(viewer.authentication_complete_count(), 1)
+        self.assertEqual(
+            controls,
+            [
+                (
+                    "/usr/bin/tmux", "-S", "/tmp/787878787878.sock",
+                    "capture-pane", "-p", "-t", session_name,
+                ),
+                (
+                    "/usr/bin/tmux", "-S", "/tmp/787878787878.sock",
+                    "capture-pane", "-p", "-S", "-", "-t", session_name,
+                ),
+            ],
+        )
+
+    def test_master_authentication_inherits_only_broker_terminal(self):
+        calls = []
+        terminal = FakeTerminal()
+        terminal_lock = FlagLock()
+
+        def run(argv, **kwargs):
+            self.assertTrue(terminal_lock.held)
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        backend = SubprocessMasterBackend(
+            runner=run,
+            terminal_opener=lambda *args, **kwargs: terminal,
+            terminal_lock=terminal_lock,
+        )
+        invocation = SshInvocation("start-master", ("/usr/bin/ssh",), True)
+        backend.start_master(invocation, Path("/tmp/master.sock"))
+        kwargs = calls[0][1]
+        self.assertIs(kwargs["stdin"], terminal)
+        self.assertIs(kwargs["stdout"], terminal)
+        self.assertIs(kwargs["stderr"], terminal)
+
+    def test_post_auth_batch_channel_cannot_prompt(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 7, b"out", b"err")
+
+        result = SshChannelRunner(runner=run).batch(
+            ("/usr/bin/ssh", "-o", "BatchMode=yes", "host", "true")
+        )
+        self.assertEqual((result.stdout, result.stderr, result.returncode), (b"out", b"err", 7))
+        self.assertNotIn("stdin", calls[0][1])
+        self.assertIs(calls[0][1]["stdout"], subprocess.PIPE)
+        self.assertIs(calls[0][1]["stderr"], subprocess.PIPE)
+
+    def test_parallel_secret_prompts_are_presented_one_at_a_time(self):
+        terminal = FakeTerminal()
+        viewers = {
+            "aaaaaaaaaaaa": ScriptedDetachedViewer("aaaaaaaaaaaa"),
+            "bbbbbbbbbbbb": ScriptedDetachedViewer("bbbbbbbbbbbb"),
+        }
+        started = []
+        handoffs = []
+        started_event = threading.Event()
+
+        def popen(argv, **kwargs):
+            suffix = argv[-1].removeprefix("tmuxgate-")
+            handoffs.append(("attach", suffix))
+            process = FakeAttachProcess()
+            viewers[suffix].process = process
+            started.append(suffix)
+            started_event.set()
+            return process
+
+        presenter = SecretPromptPresenter(
+            terminal_opener=lambda *args, **kwargs: terminal,
+            popen=popen,
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: handoffs.append(
+                ("flush", path)
+            ),
+            poll_seconds=0.01,
+        )
+        try:
+            presenter.watch(viewers["aaaaaaaaaaaa"])
+            presenter.watch(viewers["bbbbbbbbbbbb"])
+            self.assertTrue(started_event.wait(timeout=1))
+            time.sleep(0.05)
+            self.assertEqual(len(started), 1)
+
+            first = started[0]
+            viewers[first].prompt = (
+                f"TMUXGATE_AUTH_COMPLETE={viewers[first].session_name}\n"
+            ).encode("ascii")
+            self.assertTrue(viewers[first].detached.wait(timeout=1))
+            deadline = time.monotonic() + 1
+            while len(started) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(set(started), set(viewers))
+
+            second = next(name for name in viewers if name != first)
+            viewers[second].prompt = (
+                f"TMUXGATE_AUTH_COMPLETE={viewers[second].session_name}\n"
+            ).encode("ascii")
+            self.assertTrue(viewers[second].detached.wait(timeout=1))
+            self.assertEqual(
+                handoffs,
+                [
+                    ("flush", "/dev/pts/test"),
+                    ("attach", first),
+                    ("flush", "/dev/pts/test"),
+                    ("attach", second),
+                ],
+            )
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_pwfeedback_typing_and_backspace_keep_viewer_attached(self):
+        viewer = ScriptedDetachedViewer("dddddddddddd")
+        attached = threading.Event()
+
+        def popen(argv, **kwargs):
+            process = FakeAttachProcess()
+            viewer.process = process
+            attached.set()
+            return process
+
+        presenter = SecretPromptPresenter(
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=popen,
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: None,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer)
+            self.assertTrue(attached.wait(timeout=1))
+            for prompt in (
+                b"[sudo] password for operator: *\n",
+                b"[sudo] password for operator: ***\n",
+                b"[sudo] password for operator: **\n",
+                b"[sudo] password for operator: *\n",
+                b"[sudo] password for operator:\n",
+            ):
+                viewer.prompt = prompt
+                time.sleep(0.08)
+                self.assertFalse(viewer.detached.is_set(), prompt)
+
+            viewer.prompt = (
+                f"TMUXGATE_AUTH_COMPLETE={viewer.session_name}\n"
+            ).encode("ascii")
+            self.assertTrue(viewer.detached.wait(timeout=1))
+            self.assertEqual(viewer.detach_count, 1)
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_wrong_password_retry_reuses_the_same_attachment(self):
+        cases = (
+            (
+                "sudo",
+                b"[sudo] password for operator: **\n",
+                b"Sorry, try again.\n",
+                b"[sudo] password for operator:\n",
+            ),
+            (
+                "openssh",
+                b"operator@example's password:\n",
+                b"Permission denied, please try again.\n",
+                b"operator@example's password:\n",
+            ),
+        )
+        for label, initial, rejection, retry in cases:
+            with self.subTest(label=label):
+                viewer = ScriptedDetachedViewer(
+                    "eeeeeeeeeeee" if label == "sudo" else "ffffffffffff"
+                )
+                viewer.prompt = initial
+                attach_count = 0
+                attached = threading.Event()
+
+                def popen(argv, **kwargs):
+                    nonlocal attach_count
+                    attach_count += 1
+                    process = FakeAttachProcess()
+                    viewer.process = process
+                    attached.set()
+                    return process
+
+                presenter = SecretPromptPresenter(
+                    terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+                    popen=popen,
+                    terminal_path_resolver=lambda: "/dev/pts/test",
+                    terminal_input_flusher=lambda terminal, path: None,
+                    poll_seconds=0.005,
+                )
+                try:
+                    presenter.watch(viewer)
+                    self.assertTrue(attached.wait(timeout=1))
+                    viewer.prompt = rejection
+                    time.sleep(0.12)
+                    self.assertFalse(viewer.detached.is_set())
+                    viewer.prompt = retry
+                    time.sleep(0.12)
+                    self.assertFalse(viewer.detached.is_set())
+                    self.assertEqual(attach_count, 1)
+
+                    viewer.prompt = (
+                        f"TMUXGATE_AUTH_COMPLETE={viewer.session_name}\n"
+                    ).encode("ascii")
+                    self.assertTrue(viewer.detached.wait(timeout=1))
+                    self.assertEqual(viewer.detach_count, 1)
+                    self.assertEqual(attach_count, 1)
+                finally:
+                    self.assertTrue(presenter.close())
+
+    def test_non_prompt_output_waits_for_an_exact_completion_marker(self):
+        viewer = ScriptedDetachedViewer("121212121212")
+        attached = threading.Event()
+
+        def popen(argv, **kwargs):
+            process = FakeAttachProcess()
+            viewer.process = process
+            attached.set()
+            return process
+
+        presenter = SecretPromptPresenter(
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=popen,
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: None,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer)
+            self.assertTrue(attached.wait(timeout=1))
+            for sequence in range(6):
+                viewer.prompt = f"ordinary output {sequence}\n".encode("ascii")
+                time.sleep(0.04)
+                self.assertFalse(viewer.detached.is_set())
+
+            viewer.prompt = (
+                f"TMUXGATE_AUTH_COMPLETE={viewer.session_name}\n"
+            ).encode("ascii")
+            self.assertTrue(viewer.detached.wait(timeout=1))
+            self.assertEqual(viewer.detach_count, 1)
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_old_completion_marker_cannot_satisfy_a_later_prompt(self):
+        viewer = ScriptedDetachedViewer("565656565656")
+        marker = (
+            f"TMUXGATE_AUTH_COMPLETE={viewer.session_name}\n"
+        ).encode("ascii")
+        viewer.prompt = marker + b"[sudo] password for operator:\n"
+        attached = threading.Event()
+
+        def popen(argv, **kwargs):
+            process = FakeAttachProcess()
+            viewer.process = process
+            attached.set()
+            return process
+
+        presenter = SecretPromptPresenter(
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=popen,
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: None,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer)
+            self.assertTrue(attached.wait(timeout=1))
+            viewer.prompt = marker + b"ordinary output\n"
+            time.sleep(0.12)
+            self.assertFalse(viewer.detached.is_set())
+
+            viewer.prompt += marker
+            self.assertTrue(viewer.detached.wait(timeout=1))
+            self.assertEqual(viewer.detach_count, 1)
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_manual_detach_does_not_reattach_until_a_new_prompt_episode(self):
+        viewer = ScriptedDetachedViewer("909090909090")
+        processes = []
+
+        def popen(argv, **kwargs):
+            process = FakeAttachProcess()
+            viewer.process = process
+            processes.append(process)
+            return process
+
+        presenter = SecretPromptPresenter(
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=popen,
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: None,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer)
+            deadline = time.monotonic() + 1
+            while len(processes) < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(processes), 1)
+
+            processes[0].returncode = 0
+            time.sleep(0.12)
+            self.assertEqual(len(processes), 1)
+
+            viewer.prompt = b"authentication check in progress\n"
+            time.sleep(0.08)
+            viewer.prompt = b"[sudo] password for operator:\n"
+            deadline = time.monotonic() + 1
+            while len(processes) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(processes), 2)
+
+            viewer.prompt = (
+                f"TMUXGATE_AUTH_COMPLETE={viewer.session_name}\n"
+            ).encode("ascii")
+            self.assertTrue(viewer.detached.wait(timeout=1))
+            self.assertEqual(viewer.detach_count, 1)
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_detach_failure_terminates_local_attachment_process(self):
+        class DetachFailureViewer(ScriptedDetachedViewer):
+            def detach_client(self, client_tty):
+                self.detach_count += 1
+                raise TransportError("injected detach failure")
+
+        viewer = DetachFailureViewer("abababababab")
+        process = FakeAttachProcess()
+
+        def popen(argv, **kwargs):
+            viewer.process = process
+            viewer.prompt = (
+                f"TMUXGATE_AUTH_COMPLETE={viewer.session_name}\n"
+            ).encode("ascii")
+            return process
+
+        presenter = SecretPromptPresenter(
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=popen,
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: None,
+            poll_seconds=0.005,
+        )
+        try:
+            with self.assertRaisesRegex(TransportError, "injected detach failure"):
+                presenter._present(viewer)
+            self.assertEqual(viewer.detach_count, 1)
+            self.assertEqual(process.terminate_count, 1)
+            self.assertEqual(process.kill_count, 0)
+            self.assertEqual(process.wait_count, 1)
+            self.assertEqual(process.returncode, -15)
+            with presenter._active_lock:
+                self.assertIsNone(presenter._active)
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_prompt_probe_failure_detaches_before_reporting_failure(self):
+        class ProbeFailureViewer(ScriptedDetachedViewer):
+            def __init__(self):
+                super().__init__("343434343434")
+                self.prompt_calls = 0
+
+            def prompt_signature(self):
+                self.prompt_calls += 1
+                if self.prompt_calls > 2:
+                    raise TransportError("injected prompt probe failure")
+                return super().prompt_signature()
+
+        viewer = ProbeFailureViewer()
+
+        def popen(argv, **kwargs):
+            process = FakeAttachProcess()
+            viewer.process = process
+            return process
+
+        presenter = SecretPromptPresenter(
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=popen,
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: None,
+            poll_seconds=0.005,
+        )
+        try:
+            with self.assertRaisesRegex(
+                TransportError, "prompt inspection failed"
+            ):
+                presenter._present(viewer)
+            self.assertTrue(viewer.detached.is_set())
+            self.assertEqual(viewer.detach_count, 1)
+        finally:
+            self.assertTrue(presenter.close())
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,48 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Coverage and test output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Local configuration and runtime artifacts
+.env
+.env.*
+!.env.example
+/config.toml
+/config.local.toml
+*.pid
+*.sock
+
+# Syncthing metadata and conflict files
+.stignore
+.stfolder/
+.stversions/
+.syncthing.*.tmp
+*.sync-conflict-*
+
+# Local tooling, editors, and operating systems
+.codebase-memory/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tmuxgate"
+version = "0.1.0.dev0"
+description = "Owner-controlled SSH execution broker using isolated remote tmux jobs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{name = "Unal"}]
+keywords = ["ssh", "tmux", "remote-execution", "automation", "security"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/unalcubic-m/tmuxgate"
+Documentation = "https://github.com/unalcubic-m/tmuxgate/blob/main/docs/ARCHITECTURE.md"
+Issues = "https://github.com/unalcubic-m/tmuxgate/issues"
+Repository = "https://github.com/unalcubic-m/tmuxgate.git"
+
+[project.scripts]
+tmuxgate = "tmuxgate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tmuxgate = ["assets/*.sh"]

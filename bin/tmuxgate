@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+launcher=$(readlink -f -- "$0")
+project_root=$(dirname -- "$(dirname -- "$launcher")")
+if [ -n "${PYTHONPATH:-}" ]; then
+    PYTHONPATH="$project_root/src:$PYTHONPATH"
+else
+    PYTHONPATH="$project_root/src"
+fi
+export PYTHONPATH
+exec /usr/bin/python3 -m tmuxgate "$@"
