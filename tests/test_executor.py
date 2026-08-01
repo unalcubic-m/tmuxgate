@@ -114,6 +114,20 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(self.state.load_all(), ())
         self.assertIsNone(self.pool.pinned_request_id)
 
+    def test_disabled_after_approval_is_proven_pre_remote_without_recovery_state(self):
+        spec = request(("true",))
+        self.approve(spec)
+        self.planner.machine_enabled = lambda _machine_name: False
+
+        result = self.executor(AutoCompletingBackend())(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertIn("configured machine is disabled", result.detail)
+        self.assertEqual(self.master_backend.starts, [])
+        self.assertEqual(self.state.load_all(), ())
+        self.assertIsNone(self.pool.pinned_request_id)
+        self.assertEqual(self.planner.pending_request_ids, ())
+
     def test_failed_ssh_master_can_be_retried_once_from_broker_terminal(self):
         self.master_backend.close()
         self.master_backend = RetryMasterBackend(1)
@@ -184,10 +198,14 @@ class RealExecutorTests(unittest.TestCase):
             fallback_calls.append((args, kwargs))
             return ApprovalDecision.DENIED
 
+        def unexpected_disable(*args, **kwargs):
+            raise AssertionError("untried fallback must not offer machine disable")
+
         result = self.executor(
             AutoCompletingBackend(),
             ssh_retry_approver=cancel_retry,
             fallback_approver=deny_fallback,
+            machine_disable_approver=unexpected_disable,
         )(REQUEST_ID, spec)
 
         self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
@@ -232,6 +250,95 @@ class RealExecutorTests(unittest.TestCase):
             "wireguard",
         )
 
+    def test_exhausted_ssh_endpoints_can_disable_machine_once(self):
+        self.master_backend.close()
+        self.master_backend = RetryMasterBackend(4)
+        self.pool.backend = self.master_backend
+        spec = request(("true",))
+        self.approve(spec)
+        disable_calls = []
+        disabled = []
+
+        def approve_disable(*args, **kwargs):
+            disable_calls.append((args, kwargs))
+            return ApprovalDecision.APPROVED
+
+        result = self.executor(
+            AutoCompletingBackend(),
+            ssh_retry_approver=(
+                lambda *args, **kwargs: ApprovalDecision.APPROVED
+            ),
+            fallback_approver=(
+                lambda *args, **kwargs: ApprovalDecision.APPROVED
+            ),
+            machine_disable_approver=approve_disable,
+            machine_disabler=disabled.append,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertEqual(len(self.master_backend.starts), 4)
+        self.assertEqual(len(disable_calls), 1)
+        self.assertEqual(disable_calls[0][0], (REQUEST_ID, "app-server"))
+        self.assertFalse(disable_calls[0][1]["remote_mutation_started"])
+        self.assertEqual(disabled, ["app-server"])
+        self.assertIn("machine disabled by operator", result.detail)
+        self.assertEqual(self.state.load_all(), ())
+
+    def test_disable_write_failure_preserves_original_pre_remote_failure(self):
+        self.master_backend.close()
+        self.master_backend = RetryMasterBackend(4)
+        self.pool.backend = self.master_backend
+        spec = request(("true",))
+        self.approve(spec)
+
+        def fail_disable(machine_name):
+            raise OSError(f"cannot persist {machine_name}")
+
+        result = self.executor(
+            AutoCompletingBackend(),
+            ssh_retry_approver=(
+                lambda *args, **kwargs: ApprovalDecision.APPROVED
+            ),
+            fallback_approver=(
+                lambda *args, **kwargs: ApprovalDecision.APPROVED
+            ),
+            machine_disable_approver=(
+                lambda *args, **kwargs: ApprovalDecision.APPROVED
+            ),
+            machine_disabler=fail_disable,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertIn("SSH transport was not established", result.detail)
+        self.assertIn("machine remains enabled because disabling failed", result.detail)
+        self.assertEqual(self.state.load_all(), ())
+
+    def test_already_disabled_machine_skips_duplicate_disable_prompt(self):
+        self.master_backend.close()
+        self.master_backend = RetryMasterBackend(4)
+        self.pool.backend = self.master_backend
+        spec = request(("true",))
+        self.approve(spec)
+
+        def unexpected_disable_prompt(*args, **kwargs):
+            raise AssertionError("an already-disabled machine must not prompt again")
+
+        result = self.executor(
+            AutoCompletingBackend(),
+            ssh_retry_approver=(
+                lambda *args, **kwargs: ApprovalDecision.APPROVED
+            ),
+            fallback_approver=(
+                lambda *args, **kwargs: ApprovalDecision.APPROVED
+            ),
+            machine_disable_approver=unexpected_disable_prompt,
+            machine_enabled=lambda _machine_name: False,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertIn("machine was already disabled", result.detail)
+        self.assertEqual(self.state.load_all(), ())
+
     def test_ssh_retry_refuses_changed_ssh_identity_plan(self):
         self.master_backend.close()
         self.master_backend = RetryMasterBackend(1)
@@ -273,8 +380,13 @@ class RealExecutorTests(unittest.TestCase):
         def unexpected_retry(*args, **kwargs):
             raise AssertionError("ordinary transport failures must not be retried")
 
+        def unexpected_disable(*args, **kwargs):
+            raise AssertionError("ordinary transport failures must not offer disable")
+
         result = self.executor(
-            AutoCompletingBackend(), ssh_retry_approver=unexpected_retry
+            AutoCompletingBackend(),
+            ssh_retry_approver=unexpected_retry,
+            machine_disable_approver=unexpected_disable,
         )(REQUEST_ID, spec)
         self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
 

@@ -96,10 +96,15 @@ Configuration is still exclusively backed by the owner-only TOML file at
 `~/.config/tmuxgate/config.toml`. Dashboard configuration actions invoke the
 same `tmuxgate config` handlers. Structured actions use the same parser,
 validation, serializer, and atomic publisher; the advanced `config edit`
-action instead validates and atomically publishes the edited TOML text. The
-running application does not depend on dashboard state. It retains its startup
-snapshot until restart so a configuration edit cannot change an already
-approved route or execution identity.
+action captures parsed settings and exact bytes from one secure descriptor,
+then compares the current exact bytes under the owner-only writer lock. It
+reopens the editor output securely under that lock and copies its exact
+validated bytes into a broker-owned `0600` temporary that is fsynced before
+atomic replacement. Comment-only concurrent changes therefore conflict rather
+than being silently overwritten. The running application does not depend on
+dashboard state. It retains its startup snapshot until restart so a
+configuration edit cannot change an already approved route or execution
+identity.
 
 Schema version 2 adds:
 
@@ -254,9 +259,9 @@ main TOML file.
 
 The MCP surface contains exactly five tools:
 
-- `list_machines()` returns only logical aliases and descriptions; endpoints,
-  addresses, SSH identities/options, routes, keys, and host-key evidence remain
-  private to the broker.
+- `list_machines()` returns only logical aliases, descriptions, and the boolean
+  enabled state; endpoints, addresses, SSH identities/options, routes, keys,
+  and host-key evidence remain private to the broker.
 - `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?)`
   validates and creates `RequestSpec(mode=ARGV)` without shell-joining argv.
 - `run_script(machine, cwd, purpose, script?, script_base64?, environment?,
@@ -477,10 +482,11 @@ review that terminal; the status alone is not classified as an authentication
 failure because it may also represent host-key, configuration, or reachability
 failure. tmuxgate does not capture or persist the terminal text.
 Before considering an approved fallback, the executor may offer exactly one
-same-endpoint retry. It requires an exact broker-terminal confirmation, keeps
-the original request and connection-plan binding, recollects local network
-evidence, re-resolves SSH policy and host-key evidence, and requires the
-approved machine, ordered candidate eligibility, eligible endpoint order, and
+same-endpoint retry. It requires a broker-terminal yes/no confirmation, with
+yes as the displayed default, keeps the original request and connection-plan
+binding, recollects local network evidence, re-resolves SSH policy and host-key
+evidence, and requires the approved machine, ordered candidate eligibility,
+eligible endpoint order, and
 complete resolved SSH identities to remain equal. The retried endpoint must
 remain eligible. Volatile observation bytes and their snapshot digest may
 change when those security semantics do not. A semantic change fails closed
@@ -493,6 +499,23 @@ command and cannot create durable remote-job state. No local transport,
 identity-validation, or control-path error is retried; a typed nonzero OpenSSH
 start exit remains opaque except for the terminal diagnostic and numeric
 status.
+
+Only when every eligible endpoint's initial OpenSSH master start and its
+broker-terminal-approved retry have failed does the broker offer to disable the
+logical machine. The local-only prompt is `Disable machine <alias>? [y/N]` and
+defaults to no. Retry denial, fallback denial, plan revalidation failure,
+generic local transport failure, and every post-remote failure do not offer
+this mutation. A confirmed disable performs a locked, compare-and-swap update
+of only that machine's `enabled` flag, preserves unrelated current settings,
+and immediately updates the shared runtime availability registry. New and
+still-queued requests then fail before network collection, approval, or SSH.
+The non-revoking boundary is `BoundRequestPlanner.take()`: an execution that
+already consumed its approved plan before the disable was committed may
+continue, including if it has not reached remote mutation yet. This avoids
+retroactively changing an active execution's approved transport semantics;
+already remote-mutating jobs are likewise not cancelled. The machine remains
+visible through `list_machines()` with `enabled = false` and can be restored
+with `tmuxgate config enable-machine <alias>`.
 
 Canonical local collection is part of the lease gate. Once completion, local
 spool verification, viewer detachment, and terminal restoration all pass, a

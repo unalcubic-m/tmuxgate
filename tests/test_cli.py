@@ -49,6 +49,8 @@ class CommandLineParsingTests(unittest.TestCase):
             ("_config_set_broker", ("set-broker",)),
             ("_config_add_machine", ("add-machine",)),
             ("_config_remove_machine", ("remove-machine", "app-server")),
+            ("_config_disable_machine", ("disable-machine", "app-server")),
+            ("_config_enable_machine", ("enable-machine", "app-server")),
             ("_config_enroll_home", ("enroll-home",)),
         )
         for handler_name, command in commands:
@@ -71,6 +73,8 @@ class CommandLineParsingTests(unittest.TestCase):
             ("_config_set_broker", ("set-broker",)),
             ("_config_add_machine", ("add-machine",)),
             ("_config_remove_machine", ("remove-machine", "app-server")),
+            ("_config_disable_machine", ("disable-machine", "app-server")),
+            ("_config_enable_machine", ("enable-machine", "app-server")),
             ("_config_enroll_home", ("enroll-home",)),
         )
         for handler_name, command in commands:
@@ -118,7 +122,10 @@ class CommandLineParsingTests(unittest.TestCase):
                 writer=io.StringIO(),
             )
             with (
-                mock.patch("tmuxgate.cli.load_config", return_value=object()),
+                mock.patch(
+                    "tmuxgate.cli.load_config_snapshot",
+                    return_value=(object(), b"version = 2\n"),
+                ),
                 mock.patch(
                     "tmuxgate.cli.open_approval_terminal",
                     return_value=nullcontext(terminal),

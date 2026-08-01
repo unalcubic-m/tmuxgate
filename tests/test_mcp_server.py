@@ -418,8 +418,12 @@ class McpBrokerIntegrationTests(unittest.TestCase):
         listener = create_broker_socket(self.socket_path)
         control = BrokerControlService(
             {
-                "machine-a": SimpleNamespace(description="Application server"),
-                "machine-b": SimpleNamespace(description="Build host"),
+                "machine-a": SimpleNamespace(
+                    description="Application server", enabled=True
+                ),
+                "machine-b": SimpleNamespace(
+                    description="Build host", enabled=False
+                ),
             },
             self.state,
             self.spool,
@@ -476,6 +480,14 @@ class McpBrokerIntegrationTests(unittest.TestCase):
         self.assertEqual(
             [item["alias"] for item in machines.structured_content["machines"]],
             ["machine-a", "machine-b"],
+        )
+        self.assertEqual(
+            [item["enabled"] for item in machines.structured_content["machines"]],
+            [True, False],
+        )
+        self.assertEqual(
+            set(machines.structured_content["machines"][0]),
+            {"alias", "description", "enabled"},
         )
         self.assertFalse(argv_result.is_error)
         argv_body = argv_result.structured_content

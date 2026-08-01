@@ -28,6 +28,7 @@ from tmuxgate.config import (
     Machine,
     default_config_path,
     load_config,
+    load_config_snapshot,
 )
 from tmuxgate.models import (
     RequestSpec,
@@ -53,7 +54,11 @@ from tmuxgate.state import (
     StateError,
 )
 from tmuxgate.spool import ResultSpool, SpoolError
-from tmuxgate.settings import publish_config
+from tmuxgate.settings import (
+    publish_config,
+    publish_edited_config,
+    set_machine_enabled,
+)
 from tmuxgate.terminal import TerminalArbiter, TerminalError, TerminalPriority
 
 
@@ -151,6 +156,17 @@ def build_parser() -> argparse.ArgumentParser:
     remove_parser.add_argument("--yes", action="store_true")
     remove_parser.add_argument("--path", default=argparse.SUPPRESS)
     remove_parser.set_defaults(handler=_config_remove_machine)
+    for action, handler in (
+        ("disable", _config_disable_machine),
+        ("enable", _config_enable_machine),
+    ):
+        state_parser = config_subparsers.add_parser(
+            f"{action}-machine",
+            help=f"{action} one logical machine without removing its settings",
+        )
+        state_parser.add_argument("name")
+        state_parser.add_argument("--path", default=argparse.SUPPRESS)
+        state_parser.set_defaults(handler=handler)
     enroll_parser = config_subparsers.add_parser(
         "enroll-home", help="learn the directly connected physical home network"
     )
@@ -237,9 +253,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _config_check(args: argparse.Namespace) -> int:
     config = load_config(args.path)
+    enabled_count = sum(machine.enabled for machine in config.machines.values())
     print(
         "configuration valid: "
-        f"{len(config.machines)} machines, "
+        f"{len(config.machines)} machines ({enabled_count} enabled), "
         f"{config.broker.max_open_ssh_masters} retained masters, "
         f"{config.broker.max_active_remote_commands} active remote commands, "
         f"approval={config.broker.approval_mode}"
@@ -252,7 +269,11 @@ def _config_list(args: argparse.Namespace) -> int:
     print("Configured remote machines")
     print("==========================")
     for machine in config.machines.values():
-        print(f"{machine.name}  user={machine.user}  {machine.description}")
+        status = "enabled" if machine.enabled else "disabled"
+        print(
+            f"{machine.name}  status={status}  user={machine.user}  "
+            f"{machine.description}"
+        )
         for endpoint in machine.endpoints:
             print(
                 f"  - {endpoint.id:<12} {endpoint.address}:{endpoint.port} "
@@ -281,7 +302,7 @@ def _config_set_broker(args: argparse.Namespace) -> int:
     if not changes:
         raise ConfigError("set-broker requires at least one setting")
     updated = replace(config, broker=replace(config.broker, **changes))
-    publish_config(path, updated)
+    publish_config(path, updated, expected_config=config)
     print(
         "Broker settings updated: "
         f"approval_mode={updated.broker.approval_mode}, "
@@ -297,8 +318,7 @@ def _config_edit(args: argparse.Namespace) -> int:
     path = Path(args.path).expanduser()
     if not path.is_absolute():
         raise ConfigError("configuration path must be absolute")
-    load_config(path)
-    content = path.read_bytes()
+    _original_config, content = load_config_snapshot(path)
     temporary = path.parent / f".config.{secrets.token_hex(16)}.tmp"
     flags = (
         os.O_WRONLY
@@ -319,7 +339,6 @@ def _config_edit(args: argparse.Namespace) -> int:
     finally:
         os.close(descriptor)
 
-    published = False
     try:
         while True:
             with open_approval_terminal() as terminal:
@@ -339,24 +358,21 @@ def _config_edit(args: argparse.Namespace) -> int:
                 print(f"tmuxgate: settings are not valid: {exc}", file=sys.stderr)
                 print("Reopening the editor; fix the error or exit without saving.")
                 continue
-            os.replace(temporary, path)
-            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-            published = True
+            config = publish_edited_config(
+                path,
+                temporary,
+                expected_content=content,
+            )
             print(
                 f"Settings valid: {len(config.machines)} machines. "
                 "Restart tmuxgate to load them."
             )
             return 0
     finally:
-        if not published:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _prompt(label: str, *, default: str | None = None, allow_empty: bool = False) -> str:
@@ -439,7 +455,11 @@ def _config_add_machine(args: argparse.Namespace) -> int:
     )
     machines = dict(config.machines)
     machines[name] = machine
-    publish_config(path, replace(config, machines=MappingProxyType(machines)))
+    publish_config(
+        path,
+        replace(config, machines=MappingProxyType(machines)),
+        expected_config=config,
+    )
     print(f"Added {name}. Restart tmuxgate to load the new machine.")
     return 0
 
@@ -462,9 +482,40 @@ def _config_remove_machine(args: argparse.Namespace) -> int:
             return 0
     machines = dict(config.machines)
     del machines[name]
-    publish_config(path, replace(config, machines=MappingProxyType(machines)))
+    publish_config(
+        path,
+        replace(config, machines=MappingProxyType(machines)),
+        expected_config=config,
+    )
     print(f"Removed {name} from local settings. No remote machine was contacted.")
     return 0
+
+
+def _config_set_machine_enabled(
+    args: argparse.Namespace,
+    *,
+    enabled: bool,
+) -> int:
+    path = Path(args.path).expanduser()
+    name = validate_alias(args.name, field_name="machine name")
+    state = "enabled" if enabled else "disabled"
+    _updated, changed = set_machine_enabled(path, name, enabled=enabled)
+    if not changed:
+        print(f"{name} is already {state}. No settings changed.")
+        return 0
+    print(
+        f"{name} is now {state}. No remote machine was contacted. "
+        "Restart tmuxgate to load the change."
+    )
+    return 0
+
+
+def _config_disable_machine(args: argparse.Namespace) -> int:
+    return _config_set_machine_enabled(args, enabled=False)
+
+
+def _config_enable_machine(args: argparse.Namespace) -> int:
+    return _config_set_machine_enabled(args, enabled=True)
 
 
 def _direct_home_route(config: object, snapshot: object) -> object:
@@ -596,7 +647,11 @@ def _config_enroll_home(args: argparse.Namespace) -> int:
         frozenset() if bssid is None else frozenset({bssid.lower()}),
     )
     updated_home = replace(home, fingerprints=(*home.fingerprints, fingerprint))
-    publish_config(path, replace(config, home=updated_home))
+    publish_config(
+        path,
+        replace(config, home=updated_home),
+        expected_config=config,
+    )
     print(f"Enrolled {fingerprint_id}. Restart tmuxgate to use home-LAN routing.")
     return 0
 

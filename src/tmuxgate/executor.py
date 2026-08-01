@@ -38,8 +38,24 @@ class ExecutorError(RuntimeError):
     """The composed executor violated a lifecycle invariant."""
 
 
+class SshEndpointsExhaustedError(TransportError):
+    """Every approved endpoint exhausted its bounded SSH master retry."""
+
+
 RemoteBackendFactory = Callable[[MasterTransport], object]
 DetachedHandler = Callable[[str], str]
+
+
+def _deny_machine_disable(*_arguments: object, **_keywords: object) -> ApprovalDecision:
+    return ApprovalDecision.DENIED
+
+
+def _ignore_machine_disable(_machine_name: str) -> None:
+    return None
+
+
+def _machine_enabled(_machine_name: str) -> bool:
+    return True
 
 
 def prompt_detached_job(request_id: str) -> str:
@@ -85,6 +101,11 @@ class RealExecutor:
         backend_factory: RemoteBackendFactory,
         fallback_approver: Callable[..., ApprovalDecision] = request_fallback_approval,
         ssh_retry_approver: Callable[..., ApprovalDecision] = request_ssh_retry,
+        machine_disable_approver: Callable[..., ApprovalDecision] = (
+            _deny_machine_disable
+        ),
+        machine_disabler: Callable[[str], object] = _ignore_machine_disable,
+        machine_enabled: Callable[[str], bool] = _machine_enabled,
         detached_handler: DetachedHandler = reattach_detached_job,
         poll_interval_seconds: float = 0.25,
         detached_wait_seconds: float = 5.0,
@@ -93,6 +114,9 @@ class RealExecutor:
             ("backend_factory", backend_factory),
             ("fallback_approver", fallback_approver),
             ("ssh_retry_approver", ssh_retry_approver),
+            ("machine_disable_approver", machine_disable_approver),
+            ("machine_disabler", machine_disabler),
+            ("machine_enabled", machine_enabled),
             ("detached_handler", detached_handler),
         ):
             if not callable(callback):
@@ -104,6 +128,9 @@ class RealExecutor:
         self.backend_factory = backend_factory
         self.fallback_approver = fallback_approver
         self.ssh_retry_approver = ssh_retry_approver
+        self.machine_disable_approver = machine_disable_approver
+        self.machine_disabler = machine_disabler
+        self.machine_enabled = machine_enabled
         self.detached_handler = detached_handler
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.detached_wait_seconds = float(detached_wait_seconds)
@@ -119,6 +146,7 @@ class RealExecutor:
 
     def _acquire_transport(self, request_id: str, request: RequestSpec, plan):
         failure: BaseException | None = None
+        all_endpoints_exhausted = True
         for index, endpoint in enumerate(plan.endpoints):
             if index == 0:
                 authorization = issue_selected_transport_authorization(
@@ -178,6 +206,7 @@ class RealExecutor:
                             )
                             ssh_attempt += 1
                             continue
+                        all_endpoints_exhausted = False
                         failure = TransportError(
                             f"{exc}; operator cancelled the same-endpoint retry"
                         )
@@ -187,11 +216,14 @@ class RealExecutor:
                         )
                     break
                 except TransportError as exc:
+                    all_endpoints_exhausted = False
                     failure = exc
                     break
                 return lease, endpoint
             if index + 1 == len(plan.endpoints):
                 assert failure is not None
+                if all_endpoints_exhausted:
+                    raise SshEndpointsExhaustedError(str(failure)) from failure
                 raise failure
         raise TransportError("no approved endpoint transport could be established")
 
@@ -237,12 +269,59 @@ class RealExecutor:
             time.sleep(self.poll_interval_seconds)
 
     def __call__(self, request_id: str, request: RequestSpec) -> ExecutionResult:
-        context = self.planner.take(request_id, request)
+        try:
+            # Consuming the approved plan is still entirely local.  In
+            # particular, a runtime machine disable can invalidate a queued
+            # approval here before any SSH transport or durable remote-start
+            # boundary exists.
+            context = self.planner.take(request_id, request)
+        except BaseException as exc:
+            return ExecutionResult(
+                request_id,
+                TransportStatus.PRE_REMOTE_FAILURE,
+                detail=f"approved connection plan was not usable: {exc}",
+            )
         try:
             lease, endpoint = self._acquire_transport(
                 request_id,
                 request,
                 context.connection_plan,
+            )
+        except SshEndpointsExhaustedError as exc:
+            disable_detail = "; machine remains enabled"
+            try:
+                enabled = self.machine_enabled(request.machine_alias)
+                if type(enabled) is not bool:
+                    raise ExecutorError(
+                        "machine availability callback returned invalid state"
+                    )
+                if not enabled:
+                    disable_detail = "; machine was already disabled"
+                else:
+                    decision = ApprovalDecision(
+                        self.machine_disable_approver(
+                            request_id,
+                            request.machine_alias,
+                            failure_detail=str(exc)[:500],
+                            remote_mutation_started=False,
+                        )
+                    )
+                    if decision is ApprovalDecision.APPROVED:
+                        self.machine_disabler(request.machine_alias)
+                        disable_detail = "; machine disabled by operator"
+                    elif not self.machine_enabled(request.machine_alias):
+                        # Another failed request may have disabled the machine
+                        # while this request waited for the terminal arbiter.
+                        disable_detail = "; machine was already disabled"
+            except BaseException as disable_exc:
+                disable_detail = (
+                    "; machine remains enabled because disabling failed: "
+                    f"{str(disable_exc)[:500]}"
+                )
+            return ExecutionResult(
+                request_id,
+                TransportStatus.PRE_REMOTE_FAILURE,
+                detail=f"SSH transport was not established: {exc}{disable_detail}",
             )
         except BaseException as exc:
             return ExecutionResult(

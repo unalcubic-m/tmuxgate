@@ -13,11 +13,13 @@ from tmuxgate.approval import (
     ApprovalDecision,
     request_approval,
     request_fallback_approval,
+    request_machine_disable,
     request_ssh_retry,
 )
+from tmuxgate.availability import MachineAvailabilityRegistry
 from tmuxgate.broker import BrokerServer
 from tmuxgate.broker_api import BrokerControlService
-from tmuxgate.config import AppConfig, load_config
+from tmuxgate.config import AppConfig, Machine, load_config
 from tmuxgate.executor import RealExecutor
 from tmuxgate.fake import FakeExecution
 from tmuxgate.mcp_server import (
@@ -41,6 +43,7 @@ from tmuxgate.runtime import (
     prepare_runtime_layout,
 )
 from tmuxgate.spool import ResultSpool
+from tmuxgate.settings import set_machine_enabled
 from tmuxgate.ssh import ResolvedSshEndpoint, resolve_ssh_endpoint
 from tmuxgate.ssh_key import AutoSshKeyManager
 from tmuxgate.state import DurableStateStore, recover_startup
@@ -123,6 +126,7 @@ class UnifiedApplication:
 
     def run(self) -> int:
         config = load_config(self._config_path)
+        availability = MachineAvailabilityRegistry(config.machines)
         paths = prepare_runtime_layout(
             socket_path=self._socket_path,
             state_dir=self._state_dir,
@@ -172,7 +176,10 @@ class UnifiedApplication:
                 delivery_observer = lambda request_id, delivered: None
             else:
                 if config.broker.approval_mode == "always":
-                    planner = BoundRequestPlanner(config)
+                    planner = BoundRequestPlanner(
+                        config,
+                        machine_enabled=availability.is_enabled,
+                    )
 
                     def approver(request_id: str, request: RequestSpec) -> ApprovalDecision:
                         with self._terminal.claim(
@@ -184,6 +191,7 @@ class UnifiedApplication:
                     planner = BoundRequestPlanner(
                         config,
                         approver=_approve_without_prompt,
+                        machine_enabled=availability.is_enabled,
                     )
                     approver = planner
 
@@ -261,6 +269,34 @@ class UnifiedApplication:
                     ):
                         return request_ssh_retry(*arguments, **keywords)
 
+                def machine_disable_approver(
+                    request_id: str,
+                    machine_name: str,
+                    **keywords: object,
+                ) -> ApprovalDecision:
+                    with self._terminal.claim(
+                        priority=TerminalPriority.APPROVAL,
+                        purpose="machine disable decision",
+                    ):
+                        if not availability.is_enabled(machine_name):
+                            return ApprovalDecision.DENIED
+                        return request_machine_disable(
+                            request_id,
+                            machine_name,
+                            **keywords,
+                        )
+
+                def machine_disabler(machine_name: str) -> None:
+                    def persist(name: str, expected_machine: Machine) -> None:
+                        set_machine_enabled(
+                            self._config_path,
+                            name,
+                            enabled=False,
+                            expected_machine=expected_machine,
+                        )
+
+                    availability.disable_persistently(machine_name, persist)
+
                 executor = RealExecutor(
                     planner=planner,
                     transports=pool,
@@ -277,17 +313,26 @@ class UnifiedApplication:
                         else _approve_without_prompt
                     ),
                     ssh_retry_approver=ssh_retry_approver,
+                    machine_disable_approver=machine_disable_approver,
+                    machine_disabler=machine_disabler,
+                    machine_enabled=availability.is_enabled,
                 )
                 selected_executor = executor
                 approval_discarder = executor.discard_approval
                 delivery_observer = executor.result_delivery_finished
 
-            control_service = BrokerControlService(config.machines, store, spool)
+            control_service = BrokerControlService(
+                config.machines,
+                store,
+                spool,
+                machine_enabled=availability.is_enabled,
+            )
             run_worker_count = config.broker.max_pending_requests + 2
             control_worker_count = DEFAULT_CONTROL_WORKERS
             broker = BrokerServer(
                 lifecycle.listener,
                 allowed_machines=config.machines,
+                machine_enabled=availability.is_enabled,
                 approver=approver,
                 executor=selected_executor,
                 max_pending_requests=config.broker.max_pending_requests,

@@ -19,6 +19,7 @@ from unittest.mock import call, patch
 from tmuxgate.approval import (
     ApprovalDecision,
     ApprovalDisplayError,
+    ApprovalError,
     ApprovalInputError,
     ApprovalTerminal,
     CONTROLLING_TTY_PATH,
@@ -27,6 +28,7 @@ from tmuxgate.approval import (
     render_approval_document,
     render_code_document,
     request_approval,
+    request_machine_disable,
     secure_less_pager,
 )
 from tmuxgate.models import ExecutionMode, RequestSpec
@@ -83,6 +85,60 @@ class ShortWriteBuffer:
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_machine_disable_prompt_defaults_to_no_and_accepts_yes(self):
+        for response in ("\n", "n\n", "N\n", "no\n", "NO\n"):
+            with self.subTest(response=response):
+                terminal, _output = terminal_with_input(response)
+                self.assertEqual(
+                    request_machine_disable(
+                        REQUEST_ID,
+                        "host",
+                        failure_detail="SSH setup failed",
+                        remote_mutation_started=False,
+                        terminal=terminal,
+                    ),
+                    ApprovalDecision.DENIED,
+                )
+        for response in ("y\n", "Y\n", "yes\n", "YES\n"):
+            with self.subTest(response=response):
+                terminal, _output = terminal_with_input(response)
+                self.assertEqual(
+                    request_machine_disable(
+                        REQUEST_ID,
+                        "host",
+                        failure_detail="SSH setup failed",
+                        remote_mutation_started=False,
+                        terminal=terminal,
+                    ),
+                    ApprovalDecision.APPROVED,
+                )
+
+    def test_machine_disable_prompt_does_not_echo_invalid_input(self):
+        terminal, output = terminal_with_input("do-not-record-me\nn\n")
+
+        decision = request_machine_disable(
+            REQUEST_ID,
+            "host",
+            failure_detail="SSH setup failed",
+            remote_mutation_started=False,
+            terminal=terminal,
+        )
+
+        self.assertEqual(decision, ApprovalDecision.DENIED)
+        self.assertNotIn("do-not-record-me", output.getvalue())
+        self.assertIn("Please answer y or n.", output.getvalue())
+
+    def test_machine_disable_prompt_is_forbidden_after_remote_mutation(self):
+        terminal, _output = terminal_with_input("y\n")
+        with self.assertRaises(ApprovalError):
+            request_machine_disable(
+                REQUEST_ID,
+                "host",
+                failure_detail="failure",
+                remote_mutation_started=True,
+                terminal=terminal,
+            )
+
     def test_script_containing_run_text_cannot_approve_itself(self):
         script = (
             b"#!/bin/sh\n"

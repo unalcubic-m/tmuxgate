@@ -1,3 +1,4 @@
+from dataclasses import replace
 import os
 from pathlib import Path
 import tempfile
@@ -116,6 +117,23 @@ class ConfigTests(unittest.TestCase):
             tuple(map(str, config.wireguard.local_addresses)),
             ("198.51.100.3/32",),
         )
+        self.assertTrue(config.machines["app-server"].enabled)
+
+    def test_machine_enabled_defaults_true_and_requires_a_boolean(self):
+        data = valid_config()
+        data["machines"]["app-server"]["enabled"] = False
+        self.assertFalse(parse_config(data).machines["app-server"].enabled)
+
+        for invalid in (0, 1, "false", None):
+            with self.subTest(invalid=invalid):
+                data = valid_config()
+                data["machines"]["app-server"]["enabled"] = invalid
+                with self.assertRaisesRegex(ConfigError, "enabled.*boolean"):
+                    parse_config(data)
+
+        machine = parse_config(valid_config()).machines["app-server"]
+        with self.assertRaisesRegex(ConfigError, "enabled status.*boolean"):
+            replace(machine, enabled=1)
 
     def test_wireguard_interface_names_are_not_configuration(self):
         for field, value in (("interface", "wg0"), ("interfaces", ["wg0"])):

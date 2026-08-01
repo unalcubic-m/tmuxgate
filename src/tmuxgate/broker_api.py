@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 import base64
@@ -101,6 +101,7 @@ def _integer(value: object, label: str, minimum: int, maximum: int) -> int:
 class MachineSummary:
     alias: str
     description: str
+    enabled: bool = True
 
     def __post_init__(self) -> None:
         try:
@@ -109,17 +110,27 @@ class MachineSummary:
             raise ValueError(str(exc)) from exc
         if not isinstance(self.description, str) or "\x00" in self.description:
             raise ValueError("machine description must be text without NUL")
+        if type(self.enabled) is not bool:
+            raise ValueError("machine enabled status must be boolean")
         object.__setattr__(self, "alias", alias)
 
     def to_wire(self) -> dict[str, object]:
-        return {"alias": self.alias, "description": self.description}
+        return {
+            "alias": self.alias,
+            "description": self.description,
+            "enabled": self.enabled,
+        }
 
     @classmethod
     def from_wire(cls, value: object) -> "MachineSummary":
-        if not isinstance(value, dict) or set(value) != {"alias", "description"}:
+        if not isinstance(value, dict) or set(value) != {
+            "alias",
+            "description",
+            "enabled",
+        }:
             raise ProtocolError("machine summary fields are not exactly recognized")
         try:
-            return cls(value["alias"], value["description"])
+            return cls(value["alias"], value["description"], value["enabled"])
         except (TypeError, ValueError) as exc:
             raise ProtocolError(str(exc)) from exc
 
@@ -595,12 +606,15 @@ class BrokerControlService:
         machines: Mapping[str, object] | Iterable[MachineSummary],
         state_store: DurableStateStore,
         result_spool: ResultSpool,
+        *,
+        machine_enabled: Callable[[str], bool] | None = None,
     ) -> None:
         summaries: list[MachineSummary] = []
         if isinstance(machines, Mapping):
             for alias, machine in machines.items():
                 description = getattr(machine, "description", None)
-                summaries.append(MachineSummary(alias, description))
+                enabled = getattr(machine, "enabled", True)
+                summaries.append(MachineSummary(alias, description, enabled))
         else:
             for machine in machines:
                 if not isinstance(machine, MachineSummary):
@@ -615,12 +629,38 @@ class BrokerControlService:
         if not callable(getattr(result_spool, "read_verified_range", None)):
             raise TypeError("result spool must support verified range reads")
         self._machines = tuple(sorted(summaries, key=lambda item: item.alias))
+        if machine_enabled is not None and not callable(machine_enabled):
+            raise TypeError("machine_enabled must be callable")
+        self._machine_enabled = machine_enabled
         self._state_store = state_store
         self._result_spool = result_spool
 
     def handle(self, request: ControlRequest) -> ControlResponse:
         if isinstance(request, ListMachinesRequest):
-            return MachineList(self._machines)
+            if self._machine_enabled is None:
+                return MachineList(self._machines)
+            machines = []
+            for machine in self._machines:
+                try:
+                    enabled = self._machine_enabled(machine.alias)
+                except BaseException as exc:
+                    raise BrokerControlError(
+                        "availability_unavailable",
+                        "machine availability could not be verified",
+                    ) from exc
+                if type(enabled) is not bool:
+                    raise BrokerControlError(
+                        "availability_unavailable",
+                        "machine availability could not be verified",
+                    )
+                machines.append(
+                    MachineSummary(
+                        machine.alias,
+                        machine.description,
+                        machine.enabled and enabled,
+                    )
+                )
+            return MachineList(tuple(machines))
         if isinstance(request, ListJobsRequest):
             return self._list_jobs(request)
         if isinstance(request, ReadVerifiedResultRequest):

@@ -173,10 +173,12 @@ port = 8765
 
 Only the literal IPv4 loopback address is accepted. Existing version-1 files
 remain readable and receive these MCP defaults. The next structured
-configuration write (such as `set-broker`, `add-machine`, `remove-machine`, or
-`enroll-home`) publishes the complete file as version 2. `config edit`
-validates and atomically publishes the edited text but does not itself upgrade
-the schema version.
+configuration write (such as `set-broker`, `add-machine`, `remove-machine`,
+`enable-machine`, `disable-machine`, or `enroll-home`) publishes the complete
+file as version 2. `config edit` captures the parsed configuration and exact
+source bytes from one secure open, rejects any concurrent byte-level change,
+and fsyncs an owned private copy of the validated editor output before atomic
+publication. It does not itself upgrade the schema version.
 
 Structured configuration commands remain available:
 
@@ -184,6 +186,8 @@ Structured configuration commands remain available:
 tmuxgate config list
 tmuxgate config add-machine
 tmuxgate config remove-machine MACHINE
+tmuxgate config disable-machine MACHINE
+tmuxgate config enable-machine MACHINE
 tmuxgate config enroll-home
 tmuxgate config set-broker --approval-mode always
 ```
@@ -251,7 +255,8 @@ the token.
 
 The embedded server exposes five typed tools:
 
-- `list_machines()` returns logical aliases and descriptions only.
+- `list_machines()` returns logical aliases, descriptions, and enabled status
+  only.
 - `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?)`
   submits exact structured argv and waits for the broker result.
 - `run_script(machine, cwd, purpose, script?, script_base64?, environment?,

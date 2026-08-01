@@ -16,6 +16,7 @@ from tmuxgate.broker_api import (
     ListJobsRequest,
     ListMachinesRequest,
     MachineList,
+    MachineSummary,
     ReadVerifiedResultRequest,
     ResultStream,
     decode_control_request,
@@ -149,12 +150,58 @@ class BrokerControlServiceTests(unittest.TestCase):
             self.spool,
         )
 
-    def test_machine_list_exposes_only_alias_and_description(self):
+    def test_machine_list_exposes_only_sanitized_metadata_and_enabled_status(self):
         response = self.service.handle(ListMachinesRequest())
         self.assertIsInstance(response, MachineList)
         self.assertEqual(response.machines[0].alias, "machine-a")
         self.assertEqual(response.machines[0].description, "Application server")
-        self.assertEqual(set(response.machines[0].to_wire()), {"alias", "description"})
+        self.assertTrue(response.machines[0].enabled)
+        self.assertEqual(
+            set(response.machines[0].to_wire()),
+            {"alias", "description", "enabled"},
+        )
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            MachineSummary("machine-b", "Build host", enabled=1)
+        with self.assertRaisesRegex(ProtocolError, "exactly"):
+            MachineSummary.from_wire(
+                {"alias": "machine-b", "description": "Build host"}
+            )
+
+    def test_machine_list_reports_disabled_without_exposing_machine_details(self):
+        service = BrokerControlService(
+            {
+                "machine-b": SimpleNamespace(
+                    description="Build host",
+                    enabled=False,
+                    endpoint="must-not-leak",
+                )
+            },
+            self.store,
+            self.spool,
+        )
+        response = service.handle(ListMachinesRequest())
+        self.assertEqual(
+            response.machines,
+            (MachineSummary("machine-b", "Build host", False),),
+        )
+        self.assertNotIn("endpoint", response.machines[0].to_wire())
+
+    def test_machine_list_reflects_shared_runtime_disable_state(self):
+        enabled = {"machine-a": True}
+        service = BrokerControlService(
+            {"machine-a": SimpleNamespace(description="Application server")},
+            self.store,
+            self.spool,
+            machine_enabled=enabled.__getitem__,
+        )
+
+        self.assertTrue(
+            service.handle(ListMachinesRequest()).machines[0].enabled
+        )
+        enabled["machine-a"] = False
+        self.assertFalse(
+            service.handle(ListMachinesRequest()).machines[0].enabled
+        )
 
     def test_jobs_filter_and_paginate_newest_first(self):
         first = self.service.handle(ListJobsRequest(limit=1))
@@ -248,6 +295,7 @@ class BrokerControlIntegrationTests(BrokerControlServiceTests):
     def test_typed_clients_round_trip_through_broker_without_approval(self):
         machines = list_machines(self.socket_path)
         self.assertEqual([machine.alias for machine in machines], ["machine-a"])
+        self.assertTrue(machines[0].enabled)
 
         page = list_jobs(
             self.socket_path,

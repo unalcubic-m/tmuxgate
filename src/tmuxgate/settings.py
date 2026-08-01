@@ -2,12 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import replace
+import errno
+import fcntl
 import json
 import os
 from pathlib import Path
 import secrets
+import stat
+import time
+from types import MappingProxyType
 
-from tmuxgate.config import AppConfig, ConfigError, load_config
+from tmuxgate.config import (
+    AppConfig,
+    ConfigError,
+    Machine,
+    load_config,
+    load_config_snapshot,
+)
+from tmuxgate.models import ValidationError, validate_alias
 
 
 def _quote(value: object) -> str:
@@ -80,6 +95,7 @@ def serialize_config(config: AppConfig) -> bytes:
                 "",
                 f"[machines.{machine.name}]",
                 f"description = {_quote(machine.description)}",
+                f"enabled = {'true' if machine.enabled else 'false'}",
                 f"ssh_profile = {_quote(machine.ssh_profile)}",
                 f"user = {_quote(machine.user)}",
                 f"host_key_alias = {_quote(machine.host_key_alias)}",
@@ -101,15 +117,55 @@ def serialize_config(config: AppConfig) -> bytes:
     return ("\n".join(lines) + "\n").encode("ascii")
 
 
-def publish_config(path: Path, config: AppConfig) -> None:
-    """Validate and atomically publish an owner-only complete config."""
+class ConfigWriteConflictError(ConfigError):
+    """Configuration changed after a caller captured its update preimage."""
 
-    path = path.expanduser()
-    if not path.is_absolute():
-        raise ConfigError("configuration path must be absolute")
-    # Prove the existing path and private parent before replacing anything.
-    load_config(path)
-    content = serialize_config(config)
+
+@contextmanager
+def _config_write_lock(path: Path, *, timeout_seconds: float = 5.0) -> Iterator[None]:
+    """Serialize tmuxgate writers through a validated owner-only lock file."""
+
+    lock_path = path.parent / f".{path.name}.lock"
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ConfigError("configuration write lock is not a private regular file")
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise ConfigError("configuration is busy; try again") from exc
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_bytes_unlocked(path: Path, content: bytes) -> None:
+    """Fsync and publish exact validated bytes while the caller holds the lock."""
+
+    if not isinstance(content, bytes):
+        raise TypeError("configuration content must be bytes")
     temporary = path.parent / f".config.{secrets.token_hex(16)}.tmp"
     flags = (
         os.O_WRONLY
@@ -146,3 +202,103 @@ def publish_config(path: Path, config: AppConfig) -> None:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _publish_config_unlocked(path: Path, config: AppConfig) -> None:
+    """Publish after the caller has validated the path and acquired its lock."""
+
+    _publish_bytes_unlocked(path, serialize_config(config))
+
+
+def publish_config(
+    path: Path,
+    config: AppConfig,
+    *,
+    expected_config: AppConfig | None = None,
+) -> None:
+    """Validate, compare if requested, and atomically publish private config."""
+
+    path = path.expanduser()
+    if not path.is_absolute():
+        raise ConfigError("configuration path must be absolute")
+    # Prove the existing path and private parent before creating the sibling lock.
+    load_config(path)
+    with _config_write_lock(path):
+        current = load_config(path)
+        if expected_config is not None and current != expected_config:
+            raise ConfigWriteConflictError(
+                "configuration changed while the update was being prepared"
+            )
+        _publish_config_unlocked(path, config)
+
+
+def publish_edited_config(
+    path: Path,
+    temporary: Path,
+    *,
+    expected_content: bytes,
+) -> AppConfig:
+    """CAS-publish a validated private edit while preserving its exact bytes."""
+
+    path = path.expanduser()
+    temporary = temporary.expanduser()
+    if not path.is_absolute() or not temporary.is_absolute():
+        raise ConfigError("configuration paths must be absolute")
+    if temporary.parent != path.parent or temporary == path:
+        raise ConfigError("edited configuration must be a sibling temporary")
+    if not isinstance(expected_content, bytes):
+        raise TypeError("expected_content must be bytes")
+    load_config_snapshot(path)
+    with _config_write_lock(path):
+        _current, current_content = load_config_snapshot(path)
+        if current_content != expected_content:
+            raise ConfigWriteConflictError(
+                "configuration changed while the editor was open"
+            )
+        # Reopen the editor output securely while holding the writer lock, then
+        # copy those exact validated bytes into our own O_EXCL temporary.  The
+        # owned copy is fsynced before replacement, so Nano's write durability
+        # and a path swap after validation cannot affect the published file.
+        edited, edited_content = load_config_snapshot(temporary)
+        _publish_bytes_unlocked(path, edited_content)
+    return edited
+
+
+def set_machine_enabled(
+    path: Path,
+    name: str,
+    *,
+    enabled: bool,
+    expected_machine: Machine | None = None,
+) -> tuple[AppConfig, bool]:
+    """Lock, reload, and set one machine flag while preserving current settings."""
+
+    if type(enabled) is not bool:
+        raise TypeError("enabled must be a boolean")
+    if expected_machine is not None and not isinstance(expected_machine, Machine):
+        raise TypeError("expected_machine must be a Machine")
+    try:
+        machine_name = validate_alias(name, field_name="machine name")
+    except ValidationError as exc:
+        raise ConfigError(str(exc)) from exc
+    config_path = Path(path).expanduser()
+    if not config_path.is_absolute():
+        raise ConfigError("configuration path must be absolute")
+    load_config(config_path)
+    with _config_write_lock(config_path):
+        config = load_config(config_path)
+        try:
+            machine = config.machines[machine_name]
+        except KeyError as exc:
+            raise ConfigError(f"unknown configured machine: {machine_name}") from exc
+        if machine.enabled is enabled:
+            return config, False
+        if expected_machine is not None and machine != expected_machine:
+            raise ConfigWriteConflictError(
+                f"machine settings changed before {machine_name} could be updated"
+            )
+        machines = dict(config.machines)
+        machines[machine_name] = replace(machine, enabled=enabled)
+        updated = replace(config, machines=MappingProxyType(machines))
+        _publish_config_unlocked(config_path, updated)
+        return updated, True

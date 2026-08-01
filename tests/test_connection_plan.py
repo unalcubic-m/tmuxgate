@@ -309,10 +309,8 @@ class BoundApprovalTests(unittest.TestCase):
         )
         self.assertIs(decision, ApprovalDecision.DENIED)
 
-    def test_ssh_retry_requires_exact_terminal_confirmation(self):
-        terminal, output = self.terminal(
-            f"yes\nRETRY {REQUEST_ID[:8]} home-lan\n"
-        )
+    def test_ssh_retry_uses_yes_no_prompt_with_yes_default(self):
+        terminal, output = self.terminal("do-not-echo-this\n\n")
         detail = "OpenSSH failed\n\x1b[31mterminal text"
         decision = request_ssh_retry(
             REQUEST_ID,
@@ -325,23 +323,46 @@ class BoundApprovalTests(unittest.TestCase):
         )
         rendered = output.getvalue()
         self.assertIs(decision, ApprovalDecision.APPROVED)
-        self.assertIn("Invalid response; no retry decision was recorded.", rendered)
+        self.assertIn("Please answer y or n.", rendered)
+        self.assertIn(
+            f"Retry SSH setup once for request {REQUEST_ID[:8]} "
+            "on endpoint home-lan? [Y/n]",
+            rendered,
+        )
+        self.assertNotIn("do-not-echo-this", rendered)
         self.assertIn("No remote command started.", rendered)
         self.assertIn("\\n\\u001b[31m", rendered)
         self.assertNotIn("\x1b", rendered)
 
+    def test_ssh_retry_accepts_common_yes_answers(self):
+        for answer in ("y", "Y", "yes", "YES"):
+            with self.subTest(answer=answer):
+                terminal, _output = self.terminal(answer + "\n")
+                decision = request_ssh_retry(
+                    REQUEST_ID,
+                    self.request,
+                    self.plan,
+                    endpoint_id="home-lan",
+                    failure_detail="status 255",
+                    remote_mutation_started=False,
+                    terminal=terminal,
+                )
+                self.assertIs(decision, ApprovalDecision.APPROVED)
+
     def test_ssh_retry_can_be_cancelled_and_is_forbidden_after_mutation(self):
-        terminal, _output = self.terminal("CANCEL\n")
-        decision = request_ssh_retry(
-            REQUEST_ID,
-            self.request,
-            self.plan,
-            endpoint_id="home-lan",
-            failure_detail="status 255",
-            remote_mutation_started=False,
-            terminal=terminal,
-        )
-        self.assertIs(decision, ApprovalDecision.DENIED)
+        for answer in ("n", "N", "no", "NO"):
+            with self.subTest(answer=answer):
+                terminal, _output = self.terminal(answer + "\n")
+                decision = request_ssh_retry(
+                    REQUEST_ID,
+                    self.request,
+                    self.plan,
+                    endpoint_id="home-lan",
+                    failure_detail="status 255",
+                    remote_mutation_started=False,
+                    terminal=terminal,
+                )
+                self.assertIs(decision, ApprovalDecision.DENIED)
         with self.assertRaisesRegex(ApprovalError, "forbidden"):
             render_ssh_retry_document(
                 REQUEST_ID,
