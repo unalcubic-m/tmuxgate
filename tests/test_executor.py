@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -7,7 +8,8 @@ from tmuxgate.result import TransportStatus
 from tmuxgate.scheduler import RequestState
 from tmuxgate.spool import ResultSpool
 from tmuxgate.state import DurableStateStore
-from tmuxgate.transport import MasterTransportPool
+from tmuxgate.approval import ApprovalDecision
+from tmuxgate.transport import MasterTransportPool, SshMasterStartError
 from test_planning import PlannerHarness, request
 from test_remote_job import FakeRemoteBackend
 from test_transport import FakeMasterBackend
@@ -26,6 +28,19 @@ class AutoCompletingBackend(FakeRemoteBackend):
         super().release_gate(identity)
         self.complete(b"stdout-line\n", b"stderr-line\n", 7)
         self.viewer.detach()
+
+
+class RetryMasterBackend(FakeMasterBackend):
+    def __init__(self, failures):
+        super().__init__()
+        self.failures = failures
+
+    def start_master(self, invocation, control_path):
+        if self.failures:
+            self.starts.append(invocation)
+            self.failures -= 1
+            raise SshMasterStartError(255)
+        super().start_master(invocation, control_path)
 
 
 class RealExecutorTests(unittest.TestCase):
@@ -55,7 +70,7 @@ class RealExecutorTests(unittest.TestCase):
     def approve(self, spec):
         self.planner(REQUEST_ID, spec)
 
-    def executor(self, backend):
+    def executor(self, backend, **kwargs):
         return RealExecutor(
             planner=self.planner,
             transports=self.pool,
@@ -64,6 +79,7 @@ class RealExecutorTests(unittest.TestCase):
             backend_factory=lambda transport: backend,
             poll_interval_seconds=0.001,
             detached_wait_seconds=0.001,
+            **kwargs,
         )
 
     def test_full_fake_transport_and_remote_job_returns_exact_result_and_done(self):
@@ -97,6 +113,170 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
         self.assertEqual(self.state.load_all(), ())
         self.assertIsNone(self.pool.pinned_request_id)
+
+    def test_failed_ssh_master_can_be_retried_once_from_broker_terminal(self):
+        self.master_backend.close()
+        self.master_backend = RetryMasterBackend(1)
+        self.pool.backend = self.master_backend
+        spec = request(("true",))
+        self.approve(spec)
+        retry_calls = []
+
+        def retry(*args, **kwargs):
+            retry_calls.append((args, kwargs))
+            return ApprovalDecision.APPROVED
+
+        result = self.executor(
+            AutoCompletingBackend(), ssh_retry_approver=retry
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
+        self.assertEqual(len(self.master_backend.starts), 2)
+        self.assertEqual(len(retry_calls), 1)
+        self.assertEqual(retry_calls[0][1]["endpoint_id"], "home-lan")
+        self.assertFalse(retry_calls[0][1]["remote_mutation_started"])
+
+    def test_broker_confirmed_ssh_retry_is_bounded_to_one_attempt(self):
+        self.master_backend.close()
+        self.master_backend = RetryMasterBackend(2)
+        self.pool.backend = self.master_backend
+        spec = request(("true",))
+        self.approve(spec)
+        retry_calls = []
+
+        def retry(*args, **kwargs):
+            retry_calls.append((args, kwargs))
+            return ApprovalDecision.APPROVED
+
+        fallback_calls = []
+
+        def deny_fallback(*args, **kwargs):
+            fallback_calls.append((args, kwargs))
+            return ApprovalDecision.DENIED
+
+        result = self.executor(
+            AutoCompletingBackend(),
+            ssh_retry_approver=retry,
+            fallback_approver=deny_fallback,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertEqual(len(self.master_backend.starts), 2)
+        self.assertEqual(len(retry_calls), 1)
+        self.assertEqual(len(fallback_calls), 1)
+        self.assertIn("retry also failed", fallback_calls[0][1]["failure_detail"])
+        self.assertEqual(self.state.load_all(), ())
+
+    def test_cancelled_ssh_retry_requires_fallback_approval_without_state(self):
+        self.master_backend.close()
+        self.master_backend = RetryMasterBackend(1)
+        self.pool.backend = self.master_backend
+        spec = request(("true",))
+        self.approve(spec)
+        retry_calls = []
+        fallback_calls = []
+
+        def cancel_retry(*args, **kwargs):
+            retry_calls.append((args, kwargs))
+            return ApprovalDecision.DENIED
+
+        def deny_fallback(*args, **kwargs):
+            fallback_calls.append((args, kwargs))
+            return ApprovalDecision.DENIED
+
+        result = self.executor(
+            AutoCompletingBackend(),
+            ssh_retry_approver=cancel_retry,
+            fallback_approver=deny_fallback,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertEqual(len(self.master_backend.starts), 1)
+        self.assertEqual(len(retry_calls), 1)
+        self.assertEqual(len(fallback_calls), 1)
+        self.assertIn(
+            "cancelled the same-endpoint retry",
+            fallback_calls[0][1]["failure_detail"],
+        )
+        self.assertEqual(self.state.load_all(), ())
+
+    def test_fallback_endpoint_has_its_own_single_confirmed_retry(self):
+        self.master_backend.close()
+        self.master_backend = RetryMasterBackend(3)
+        self.pool.backend = self.master_backend
+        spec = request(("true",))
+        self.approve(spec)
+        retry_endpoint_ids = []
+        fallback_calls = []
+
+        def approve_retry(*args, **kwargs):
+            retry_endpoint_ids.append(kwargs["endpoint_id"])
+            return ApprovalDecision.APPROVED
+
+        def approve_fallback(*args, **kwargs):
+            fallback_calls.append((args, kwargs))
+            return ApprovalDecision.APPROVED
+
+        result = self.executor(
+            AutoCompletingBackend(),
+            ssh_retry_approver=approve_retry,
+            fallback_approver=approve_fallback,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
+        self.assertEqual(len(self.master_backend.starts), 4)
+        self.assertEqual(retry_endpoint_ids, ["home-lan", "wireguard"])
+        self.assertEqual(len(fallback_calls), 1)
+        self.assertEqual(
+            fallback_calls[0][1]["fallback_endpoint_id"],
+            "wireguard",
+        )
+
+    def test_ssh_retry_refuses_changed_ssh_identity_plan(self):
+        self.master_backend.close()
+        self.master_backend = RetryMasterBackend(1)
+        self.pool.backend = self.master_backend
+        spec = request(("true",))
+        self.approve(spec)
+        approved_plan = self.harness.approval_calls[0][2]
+        changed_selected = replace(
+            approved_plan.selected,
+            resolved=replace(
+                approved_plan.selected.resolved,
+                resolved_user="different-user",
+            ),
+        )
+        changed_plan = replace(
+            approved_plan,
+            endpoints=(changed_selected, *approved_plan.fallbacks),
+            plan_sha256="e" * 64,
+        )
+        self.planner.connection_builder = (
+            lambda route_plan, snapshot, *, resolver: changed_plan
+        )
+
+        result = self.executor(
+            AutoCompletingBackend(),
+            ssh_retry_approver=lambda *args, **kwargs: ApprovalDecision.APPROVED,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertIn("plan changed", result.detail)
+        self.assertEqual(len(self.master_backend.starts), 1)
+        self.assertEqual(self.state.load_all(), ())
+
+    def test_non_ssh_setup_failure_never_offers_authentication_retry(self):
+        spec = request(("true",))
+        self.approve(spec)
+        self.master_backend.fail_next_start = True
+
+        def unexpected_retry(*args, **kwargs):
+            raise AssertionError("ordinary transport failures must not be retried")
+
+        result = self.executor(
+            AutoCompletingBackend(), ssh_retry_approver=unexpected_retry
+        )(REQUEST_ID, spec)
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
 
     def test_post_arm_failure_is_incomplete_and_retains_transport_lease(self):
         spec = request(("true",))

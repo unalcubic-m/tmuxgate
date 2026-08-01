@@ -7,7 +7,11 @@ import threading
 import time
 from typing import TextIO
 
-from tmuxgate.approval import ApprovalDecision, request_fallback_approval
+from tmuxgate.approval import (
+    ApprovalDecision,
+    request_fallback_approval,
+    request_ssh_retry,
+)
 from tmuxgate.models import RequestSpec
 from tmuxgate.planning import BoundRequestPlanner
 from tmuxgate.remote_job import (
@@ -22,6 +26,7 @@ from tmuxgate.state import DurableJobRecord, DurableStateStore, new_approved_job
 from tmuxgate.transport import (
     MasterTransport,
     MasterTransportPool,
+    SshMasterStartError,
     TransportError,
     TransportLease,
     issue_fallback_transport_authorization,
@@ -79,6 +84,7 @@ class RealExecutor:
         spool: ResultSpool,
         backend_factory: RemoteBackendFactory,
         fallback_approver: Callable[..., ApprovalDecision] = request_fallback_approval,
+        ssh_retry_approver: Callable[..., ApprovalDecision] = request_ssh_retry,
         detached_handler: DetachedHandler = reattach_detached_job,
         poll_interval_seconds: float = 0.25,
         detached_wait_seconds: float = 5.0,
@@ -86,6 +92,7 @@ class RealExecutor:
         for name, callback in (
             ("backend_factory", backend_factory),
             ("fallback_approver", fallback_approver),
+            ("ssh_retry_approver", ssh_retry_approver),
             ("detached_handler", detached_handler),
         ):
             if not callable(callback):
@@ -96,6 +103,7 @@ class RealExecutor:
         self.spool = spool
         self.backend_factory = backend_factory
         self.fallback_approver = fallback_approver
+        self.ssh_retry_approver = ssh_retry_approver
         self.detached_handler = detached_handler
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.detached_wait_seconds = float(detached_wait_seconds)
@@ -142,14 +150,49 @@ class RealExecutor:
                     fallback_endpoint_id=endpoint.resolved.endpoint_id,
                     fallback_decision=decision,
                 )
-            try:
-                lease = self.transports.acquire(authorization, endpoint.resolved)
-            except TransportError as exc:
-                failure = exc
-                if index + 1 == len(plan.endpoints):
-                    raise
-                continue
-            return lease, endpoint
+            ssh_attempt = 0
+            while True:
+                try:
+                    lease = self.transports.acquire(
+                        authorization, endpoint.resolved
+                    )
+                except SshMasterStartError as exc:
+                    failure = exc
+                    if ssh_attempt == 0:
+                        decision = ApprovalDecision(
+                            self.ssh_retry_approver(
+                                request_id,
+                                request,
+                                plan,
+                                endpoint_id=endpoint.resolved.endpoint_id,
+                                failure_detail=str(exc)[:500],
+                                remote_mutation_started=False,
+                            )
+                        )
+                        if decision is ApprovalDecision.APPROVED:
+                            self.planner.revalidate_connection_plan(
+                                request_id,
+                                request,
+                                plan,
+                                retried_endpoint_id=endpoint.resolved.endpoint_id,
+                            )
+                            ssh_attempt += 1
+                            continue
+                        failure = TransportError(
+                            f"{exc}; operator cancelled the same-endpoint retry"
+                        )
+                    else:
+                        failure = TransportError(
+                            f"{exc}; the broker-terminal-confirmed retry also failed"
+                        )
+                    break
+                except TransportError as exc:
+                    failure = exc
+                    break
+                return lease, endpoint
+            if index + 1 == len(plan.endpoints):
+                assert failure is not None
+                raise failure
         raise TransportError("no approved endpoint transport could be established")
 
     def _retain_recovery(

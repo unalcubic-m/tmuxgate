@@ -975,3 +975,144 @@ def request_fallback_approval(
         pager_threshold_bytes=pager_threshold_bytes,
     )
     return _read_fallback_decision(terminal, request_id[:8], fallback_endpoint_id)
+
+
+def render_ssh_retry_document(
+    request_id: str,
+    request: RequestSpec,
+    connection_plan: ConnectionPlan,
+    *,
+    endpoint_id: str,
+    failure_detail: str,
+    remote_mutation_started: bool,
+) -> str:
+    """Render one bounded retry decision for the same approved SSH endpoint."""
+
+    request_id = validate_request_id(request_id)
+    if remote_mutation_started:
+        raise ApprovalError("SSH setup retry is forbidden after remote mutation")
+    if not isinstance(failure_detail, str) or "\x00" in failure_detail:
+        raise ApprovalError("SSH setup failure detail must be valid text")
+    approval_binding_sha256(request_id, request, connection_plan)
+    endpoint = next(
+        (
+            item
+            for item in connection_plan.endpoints
+            if item.resolved.endpoint_id == endpoint_id
+        ),
+        None,
+    )
+    if endpoint is None:
+        raise ApprovalError("SSH retry endpoint is not in the approved plan")
+    resolved = endpoint.resolved
+    retry_binding = _canonical_sha256(
+        {
+            "client_request_sha256": request.client_request_sha256(),
+            "connection_plan_sha256": connection_plan.plan_sha256,
+            "endpoint_id": endpoint_id,
+            "failure_detail": failure_detail,
+            "request_id": request_id,
+            "ssh_retry_binding_version": 1,
+        }
+    )
+    return _terminal_safe_document(
+        [
+            "=== tmuxgate SSH setup retry ===",
+            f"request_id: {request_id}",
+            f"approval_short_id: {request_id[:8]}",
+            f"machine: {_quoted_text(connection_plan.machine_name)}",
+            f"endpoint_id: {_quoted_text(endpoint_id)}",
+            "target: "
+            f"{_quoted_text(resolved.configured_address)}:"
+            f"{resolved.configured_port}",
+            "resolved_identity: "
+            f"{_quoted_text(resolved.resolved_user)}@"
+            f"{_quoted_text(resolved.resolved_hostname)}:"
+            f"{resolved.resolved_port}",
+            f"failure_detail: {_quoted_text(failure_detail)}",
+            f"ssh_retry_binding_sha256: {retry_binding}",
+            "remote_mutation_started: false",
+            "No remote command started. OpenSSH printed its diagnostic "
+            "immediately above.",
+            "One broker-terminal-confirmed retry is allowed for this endpoint.",
+            "=== end SSH setup retry ===",
+            "",
+        ]
+    )
+
+
+def _read_ssh_retry_decision(
+    terminal: ApprovalTerminal,
+    short_id: str,
+    endpoint_id: str,
+) -> ApprovalDecision:
+    retry_line = f"RETRY {short_id} {endpoint_id}"
+    instruction = (
+        f"Type exactly {retry_line} to try SSH setup once more, or CANCEL.\n"
+    )
+    _write_all(terminal.writer, instruction)
+    while True:
+        _write_all(terminal.writer, "tmuxgate ssh> ")
+        try:
+            raw_line = terminal.reader.readline()
+        except Exception as exc:
+            raise ApprovalInputError("unable to read from the broker terminal") from exc
+        if raw_line == "":
+            raise ApprovalInputError(
+                "broker terminal reached EOF before an SSH retry decision"
+            )
+        if not isinstance(raw_line, str):
+            raise ApprovalInputError("broker terminal returned non-text retry input")
+        response = _line_without_terminal_ending(raw_line)
+        raw_line = ""
+        if response == retry_line:
+            response = ""
+            return ApprovalDecision.APPROVED
+        if response == "CANCEL":
+            response = ""
+            return ApprovalDecision.DENIED
+        response = ""
+        _write_all(
+            terminal.writer,
+            "Invalid response; no retry decision was recorded.\n" + instruction,
+        )
+
+
+def request_ssh_retry(
+    request_id: str,
+    request: RequestSpec,
+    connection_plan: ConnectionPlan,
+    *,
+    endpoint_id: str,
+    failure_detail: str,
+    remote_mutation_started: bool,
+    terminal: ApprovalTerminal | None = None,
+) -> ApprovalDecision:
+    """Ask only the broker terminal for one same-endpoint SSH setup retry."""
+
+    document = render_ssh_retry_document(
+        request_id,
+        request,
+        connection_plan,
+        endpoint_id=endpoint_id,
+        failure_detail=failure_detail,
+        remote_mutation_started=remote_mutation_started,
+    )
+    if terminal is None:
+        with open_approval_terminal() as opened_terminal:
+            _display_document(
+                opened_terminal,
+                document,
+                pager=None,
+                pager_threshold_bytes=DEFAULT_PAGER_THRESHOLD_BYTES,
+            )
+            return _read_ssh_retry_decision(
+                opened_terminal, request_id[:8], endpoint_id
+            )
+    _display_document(
+        terminal,
+        document,
+        pager=None,
+        pager_threshold_bytes=DEFAULT_PAGER_THRESHOLD_BYTES,
+    )
+    return _read_ssh_retry_decision(terminal, request_id[:8], endpoint_id)

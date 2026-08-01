@@ -12,8 +12,10 @@ from tmuxgate.approval import (
     approval_binding_sha256,
     render_approval_document,
     render_fallback_approval_document,
+    render_ssh_retry_document,
     request_bound_approval,
     request_fallback_approval,
+    request_ssh_retry,
 )
 from tmuxgate.config import parse_config
 from tmuxgate.connection_plan import (
@@ -306,6 +308,49 @@ class BoundApprovalTests(unittest.TestCase):
             pager=None,
         )
         self.assertIs(decision, ApprovalDecision.DENIED)
+
+    def test_ssh_retry_requires_exact_terminal_confirmation(self):
+        terminal, output = self.terminal(
+            f"yes\nRETRY {REQUEST_ID[:8]} home-lan\n"
+        )
+        detail = "OpenSSH failed\n\x1b[31mterminal text"
+        decision = request_ssh_retry(
+            REQUEST_ID,
+            self.request,
+            self.plan,
+            endpoint_id="home-lan",
+            failure_detail=detail,
+            remote_mutation_started=False,
+            terminal=terminal,
+        )
+        rendered = output.getvalue()
+        self.assertIs(decision, ApprovalDecision.APPROVED)
+        self.assertIn("Invalid response; no retry decision was recorded.", rendered)
+        self.assertIn("No remote command started.", rendered)
+        self.assertIn("\\n\\u001b[31m", rendered)
+        self.assertNotIn("\x1b", rendered)
+
+    def test_ssh_retry_can_be_cancelled_and_is_forbidden_after_mutation(self):
+        terminal, _output = self.terminal("CANCEL\n")
+        decision = request_ssh_retry(
+            REQUEST_ID,
+            self.request,
+            self.plan,
+            endpoint_id="home-lan",
+            failure_detail="status 255",
+            remote_mutation_started=False,
+            terminal=terminal,
+        )
+        self.assertIs(decision, ApprovalDecision.DENIED)
+        with self.assertRaisesRegex(ApprovalError, "forbidden"):
+            render_ssh_retry_document(
+                REQUEST_ID,
+                self.request,
+                self.plan,
+                endpoint_id="home-lan",
+                failure_detail="late failure",
+                remote_mutation_started=True,
+            )
 
 
 if __name__ == "__main__":

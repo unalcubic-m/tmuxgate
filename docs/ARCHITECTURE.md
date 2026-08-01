@@ -444,15 +444,44 @@ The transport implementation enforces the retention policy and
 exact broker-owned OpenSSH invocation plans. Initial master authentication is
 marked as broker-terminal interactive with `BatchMode=no`; health checks,
 control operations, and future machine-control channel prefixes force
-`BatchMode=yes`. All of them explicitly override `RemoteCommand=none`,
-`RequestTTY=no`, `-T`, configured hostname/user/port, host-key alias, strict
-host-key policy, and known-host files. The pool revalidates the complete
-resolved identity digest immediately before use. It retains at most three
+`BatchMode=yes`. Every path also sets `IdentitiesOnly=yes` with the dedicated
+per-machine key. Resolution requires that key to be the sole effective
+`IdentityFile` and rejects profile-added `CertificateFile` entries, preventing
+unrelated agent, default, or profile keys from exhausting a server's
+authentication-attempt limit. All of them explicitly override
+`RemoteCommand=none`, `RequestTTY=no`, `-T`, configured hostname/user/port,
+host-key alias, strict host-key policy, and known-host files. The pool
+revalidates the complete resolved identity digest immediately before use. It
+retains at most three
 mode-`0600` sockets in the private control directory, multiplexes separately
 identified job leases on a machine transport, evicts only the least-recent
 idle transport, and reconnects expired masters
 through the interactive path. The subprocess backend is enabled only inside
 the broker process.
+
+OpenSSH owns its normal password/passphrase attempts and writes its diagnostic
+only to the broker terminal. A nonzero initial-master exit becomes a typed
+pre-remote failure containing only the numeric exit status and guidance to
+review that terminal; the status alone is not classified as an authentication
+failure because it may also represent host-key, configuration, or reachability
+failure. tmuxgate does not capture or persist the terminal text.
+Before considering an approved fallback, the executor may offer exactly one
+same-endpoint retry. It requires an exact broker-terminal confirmation, keeps
+the original request and connection-plan binding, recollects local network
+evidence, re-resolves SSH policy and host-key evidence, and requires the
+approved machine, ordered candidate eligibility, eligible endpoint order, and
+complete resolved SSH identities to remain equal. The retried endpoint must
+remain eligible. Volatile observation bytes and their snapshot digest may
+change when those security semantics do not. A semantic change fails closed
+and requires a fresh request and approval. A subsequently approved fallback
+endpoint has its own single-retry bound. Failed-start cleanup removes an owned
+control socket only after master shutdown is confirmed; if shutdown fails, the
+socket is retained in cleanup-only pool state and shutdown is retried during
+the broker lifecycle. Declining or failing the bounded retry starts no remote
+command and cannot create durable remote-job state. No local transport,
+identity-validation, or control-path error is retried; a typed nonzero OpenSSH
+start exit remains opaque except for the terminal diagnostic and numeric
+status.
 
 Canonical local collection is part of the lease gate. Once completion, local
 spool verification, viewer detachment, and terminal restoration all pass, a

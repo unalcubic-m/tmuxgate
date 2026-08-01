@@ -11,6 +11,7 @@ from tmuxgate.models import ExecutionMode, RequestSpec
 from tmuxgate.transport import (
     MasterTransportPool,
     SshInvocation,
+    SshMasterStartError,
     TransportAuthorization,
     TransportBusyError,
     TransportError,
@@ -38,6 +39,7 @@ class FakeMasterBackend:
         self.stops = []
         self.fail_next_start = False
         self.fail_next_check = False
+        self.fail_next_stop = False
 
     def start_master(self, invocation, control_path):
         self.starts.append(invocation)
@@ -62,6 +64,9 @@ class FakeMasterBackend:
 
     def stop_master(self, invocation, control_path):
         self.stops.append(invocation)
+        if self.fail_next_stop:
+            self.fail_next_stop = False
+            raise RuntimeError("synthetic master stop failure")
         master = self.sockets.pop(control_path, None)
         if master is not None:
             master.close()
@@ -84,6 +89,12 @@ class FakeMasterBackend:
             except FileNotFoundError:
                 pass
         self.sockets.clear()
+
+
+class PartialStartMasterBackend(FakeMasterBackend):
+    def start_master(self, invocation, control_path):
+        super().start_master(invocation, control_path)
+        raise SshMasterStartError(255)
 
 
 def authorization(machine_name, endpoint, request_id=REQUEST_ID, plan_digest="b" * 64):
@@ -133,7 +144,8 @@ class InvocationTests(unittest.TestCase):
         self.assertEqual(invocation.argv[0], "/usr/bin/ssh")
         for required in (
             "-M", "-N", "-f", "BatchMode=no", "RemoteCommand=none",
-            "RequestTTY=no", "ClearAllForwardings=yes", "ControlMaster=yes",
+            "RequestTTY=no", "IdentitiesOnly=yes", "ClearAllForwardings=yes",
+            "ControlMaster=yes",
             "StrictHostKeyChecking=ask", "HostName=192.0.2.20", "-T",
         ):
             self.assertIn(required, invocation.argv)
@@ -145,6 +157,7 @@ class InvocationTests(unittest.TestCase):
         for invocation in (check, batch):
             self.assertFalse(invocation.interactive_terminal)
             self.assertIn("BatchMode=yes", invocation.argv)
+            self.assertIn("IdentitiesOnly=yes", invocation.argv)
             self.assertIn("RemoteCommand=none", invocation.argv)
             self.assertIn("RequestTTY=no", invocation.argv)
             self.assertIn("-T", invocation.argv)
@@ -361,6 +374,56 @@ class MasterPoolTests(unittest.TestCase):
         with self.assertRaisesRegex(TransportError, "control check"):
             self.acquire(0)
         self.assertEqual(self.pool.retained_machine_names, ())
+        self.assertEqual(list(self.pool.control_dir.iterdir()), [])
+
+    def test_partial_failed_start_stops_owned_master_before_unlink(self):
+        self.backend.close()
+        self.backend = PartialStartMasterBackend()
+        self.addCleanup(self.backend.close)
+        self.pool.backend = self.backend
+
+        with self.assertRaisesRegex(SshMasterStartError, "status 255"):
+            self.acquire(0)
+
+        self.assertEqual(len(self.backend.starts), 1)
+        self.assertEqual(len(self.backend.stops), 1)
+        self.assertEqual(self.pool.retained_machine_names, ())
+        self.assertEqual(list(self.pool.control_dir.iterdir()), [])
+
+    def test_partial_start_stop_failure_retains_owned_control_socket(self):
+        self.backend.close()
+        self.backend = PartialStartMasterBackend()
+        self.addCleanup(self.backend.close)
+        self.backend.fail_next_stop = True
+        self.pool.backend = self.backend
+
+        with self.assertRaisesRegex(
+            TransportError, "retained for broker lifecycle cleanup"
+        ):
+            self.acquire(0)
+
+        self.assertEqual(len(self.backend.starts), 1)
+        self.assertEqual(len(self.backend.stops), 1)
+        self.assertEqual(self.pool.retained_machine_names, ("app-server",))
+        retained_path = next(iter(self.backend.sockets))
+        self.assertTrue(retained_path.exists())
+        self.assertEqual(list(self.pool.control_dir.iterdir()), [retained_path])
+
+    def test_shutdown_retries_cleanup_of_retained_partial_master(self):
+        self.backend.close()
+        self.backend = PartialStartMasterBackend()
+        self.addCleanup(self.backend.close)
+        self.backend.fail_next_stop = True
+        self.pool.backend = self.backend
+
+        with self.assertRaises(TransportError):
+            self.acquire(0)
+        retained_path = next(iter(self.backend.sockets))
+
+        self.assertEqual(self.pool.close_idle(), ("app-server",))
+        self.assertEqual(len(self.backend.stops), 2)
+        self.assertEqual(self.pool.retained_machine_names, ())
+        self.assertFalse(retained_path.exists())
         self.assertEqual(list(self.pool.control_dir.iterdir()), [])
 
     def test_preexisting_or_unsafe_control_path_is_never_replaced(self):

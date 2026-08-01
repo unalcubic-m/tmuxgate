@@ -301,6 +301,21 @@ process stdin cannot answer the prompt. The dashboard does not hold the
 terminal while idle, allowing approvals, SSH authentication, and automatic
 secret-prompt attachments to use the same terminal safely.
 
+If initial OpenSSH master setup exits, tmuxgate leaves OpenSSH's diagnostic in
+that controlling terminal, reports its exit status without copying terminal
+output into MCP or durable state, and offers at most one exact broker-terminal
+retry for each attempted approved endpoint before any remote command starts.
+The retry recollects local network evidence,
+re-resolves SSH policy, and proceeds only if the approved machine, ordered
+candidate eligibility, eligible endpoint order, and complete resolved SSH
+identities are unchanged. Volatile observation bytes may produce a new
+snapshot digest without invalidating those semantics. The retry is never
+automatic; a semantic change requires a fresh request and approval.
+The dedicated per-machine key is the only effective identity file permitted,
+and it is used with `IdentitiesOnly=yes`, so unrelated agent/default keys
+cannot consume the server's authentication-attempt limit. Profile-added
+`IdentityFile` or `CertificateFile` entries make SSH planning fail closed.
+
 ## Security model
 
 tmuxgate is designed to fail closed around route evidence, effective SSH

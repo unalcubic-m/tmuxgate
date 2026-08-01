@@ -47,6 +47,20 @@ class TransportIdentityError(TransportError):
     """The current SSH identity differs from the approved plan."""
 
 
+class SshMasterStartError(TransportError):
+    """Interactive OpenSSH exited before an authenticated master was ready."""
+
+    def __init__(self, returncode: int) -> None:
+        if type(returncode) is not int:
+            raise TypeError("SSH master return code must be an integer")
+        self.returncode = returncode
+        super().__init__(
+            "approved SSH master setup exited with status "
+            f"{returncode} before remote execution; review the OpenSSH "
+            "diagnostic printed in the broker terminal"
+        )
+
+
 def _canonical_sha256(document: Mapping[str, object]) -> str:
     encoded = json.dumps(
         document,
@@ -173,6 +187,7 @@ def _identity_options(
         "-o", f"HostKeyAlias={resolved.host_key_alias}",
         "-o", f"HostName={resolved.resolved_hostname}",
         "-o", f"IdentityFile={default_tmuxgate_identity_file(resolved.machine_name)}",
+        "-o", "IdentitiesOnly=yes",
         "-o", "PermitLocalCommand=no",
         "-o", f"Port={resolved.resolved_port}",
         "-o", "RemoteCommand=none",
@@ -300,6 +315,7 @@ class MasterTransport:
     identity_sha256: str
     last_used: float
     pinned_request_ids: set[str] = field(default_factory=set)
+    cleanup_pending: bool = False
 
 
 class TransportLease:
@@ -468,6 +484,9 @@ class MasterTransportPool:
                 authorization, resolved
             )
             existing = self._transports.get(authorization.machine_name)
+            if existing is not None and existing.cleanup_pending:
+                self._stop(existing)
+                existing = None
             if existing is not None and existing.identity_sha256 != identity_digest:
                 self._stop(existing)
                 existing = None
@@ -522,14 +541,48 @@ class MasterTransportPool:
                     if self.key_manager is not None:
                         self.key_manager.enroll_remote_key(current, path)
                 except BaseException:
-                    if master_started:
+                    should_stop = master_started
+                    if not should_stop:
+                        try:
+                            should_stop = self._control_socket_present(path)
+                        except BaseException:
+                            should_stop = False
+                    if should_stop:
                         try:
                             stop = build_master_control_invocation(
                                 current, path, "exit"
                             )
                             self.backend.stop_master(stop, path)
-                        except BaseException:
-                            pass
+                        except BaseException as stop_exc:
+                            try:
+                                socket_retained = self._control_socket_present(path)
+                            except BaseException as path_exc:
+                                raise TransportError(
+                                    "partial SSH master shutdown was not confirmed "
+                                    "and its control path is unsafe; the path was not removed"
+                                ) from path_exc
+                            if socket_retained:
+                                self._transports[authorization.machine_name] = (
+                                    MasterTransport(
+                                        machine_name=authorization.machine_name,
+                                        endpoint=current,
+                                        control_path=path,
+                                        connection_plan_sha256=(
+                                            authorization.connection_plan_sha256
+                                        ),
+                                        identity_sha256=identity_digest,
+                                        last_used=self.clock(),
+                                        cleanup_pending=True,
+                                    )
+                                )
+                                raise TransportError(
+                                    "partial SSH master shutdown was not confirmed; "
+                                    "its owned control socket was retained for "
+                                    "broker lifecycle cleanup"
+                                ) from stop_exc
+                            raise TransportError(
+                                "partial SSH master shutdown was not confirmed"
+                            ) from stop_exc
                     self._remove_socket_if_safe(path)
                     raise
                 existing = MasterTransport(

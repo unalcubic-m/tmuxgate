@@ -13,6 +13,7 @@ from tmuxgate.approval import (
     ApprovalDecision,
     request_approval,
     request_fallback_approval,
+    request_ssh_retry,
 )
 from tmuxgate.broker import BrokerServer
 from tmuxgate.broker_api import BrokerControlService
@@ -250,6 +251,16 @@ class UnifiedApplication:
                     ):
                         return request_fallback_approval(*arguments, **keywords)
 
+                def ssh_retry_approver(
+                    *arguments: object,
+                    **keywords: object,
+                ) -> ApprovalDecision:
+                    with self._terminal.claim(
+                        priority=TerminalPriority.SECRET,
+                        purpose="SSH setup retry decision",
+                    ):
+                        return request_ssh_retry(*arguments, **keywords)
+
                 executor = RealExecutor(
                     planner=planner,
                     transports=pool,
@@ -265,6 +276,7 @@ class UnifiedApplication:
                         if config.broker.approval_mode == "always"
                         else _approve_without_prompt
                     ),
+                    ssh_retry_approver=ssh_retry_approver,
                 )
                 selected_executor = executor
                 approval_discarder = executor.discard_approval

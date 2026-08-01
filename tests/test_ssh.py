@@ -32,6 +32,7 @@ def ssh_g_output(**changes):
         "hostname": "192.0.2.20",
         "port": "22",
         "batchmode": "no",
+        "identitiesonly": "yes",
         "canonicalizehostname": "false",
         "requesttty": "false",
         "stricthostkeychecking": "ask",
@@ -42,7 +43,7 @@ def ssh_g_output(**changes):
         "pubkeyauthentication": "true",
         "passwordauthentication": "true",
         "kbdinteractiveauthentication": "true",
-        "identityfile": "~/.ssh/id_ed25519",
+        "identityfile": str(default_tmuxgate_identity_file("app-server")),
         "hostkeyalgorithms": "ssh-ed25519,rsa-sha2-512",
         "canonicalizePermittedcnames": "none",
     }
@@ -88,12 +89,17 @@ class SshResolutionTests(unittest.TestCase):
         self.assertIn("RequestTTY=no", argv)
         self.assertIn("HostName=192.0.2.20", argv)
         self.assertIn("HostKeyAlias=tmuxgate-app-server", argv)
+        self.assertIn("IdentitiesOnly=yes", argv)
         self.assertNotIn("ProxyCommand", " ".join(argv))
 
         resolved = self.resolve()
         self.assertEqual(resolved.resolved_user, "operator")
         self.assertEqual(resolved.resolved_hostname, "192.0.2.20")
         self.assertEqual(resolved.host_key_evidence.status, "unknown")
+        self.assertEqual(
+            resolved.identity_files,
+            (str(default_tmuxgate_identity_file("app-server")),),
+        )
         self.assertEqual(resolved.enabled_authentication_methods, (
             "publickey", "password", "keyboard-interactive"
         ))
@@ -121,6 +127,7 @@ class SshResolutionTests(unittest.TestCase):
         changes = (
             ("requesttty", "true"),
             ("batchmode", "yes"),
+            ("identitiesonly", "no"),
             ("canonicalizehostname", "true"),
             ("permitlocalcommand", "yes"),
             ("remotecommand", "tmux new-session -A -s base"),
@@ -133,6 +140,17 @@ class SshResolutionTests(unittest.TestCase):
             with self.subTest(key=key, value=value):
                 with self.assertRaises(SshResolutionError):
                     self.resolve(ssh_g_output(**{key: value}))
+
+    def test_profile_cannot_add_identity_or_certificate_files(self):
+        unsafe_outputs = (
+            ssh_g_output(identityfile="/tmp/profile-replacement"),
+            ssh_g_output() + b"identityfile /tmp/profile-extra\n",
+            ssh_g_output() + b"certificatefile /tmp/profile-cert.pub\n",
+        )
+        for output in unsafe_outputs:
+            with self.subTest(output=output[-48:]):
+                with self.assertRaises(SshResolutionError):
+                    self.resolve(output)
 
     def test_owner_config_proxy_and_identity_are_recorded_in_plan_evidence(self):
         first = self.resolve(ssh_g_output(proxyjump="bastion"))
