@@ -19,6 +19,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from typing import Mapping, Sequence
 
 if sys.version_info < (3, 11):  # pragma: no cover - cannot run under the test floor
@@ -251,6 +252,8 @@ def _write_owned(
 ) -> OwnedMutation | None:
     preimage = FileSnapshot.capture(path) if before is None else before
     expected = FileSnapshot(True, kind="file", data=payload, mode=mode)
+    if FileSnapshot.capture(path) != preimage:
+        raise InstallError(f"refusing to overwrite a concurrent change to {path}")
     try:
         _atomic_write(path, payload, mode)
     except BaseException as exc:
@@ -277,6 +280,8 @@ def _symlink_owned(
 ) -> OwnedMutation | None:
     preimage = FileSnapshot.capture(path) if before is None else before
     expected = FileSnapshot(True, kind="symlink", target=target)
+    if FileSnapshot.capture(path) != preimage:
+        raise InstallError(f"refusing to overwrite a concurrent change to {path}")
     try:
         _atomic_symlink(path, target)
     except BaseException as exc:
@@ -365,6 +370,7 @@ def _run(
     command: Sequence[str],
     *,
     env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
     capture: bool = False,
     label: str,
 ) -> subprocess.CompletedProcess[str]:
@@ -373,6 +379,7 @@ def _run(
         list(command),
         check=False,
         env=_child_environment(env),
+        cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
@@ -453,45 +460,168 @@ def update_profile(original: bytes, env_path: Path) -> bytes:
     return updated.encode("utf-8")
 
 
-def patch_codex_timeout(raw: bytes, *, name: str = MCP_NAME) -> bytes:
-    """Set the tool timeout only inside Codex's generated tmuxgate table."""
+_CODEX_ANY_TABLE_LINE = re.compile(
+    r"^[ \t]*\[{1,2}[^\r\n]+\]{1,2}[ \t]*(?:#[^\r\n]*)?(?:\r\n|\n|\r)?$"
+)
+_CODEX_SIMPLE_ASSIGNMENT = re.compile(
+    r"^[ \t]*[A-Za-z0-9_-]+[ \t]*=[ \t]*"
+    r"(?:\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[+-]?[0-9][0-9_]*|true|false)"
+    r"[ \t]*(?:#[^\r\n]*)?(?:\r\n|\n|\r)?$"
+)
 
-    try:
-        text = raw.decode("utf-8")
-        tomllib.loads(text)
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise InstallError("Codex config is not valid UTF-8 TOML") from exc
+
+def _codex_registration_payload(*, url: str, name: str = MCP_NAME) -> bytes:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise InstallError("unsafe Codex MCP server name")
-    header = re.compile(rf"(?m)^\[mcp_servers\.{re.escape(name)}\][ \t]*(?:#.*)?$")
-    matches = list(header.finditer(text))
-    if len(matches) != 1:
-        raise InstallError(f"expected exactly one [mcp_servers.{name}] table")
-    body_start = matches[0].end()
-    next_header = re.search(r"(?m)^\s*\[", text[body_start:])
-    body_end = len(text) if next_header is None else body_start + next_header.start()
-    body = text[body_start:body_end]
-    timeout_line = re.compile(r"(?m)^[ \t]*tool_timeout_sec[ \t]*=.*$")
-    timeout_matches = list(timeout_line.finditer(body))
-    replacement = f"tool_timeout_sec = {MCP_TOOL_TIMEOUT_SECONDS}"
-    if len(timeout_matches) > 1:
-        raise InstallError("Codex tmuxgate table has duplicate tool_timeout_sec keys")
-    if timeout_matches:
-        start, end = timeout_matches[0].span()
-        new_body = body[:start] + replacement + body[end:]
-    else:
-        content = body.rstrip(" \t\r\n")
-        trailing = body[len(content) :]
-        new_body = content + "\n" + replacement + "\n" + trailing.lstrip("\r\n")
-    updated = (text[:body_start] + new_body + text[body_end:]).encode("utf-8")
+    # JSON strings use the same escapes needed by TOML basic strings for these
+    # ASCII endpoint and environment-variable values.
+    encoded_url = json.dumps(url, ensure_ascii=True)
+    encoded_token_env = json.dumps(MCP_TOKEN_ENV)
+    return (
+        f"[mcp_servers.{name}]\n"
+        f"url = {encoded_url}\n"
+        f"bearer_token_env_var = {encoded_token_env}\n"
+        f"tool_timeout_sec = {MCP_TOOL_TIMEOUT_SECONDS}\n"
+    ).encode("utf-8")
+
+
+def _codex_target(parsed: dict[str, object], *, name: str) -> object | None:
+    servers = parsed.get("mcp_servers")
+    if servers is None:
+        return None
+    if not isinstance(servers, dict):
+        raise InstallError("Codex mcp_servers configuration is not a table")
+    return servers.get(name)
+
+
+def update_codex_registration(
+    raw: bytes,
+    *,
+    url: str,
+    replace_conflict: bool,
+    name: str = MCP_NAME,
+) -> bytes:
+    """Create or update only one simple Codex MCP table.
+
+    Codex's CLI is intentionally not used for mutation because some versions
+    rewrite unrelated configuration. Existing target tables are accepted only
+    in a deliberately small, single-line form whose byte span is unambiguous.
+    """
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise InstallError("unsafe Codex MCP server name")
     try:
-        parsed = tomllib.loads(updated.decode("utf-8"))
-        configured = parsed["mcp_servers"][name]["tool_timeout_sec"]
-    except (KeyError, TypeError, tomllib.TOMLDecodeError) as exc:
-        raise InstallError("updated Codex config failed validation") from exc
-    if configured != MCP_TOOL_TIMEOUT_SECONDS:
-        raise InstallError("updated Codex timeout failed validation")
+        text = raw.decode("utf-8")
+        parsed = tomllib.loads(text)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise InstallError("Codex config is not valid UTF-8 TOML") from exc
+
+    desired = {
+        "url": url,
+        "bearer_token_env_var": MCP_TOKEN_ENV,
+        "tool_timeout_sec": MCP_TOOL_TIMEOUT_SECONDS,
+    }
+    target = _codex_target(parsed, name=name)
+    target_header = re.compile(
+        rf"^[ \t]*\[mcp_servers\.{re.escape(name)}\][ \t]*"
+        rf"(?:#[^\r\n]*)?(?:\r\n|\n|\r)?$"
+    )
+    lines = text.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+    exact_headers = [
+        index for index, line in enumerate(lines) if target_header.fullmatch(line)
+    ]
+
+    if target is None:
+        if exact_headers:
+            raise InstallError("Codex tmuxgate table layout is ambiguous")
+        payload = _codex_registration_payload(url=url, name=name)
+        if not raw:
+            updated = payload
+        else:
+            separator = b"\n" if raw.endswith((b"\n", b"\r")) else b"\n\n"
+            updated = raw + separator + payload
+    else:
+        if not isinstance(target, dict) or len(exact_headers) != 1:
+            raise InstallError(
+                "Codex tmuxgate registration is not one simple "
+                f"[mcp_servers.{name}] table"
+            )
+        header_index = exact_headers[0]
+        end_index = len(lines)
+        for index in range(header_index + 1, len(lines)):
+            if _CODEX_ANY_TABLE_LINE.fullmatch(lines[index]):
+                end_index = index
+                break
+        body = lines[header_index + 1 : end_index]
+        for line in body:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if not _CODEX_SIMPLE_ASSIGNMENT.fullmatch(line):
+                raise InstallError(
+                    "Codex tmuxgate table contains a complex or ambiguous value; "
+                    "edit it manually"
+                )
+
+        if target == desired:
+            return raw
+        compatible = bool(
+            set(target).issubset(desired)
+            and target.get("url") == url
+            and target.get("bearer_token_env_var") == MCP_TOKEN_ENV
+            and (
+                "tool_timeout_sec" not in target
+                or type(target["tool_timeout_sec"]) is int
+            )
+        )
+        if not compatible and not replace_conflict:
+            raise InstallError(
+                "Codex already has a different 'tmuxgate' MCP entry; "
+                "rerun with --replace-codex"
+            )
+        section_start = offsets[header_index]
+        section_end = len(text) if end_index == len(lines) else offsets[end_index]
+        replacement = _codex_registration_payload(url=url, name=name).decode("utf-8")
+        updated = (text[:section_start] + replacement + text[section_end:]).encode("utf-8")
+
+    try:
+        updated_parsed = tomllib.loads(updated.decode("utf-8"))
+        updated_target = _codex_target(updated_parsed, name=name)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError, InstallError) as exc:
+        raise InstallError(
+            "Codex config layout cannot be updated safely; edit it manually"
+        ) from exc
+    if updated_target != desired:
+        raise InstallError(
+            "Codex tmuxgate table has nested or ambiguous configuration; edit it manually"
+        )
     return updated
+
+
+def patch_codex_timeout(raw: bytes, *, name: str = MCP_NAME) -> bytes:
+    """Compatibility helper for updating a matching registration's timeout."""
+
+    try:
+        parsed = tomllib.loads(raw.decode("utf-8"))
+        target = _codex_target(parsed, name=name)
+        if not isinstance(target, dict) or not isinstance(target.get("url"), str):
+            raise InstallError(f"expected exactly one [mcp_servers.{name}] table")
+        url = target["url"]
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError, InstallError) as exc:
+        if isinstance(exc, InstallError):
+            raise
+        raise InstallError("Codex config is not valid UTF-8 TOML") from exc
+    return update_codex_registration(
+        raw,
+        url=url,
+        replace_conflict=False,
+        name=name,
+    )
 
 
 def codex_entry_matches(entry: object, *, url: str) -> bool:
@@ -535,6 +665,32 @@ def launcher_is_replaceable(
     return normalized in known
 
 
+def launcher_snapshot_is_replaceable(
+    snapshot: FileSnapshot,
+    *,
+    launcher: Path,
+    source: Path,
+    install_root: Path,
+    replace_existing: bool,
+) -> bool:
+    """Apply launcher replacement policy to one already-captured preimage."""
+
+    if not snapshot.exists:
+        return True
+    if replace_existing:
+        return snapshot.kind != "missing"
+    if snapshot.kind != "symlink":
+        return False
+    raw_target = Path(snapshot.target)
+    target = raw_target if raw_target.is_absolute() else launcher.parent / raw_target
+    normalized = Path(os.path.normpath(target))
+    known = {
+        Path(os.path.normpath(source / "bin" / "tmuxgate")),
+        Path(os.path.normpath(install_root / "current" / "bin" / "tmuxgate")),
+    }
+    return normalized in known
+
+
 def _parse_codex_list(output: str) -> list[object]:
     try:
         value = json.loads(output)
@@ -545,83 +701,42 @@ def _parse_codex_list(output: str) -> list[object]:
     return value
 
 
-def _register_codex(
-    codex: Path,
-    codex_config: Path,
-    *,
-    url: str,
-    replace_conflict: bool,
-    backup_dir: Path,
-) -> OwnedMutation | None:
-    before = FileSnapshot.capture(codex_config)
-    if before.exists and before.kind != "file":
-        raise InstallError(f"refusing non-regular Codex config: {codex_config}")
-    listing = _run(
-        (str(codex), "mcp", "list", "--json"),
-        capture=True,
-        label="checking Codex MCP registrations",
-    )
-    entries = _parse_codex_list(listing.stdout)
-    matches = [entry for entry in entries if isinstance(entry, dict) and entry.get("name") == MCP_NAME]
-    if len(matches) > 1:
-        raise InstallError("Codex reported duplicate tmuxgate MCP registrations")
-    exact = bool(matches and codex_entry_matches(matches[0], url=url))
-    if matches and not exact and not replace_conflict:
-        raise InstallError(
-            "Codex already has a different 'tmuxgate' MCP entry; rerun with --replace-codex"
+def _verify_codex_registration(codex: Path, *, url: str) -> None:
+    """Verify the canonical table without exposing the live Codex home.
+
+    Some Codex versions rewrite configuration even for commands expected to be
+    read-only. The CLI therefore receives only a disposable, minimal config in
+    a private temporary home and runs from that same isolated directory.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="tmuxgate-codex-verify-") as temporary:
+        codex_home = Path(temporary)
+        _atomic_write(
+            codex_home / "config.toml",
+            _codex_registration_payload(url=url),
+            0o600,
         )
-
-    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
-    if before.exists and before.kind == "file":
-        backup = backup_dir / f"codex-config-{stamp}-{secrets.token_hex(4)}.toml"
-        _atomic_write(backup, before.data, 0o600)
-
-    owned: OwnedMutation | None = None
-    try:
-        if matches and not exact:
-            _run(
-                (str(codex), "mcp", "remove", MCP_NAME),
-                capture=True,
-                label="removing conflicting Codex tmuxgate registration",
-            )
-            owned = OwnedMutation.capture(codex_config, before)
-        if not exact:
-            _run(
-                (
-                    str(codex),
-                    "mcp",
-                    "add",
-                    MCP_NAME,
-                    "--url",
-                    url,
-                    "--bearer-token-env-var",
-                    MCP_TOKEN_ENV,
-                ),
-                capture=True,
-                label="registering tmuxgate with Codex",
-            )
-            owned = OwnedMutation.capture(codex_config, before)
-
-        if not codex_config.exists():
-            raise InstallError(f"Codex did not create its config file: {codex_config}")
-        config_metadata = os.lstat(codex_config)
-        if not stat.S_ISREG(config_metadata.st_mode) or config_metadata.st_uid != os.geteuid():
-            raise InstallError("Codex config is not a current-user regular file")
-        current_config = _read_regular_file(codex_config)
-        patched = patch_codex_timeout(current_config)
-        if patched != current_config:
-            _write_owned(
-                codex_config,
-                patched,
-                stat.S_IMODE(config_metadata.st_mode),
-                before=FileSnapshot.capture(codex_config),
-            )
-            owned = OwnedMutation.capture(codex_config, before)
-
+        environment = dict(os.environ)
+        environment["HOME"] = str(codex_home)
+        environment["CODEX_HOME"] = str(codex_home)
+        environment["PWD"] = str(codex_home)
+        for name, directory_name in (
+            ("XDG_CONFIG_HOME", "xdg-config"),
+            ("XDG_DATA_HOME", "xdg-data"),
+            ("XDG_STATE_HOME", "xdg-state"),
+            ("XDG_CACHE_HOME", "xdg-cache"),
+            ("XDG_RUNTIME_DIR", "xdg-runtime"),
+            ("TMPDIR", "tmp"),
+        ):
+            isolated = codex_home / directory_name
+            isolated.mkdir(mode=0o700)
+            environment[name] = str(isolated)
         verified = _run(
             (str(codex), "mcp", "list", "--json"),
+            env=environment,
+            cwd=codex_home,
             capture=True,
-            label="verifying Codex MCP registration",
+            label="verifying isolated Codex MCP registration",
         )
         verified_entries = _parse_codex_list(verified.stdout)
         verified_matches = [
@@ -635,6 +750,45 @@ def _register_codex(
             raise InstallError("Codex tmuxgate MCP registration did not verify")
         if verified_matches[0].get("tool_timeout_sec") != MCP_TOOL_TIMEOUT_SECONDS:
             raise InstallError("Codex tmuxgate tool timeout did not verify")
+
+
+def _register_codex(
+    codex: Path,
+    codex_config: Path,
+    *,
+    url: str,
+    replace_conflict: bool,
+    backup_dir: Path,
+) -> OwnedMutation | None:
+    before = FileSnapshot.capture(codex_config)
+    if before.exists and before.kind != "file":
+        raise InstallError(f"refusing non-regular Codex config: {codex_config}")
+
+    owned: OwnedMutation | None = None
+    try:
+        current_config = before.data if before.exists else b""
+        updated = update_codex_registration(
+            current_config,
+            url=url,
+            replace_conflict=replace_conflict,
+        )
+        _verify_codex_registration(codex, url=url)
+        if updated != current_config:
+            if before.exists:
+                stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+                backup = backup_dir / f"codex-config-{stamp}-{secrets.token_hex(4)}.toml"
+                _atomic_write(backup, before.data, 0o600)
+            owned = _write_owned(
+                codex_config,
+                updated,
+                before.mode if before.exists else 0o600,
+                before=before,
+            )
+            if owned is None:
+                raise InstallError(
+                    "expected Codex registration mutation did not change config"
+                )
+
         return owned
     except BaseException as exc:
         if owned is not None:
@@ -934,6 +1088,17 @@ def install(args: argparse.Namespace) -> int:
         current = install_root / "current"
         current_before = FileSnapshot.capture(current)
         launcher_before = FileSnapshot.capture(launcher)
+        if not launcher_snapshot_is_replaceable(
+            launcher_before,
+            launcher=launcher,
+            source=source,
+            install_root=install_root,
+            replace_existing=args.replace_existing,
+        ):
+            raise InstallError(
+                f"refusing launcher changed during installation: {launcher}; "
+                "use --replace-existing on a fresh run"
+            )
         # From this point a process could observe the new release even if a
         # directory fsync or later step fails, so failure cleanup must retain it.
         published = True
