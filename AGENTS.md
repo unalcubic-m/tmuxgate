@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`tmuxgate` is a dependency-free Python 3.11+ package using a `src/` layout. Production code lives in `src/tmuxgate/`; `cli.py` and `__main__.py` expose the command-line interface, while broker, transport, approval, planning, state, and remote-execution concerns are separated into focused modules. Packaged shell helpers are under `src/tmuxgate/assets/`. Tests mirror these modules in `tests/test_*.py`. See `docs/ARCHITECTURE.md` before changing lifecycle or security behavior, and use `examples/config.toml` only as a non-secret configuration example.
+`tmuxgate` is a Python 3.11+ package using a `src/` layout. Production code lives in `src/tmuxgate/`; `cli.py` and `__main__.py` expose the command-line interface, while broker, transport, approval, planning, state, and remote-execution concerns are separated into focused modules. Packaged shell helpers are under `src/tmuxgate/assets/`. Tests mirror these modules in `tests/test_*.py`. See `docs/ARCHITECTURE.md` before changing lifecycle or security behavior, and use `examples/config.toml` only as a non-secret configuration example.
 
 ## Build, Test, and Development Commands
 
@@ -11,7 +11,7 @@
 - `PYTHONPATH=src python3 -m unittest tests.test_models -v` runs one test module during focused development.
 - `python3 -m build` creates package artifacts when the optional `build` frontend is installed.
 
-No third-party runtime dependencies are declared. Some integration tests require local Linux facilities such as Unix sockets, PTYs, OpenSSH, or tmux; keep unit tests deterministic and isolated from real remote hosts.
+Runtime dependencies, including the official Python MCP SDK and Uvicorn, are declared in `pyproject.toml`; install the package before running tests directly from the checkout. Some integration tests require local Linux facilities such as Unix sockets, PTYs, OpenSSH, or tmux; keep unit tests deterministic and isolated from real remote hosts.
 
 ## Coding Style & Naming Conventions
 

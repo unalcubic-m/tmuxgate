@@ -24,7 +24,10 @@ classifiers = [
     "Topic :: System :: Networking",
     "Topic :: System :: Systems Administration",
 ]
-dependencies = []
+dependencies = [
+    "mcp==2.0.0",
+    "uvicorn==0.52.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/unalcubic-m/tmuxgate"

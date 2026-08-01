@@ -3,7 +3,13 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from tmuxgate.config import BrokerConfig, ConfigError, load_config, parse_config
+from tmuxgate.config import (
+    BrokerConfig,
+    ConfigError,
+    McpConfig,
+    load_config,
+    parse_config,
+)
 
 
 def valid_config():
@@ -57,6 +63,50 @@ def valid_config():
 
 
 class ConfigTests(unittest.TestCase):
+    def test_version_one_loads_with_loopback_mcp_defaults_and_upgrades_in_memory(self):
+        config = parse_config(valid_config())
+        self.assertEqual(config.version, 2)
+        self.assertEqual(config.mcp, McpConfig(host="127.0.0.1", port=8765))
+
+    def test_version_two_accepts_an_explicit_mcp_port(self):
+        data = valid_config()
+        data["version"] = 2
+        data["mcp"] = {"host": "127.0.0.1", "port": 9876}
+        config = parse_config(data)
+        self.assertEqual(config.version, 2)
+        self.assertEqual(config.mcp.port, 9876)
+
+    def test_mcp_listener_is_restricted_to_literal_ipv4_loopback(self):
+        for host in ("localhost", "::1", "0.0.0.0", "127.0.0.2"):
+            with self.subTest(host=host):
+                data = valid_config()
+                data["version"] = 2
+                data["mcp"] = {"host": host, "port": 8765}
+                with self.assertRaisesRegex(ConfigError, "literal loopback"):
+                    parse_config(data)
+                with self.assertRaisesRegex(ConfigError, "literal loopback"):
+                    McpConfig(host=host)
+
+    def test_mcp_port_and_fields_are_strictly_validated(self):
+        for port in (True, 0, 65536, "8765"):
+            with self.subTest(port=port):
+                data = valid_config()
+                data["version"] = 2
+                data["mcp"] = {"host": "127.0.0.1", "port": port}
+                with self.assertRaisesRegex(ConfigError, "mcp.port"):
+                    parse_config(data)
+        data = valid_config()
+        data["version"] = 2
+        data["mcp"] = {"host": "127.0.0.1", "port": 8765, "path": "/mcp"}
+        with self.assertRaisesRegex(ConfigError, "path"):
+            parse_config(data)
+
+    def test_version_one_rejects_new_schema_fields(self):
+        data = valid_config()
+        data["mcp"] = {"host": "127.0.0.1", "port": 8765}
+        with self.assertRaisesRegex(ConfigError, "mcp"):
+            parse_config(data)
+
     def test_valid_config_supports_three_commands_and_three_masters(self):
         config = parse_config(valid_config())
         self.assertEqual(config.broker.max_active_remote_commands, 3)
@@ -111,6 +161,10 @@ class ConfigTests(unittest.TestCase):
     def test_version_must_be_an_integer_and_machine_allowlist_is_immutable(self):
         data = valid_config()
         data["version"] = 1.0
+        with self.assertRaises(ConfigError):
+            parse_config(data)
+        data = valid_config()
+        data["version"] = 3
         with self.assertRaises(ConfigError):
             parse_config(data)
         config = parse_config(valid_config())

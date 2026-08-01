@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,9 @@ from unittest import mock
 
 from tmuxgate.spool import (
     MANIFEST_NAME,
+    MAX_MANIFEST_BYTES,
+    MAX_VERIFIED_RANGE_BYTES,
+    SPOOL_STREAM_READ_BYTES,
     STDERR_NAME,
     STDOUT_NAME,
     ResultSpool,
@@ -85,6 +89,82 @@ class ResultSpoolTests(unittest.TestCase):
         os.chmod(self.result_path() / STDOUT_NAME, 0o600)
         with self.assertRaisesRegex(SpoolCorruptionError, "do not match"):
             self.spool.load(REQUEST_ID)
+
+    def test_verified_range_hashes_only_selected_stream_with_bounded_reads(self):
+        stdout = (b"0123456789abcdef" * (SPOOL_STREAM_READ_BYTES // 8)) + b"tail"
+        stderr = b"unselected" * (SPOOL_STREAM_READ_BYTES // 2)
+        stored = self.spool.store(REQUEST_ID, stdout, stderr, 7)
+        manifest_size = (self.result_path() / MANIFEST_NAME).stat().st_size
+        read_requests: list[int] = []
+        read_lengths: list[int] = []
+        original_read = os.read
+
+        def observe_read(descriptor, amount):
+            read_requests.append(amount)
+            content = original_read(descriptor, amount)
+            read_lengths.append(len(content))
+            return content
+
+        offset = SPOOL_STREAM_READ_BYTES - 7
+        limit = 100_000
+        with mock.patch("tmuxgate.spool.os.read", side_effect=observe_read):
+            selected = self.spool.read_verified_range(
+                REQUEST_ID,
+                "stdout",
+                offset=offset,
+                limit=limit,
+                expected_manifest_payload_sha256=(
+                    stored.manifest_payload_sha256
+                ),
+                expected_exit_status=7,
+            )
+
+        self.assertEqual(selected.data, stdout[offset : offset + limit])
+        self.assertEqual(selected.total_size, len(stdout))
+        self.assertEqual(selected.sha256, hashlib.sha256(stdout).hexdigest())
+        self.assertLessEqual(len(selected.data), MAX_VERIFIED_RANGE_BYTES)
+        self.assertLessEqual(
+            max(read_requests),
+            max(MAX_MANIFEST_BYTES + 1, SPOOL_STREAM_READ_BYTES),
+        )
+        # The manifest and selected stdout are the only file bytes read.  The
+        # unselected stderr is opened for exact metadata validation only.
+        self.assertEqual(sum(read_lengths), manifest_size + len(stdout))
+
+    def test_verified_range_rejects_same_size_selected_stream_corruption(self):
+        stdout = b"selected-stream-bytes"
+        stored = self.spool.store(REQUEST_ID, stdout, b"other-stream", 7)
+        stream_path = self.result_path() / STDOUT_NAME
+        stream_path.write_bytes(b"X" + stdout[1:])
+        os.chmod(stream_path, 0o600)
+
+        with self.assertRaisesRegex(SpoolCorruptionError, "does not match"):
+            self.spool.read_verified_range(
+                REQUEST_ID,
+                "stdout",
+                offset=0,
+                limit=4,
+                expected_manifest_payload_sha256=(
+                    stored.manifest_payload_sha256
+                ),
+                expected_exit_status=7,
+            )
+
+    def test_verified_range_validates_unselected_stream_metadata_without_reading(self):
+        stored = self.spool.store(REQUEST_ID, b"selected", b"other", 7)
+        os.chmod(self.result_path() / STDERR_NAME, 0o644)
+
+        with self.assertRaisesRegex(SpoolCorruptionError, "metadata"):
+            self.spool.read_verified_range(
+                REQUEST_ID,
+                "stdout",
+                offset=0,
+                limit=4,
+                expected_manifest_payload_sha256=(
+                    stored.manifest_payload_sha256
+                ),
+                expected_exit_status=7,
+            )
 
     def test_manifest_corruption_and_noncanonical_json_are_detected(self):
         self.spool.store(REQUEST_ID, b"out", b"err", 7)

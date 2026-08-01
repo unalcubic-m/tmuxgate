@@ -1,62 +1,315 @@
 # tmuxgate architecture
 
-## Process boundary
+## Unified process boundary
 
-The public architecture has two roles:
+Running `tmuxgate` with no subcommand starts one foreground application with
+three coordinated components:
 
-1. `tmuxgate broker` owns SSH authentication, private per-job local viewers,
-   private SSH control sockets, job state, optional approval UI, and result
-   collection.
-2. `tmuxgate exec` and `tmuxgate script` are noninteractive Unix-socket clients.
-   They submit structured requests and block for their own result.
+1. The existing same-UID Unix-socket broker and execution workers.
+2. An authenticated MCP Streamable HTTP endpoint at `/mcp` on the configured
+   literal loopback address.
+3. The local dashboard in the application's controlling terminal.
 
-`approval_mode = "disabled"` is the default and performs no confirmation
-prompt. `approval_mode = "always"` enables the approval UI; in that mode,
-approval is read only from the broker's `/dev/tty` and socket data is never
-used as terminal input.
+`tmuxgate dashboard` starts the same application explicitly. `tmuxgate broker`
+is a deprecated compatibility alias and no longer starts a broker-only mode.
+There is no `tmuxgate-mcp` executable or Codex-launched helper process. The
+former public `tmuxgate exec` and `tmuxgate script` commands are removed; the
+underlying `RequestSpec` and Unix-socket client remain internal interfaces for
+MCP and tests. Administrative `jobs`, `attach`, `collect`, `recover`, and
+configuration commands remain public. Standalone remote `cleanup` remains
+deliberately disabled and fails closed until its broker-control protocol is
+implemented.
 
-When enabled, the approval display is a compact decision card: advisory purpose,
-logical machine, selected route and resolved identity, host-key status,
-working directory, exact shell-escaped argv or script identity/source,
-environment, timeout, and human-readable advisories. Enter/`y` approves, `n`
-denies, `c` opens the exact structured argv or complete escaped script, and `d`
-opens the exhaustive network/SSH-policy/evidence/binding record. Both views use
-the sealed secure pager and return to the same prompt. Approval is still read
-only from the broker's `/dev/tty`; pager output, socket/client data, process
-stdin, and client-supplied purpose text can never answer the prompt.
+The MCP server is embedded in the same OS process but runs its ASGI event loop
+in a dedicated thread. Its transport is authenticated Streamable HTTP on
+`127.0.0.1`, not stdio. Consequently, MCP protocol bytes cannot consume
+process stdin or the application's `/dev/tty`, and Codex connects to an
+already-running service instead of spawning it.
 
-Running `tmuxgate` without a subcommand opens the local terminal dashboard.
-Its guided settings actions read, validate, and atomically replace the
-owner-only TOML configuration; machine aliases and endpoints are configuration,
-not source-code constants. Direct-home enrollment requires complete local
-link, source-address, route, router-neighbor, and NetworkManager identity
-evidence and refuses a routed WireGuard view. When the otherwise-proven direct
-gateway lacks a cached neighbor entry, enrollment alone may send one bounded
-ICMP request to that configured gateway, then recollect and re-prove the full
+```text
+Codex
+  -> Authorization: Bearer ...
+  -> http://127.0.0.1:<port>/mcp
+  -> embedded typed MCP handlers
+  -> internal one-shot Unix-socket client
+  -> same-UID broker
+  -> approval/planning/execution or broker-owned durable read
+```
+
+The internal MCP-to-broker hop is intentional even though both endpoints share
+a process. MCP handlers retain only the broker socket path and a bounded local
+worker dispatcher. They do not receive the planner, SSH pool, state store,
+spool, machine endpoints, credentials, or cleanup capability. This preserves
+the existing validation and execution trust boundary and ensures that new MCP
+inputs cannot become an alternate execution path.
+
+### Startup and shutdown
+
+The unified lifecycle starts resources in fail-closed order:
+
+1. Load and validate the owner-only configuration as one immutable snapshot.
+2. Prepare private runtime/state directories and securely load or create the
+   MCP bearer-token file.
+3. Acquire the `state.lock` singleton in the state directory before opening or
+   recovering any durable state.
+4. Open durable state and the result spool, then perform startup recovery.
+5. After recovery succeeds, acquire a separate `broker.lock` singleton in the
+   socket's runtime directory, then inspect stale socket state and open the
+   Unix listener while retaining both locks. Distinct lock names preserve both
+   protections when the configured state and runtime directories are the same.
+6. Construct the shared terminal arbiter, planner, transport pool, prompt
+   presenter, executor, broker, and broker control service.
+7. Start the broker, then start and await readiness of the MCP HTTP listener.
+8. Report only sanitized listener/token-path information and enter the
+   dashboard loop.
+
+Startup refuses to accept new approvals when durable recovery reports a
+possibly running or incompletely collected request. An MCP bind or startup
+failure stops the already-started broker and unwinds owned resources; there is
+no silent broker-only mode. The explicit singleton lock prevents a deprecated
+`broker` invocation or a second no-argument invocation that shares state from
+creating a parallel owner; the separate runtime lock serializes every stale
+socket check and bind even when competing invocations select different state
+directories.
+
+`SIGINT`, `SIGTERM`, or dashboard quit sets the shared stop event. Shutdown is
+two-phase around MCP: it first tells the HTTP listener to stop accepting work,
+then performs the broker's bounded worker shutdown so in-flight MCP handlers
+blocked in the internal Unix client can finish, and only then joins the MCP
+server. A clean shutdown subsequently closes the secret-prompt presenter,
+idle SSH masters, and dedicated MCP broker-call pools, followed by the broker
+listener, spool/state, and both singleton locks. If a bounded network component
+does not stop cleanly, tmuxgate reports a software failure and retains its
+owned resources until process exit rather than closing them underneath live
+workers. Disconnecting or timing out an MCP call is not a cancellation
+boundary: its internal blocking Unix-socket client may remain connected until
+the broker produces a result. Its bounded execution-worker slot remains
+charged until that synchronous client really returns. The existing
+pre-approval cancellation rule applies only when that Unix client actually
+disconnects. An approved request is never killed, retried, or made nondurable
+because Codex disappeared.
+
+### Configuration and migration
+
+Configuration is still exclusively backed by the owner-only TOML file at
+`$XDG_CONFIG_HOME/tmuxgate/config.toml` or
+`~/.config/tmuxgate/config.toml`. Dashboard configuration actions invoke the
+same `tmuxgate config` handlers. Structured actions use the same parser,
+validation, serializer, and atomic publisher; the advanced `config edit`
+action instead validates and atomically publishes the edited TOML text. The
+running application does not depend on dashboard state. It retains its startup
+snapshot until restart so a configuration edit cannot change an already
+approved route or execution identity.
+
+Schema version 2 adds:
+
+```toml
+[mcp]
+host = "127.0.0.1"
+port = 8765
+```
+
+The host must be the literal IPv4 loopback address and the port must be from 1
+through 65535. Version-1 files remain valid without an `[mcp]` table and are
+normalized in memory to these defaults. Structured managed writes always
+publish version 2, so they require no separate migration command. The raw
+`config edit` workflow preserves version 1 unless the operator changes it.
+Version 1 deliberately does not accept an `[mcp]` table; change the top-level
+version to 2 when configuring a nondefault port.
+
+Operational migration replaces a broker-only launch with the no-argument
+unified application, removes any Codex stdio/`tmuxgate-mcp` registration, and
+registers the authenticated loopback URL. Callers move from the removed public
+`exec`/`script` commands to the typed `run_argv`/`run_script` tools. Existing
+administrative CLI workflows and durable records are retained.
+
+### User installation and Codex registration
+
+The root `./install.sh` is a user-scoped deployment transaction, not a service
+manager. It refuses root, takes a private installer lock, and builds each
+release in a new timestamped virtual environment below
+`$XDG_DATA_HOME/tmuxgate/releases`. Python packages, including the official MCP
+SDK and Uvicorn, are installed only into that environment; Node.js is not part
+of the runtime or installation path. Imports, the installed CLI, and any
+existing tmuxgate configuration are validated before the managed `current` and
+user launcher symlinks are atomically switched.
+
+The legacy checkout-backed `~/.local/bin/tmuxgate` symlink and a launcher from
+an earlier managed install are recognized replacement targets. An unrelated
+file or symlink fails closed unless the operator supplies
+`--replace-existing`. The installer does not rewrite
+`config.toml`, durable job records, verified result spools, or an existing
+`mcp-token`; it invokes the installed token loader only to validate and reuse
+that token, or to create the normal owner-only token when none exists. The
+default protected configuration must exist before installation. A newly
+created token is durable application state and is intentionally retained if a
+later deployment step fails.
+
+Codex registration is performed through `codex mcp` using the configured
+`http://127.0.0.1:<port>/mcp` Streamable HTTP URL and
+`TMUXGATE_MCP_TOKEN` as `bearer_token_env_var`. The installer then applies and
+verifies `tool_timeout_sec = 604900` in the generated tmuxgate table. It leaves
+unrelated MCP registrations intact and refuses a different registration named
+`tmuxgate` unless `--replace-codex` is explicit. An owner-controlled Codex home
+is hardened to mode `0700` before its configuration is changed. Installer
+children receive neither the MCP bearer token nor `PYTHONPATH`, `PYTHONHOME`,
+or `VIRTUAL_ENV`, preventing credentials or checkout imports from leaking into
+pip build isolation, smoke tests, or Codex commands.
+
+For Bash launches, the installer writes an owner-only
+`$XDG_CONFIG_HOME/tmuxgate/codex-env.sh` and a delimited managed source block
+in `.bashrc` and `.profile`. The environment file contains a fixed token-file
+path and canonical-token validation, never the credential bytes; each new
+shell reads the credential directly from the owner-only durable state file.
+The installer cannot alter an already-running process environment or MCP
+registry snapshot, so a new Bash shell and a Codex restart are required.
+
+Before changing a pre-existing Codex config or Bash profile, the installer
+writes an owner-only backup below `$XDG_DATA_HOME/tmuxgate/backups`. It retains
+snapshots of every managed mutation until the launcher switch and install
+manifest complete. Failure restores a file or link only while its exact
+installer-written post-image is still present, so a concurrent user or Codex
+edit is never overwritten. An unpublished incomplete release is removed; a
+release that may already have been observed through `current` is retained even
+after rollback so a running process cannot lose packaged assets. Successful
+installations retain older versioned releases and backups for operator
+recovery. The application itself is never started, stopped, or killed by the
+installer: `tmuxgate` must still run in the foreground in the terminal that
+owns approvals and authentication.
+
+If the preserved configuration has `approval_mode = "disabled"`, installation
+stops before Codex and launcher mutation unless the operator supplies
+`--allow-disabled-approvals`. Registration does not weaken or override that
+policy: the bearer token alone authorizes execution requests in this mode,
+whereas `approval_mode = "always"` retains the independent broker-terminal
+decision.
+
+Configuration edits are validated and atomically published but require a
+restart. Direct-home enrollment still requires complete local link,
+source-address, route, router-neighbor, and NetworkManager identity evidence
+and refuses a routed WireGuard view. When the otherwise-proven direct gateway
+lacks a cached neighbor entry, enrollment alone may send one bounded ICMP
+request to that configured gateway, then recollect and re-prove the full
 snapshot before publication. Ordinary planning remains passive. These settings
 actions do not open SSH or mutate a remote machine.
 
+### MCP authentication and transport security
+
+Loopback TCP has no Unix peer-credential equivalent, so every HTTP request must
+present `Authorization: Bearer <token>`. A small ASGI middleware compares the
+complete header in constant time and rejects failures before MCP parsing. The
+MCP application also receives its fixed host for Host/Origin and DNS-rebinding
+validation, disables access logging, and caps a request body at 24 MiB. The
+listener cannot be configured on a wildcard, hostname, IPv6 address, or
+non-loopback interface.
+
+Before an execution request opens the Unix socket, the MCP handler serializes
+its broker header and enforces the broker protocol's 256 KiB metadata limit.
+Oversized argv/environment requests therefore produce an input error instead
+of being misclassified as a malformed broker response.
+
+The first unified startup creates `mcp-token` below the selected durable state
+directory, normally `~/.local/state/tmuxgate/mcp-token`. The token is 32 random
+bytes represented as 64 lowercase hexadecimal characters plus one newline.
+Creation uses an exclusive private temporary file, mode `0600`, file `fsync`,
+atomic no-overwrite publication, and directory `fsync`. Every load rejects
+symlinks, non-regular files, the wrong owner or mode, malformed contents, and
+replacement races. The application prints the token path, never the token.
+
+For the credential, Codex configuration stores only the name of the environment
+variable that supplies it:
+
+```toml
+[mcp_servers.tmuxgate]
+url = "http://127.0.0.1:8765/mcp"
+bearer_token_env_var = "TMUXGATE_MCP_TOKEN"
+tool_timeout_sec = 604900
+```
+
+The environment variable must be populated from the token file before Codex
+starts. The recommended timeout covers `RequestSpec`'s seven-day maximum plus
+protocol overhead; shorter local policy is valid but may cause Codex to stop
+waiting while an approved durable job continues. Token rotation requires
+restarting tmuxgate and every Codex process that uses the old credential.
+
+Possession of the bearer token grants request-submission authority. With
+`approval_mode = "disabled"`, that authority can cause remote execution without
+a per-request terminal decision. Authorization headers, request scripts,
+environment values, stdout/stderr, and secret-terminal events must never be
+logged. The token is state, not configuration, and must not be copied into the
+main TOML file.
+
+### Typed MCP tools
+
+The MCP surface contains exactly five tools:
+
+- `list_machines()` returns only logical aliases and descriptions; endpoints,
+  addresses, SSH identities/options, routes, keys, and host-key evidence remain
+  private to the broker.
+- `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?)`
+  validates and creates `RequestSpec(mode=ARGV)` without shell-joining argv.
+- `run_script(machine, cwd, purpose, script?, script_base64?, environment?,
+  timeout_seconds?)` requires exactly one UTF-8 text script or canonical base64
+  exact-byte script and creates `RequestSpec(mode=SCRIPT)`.
+- `list_jobs(states?, limit=50, cursor?)` exposes sanitized durable metadata in
+  newest-first pages. Page size is from 1 through 100 and cursors are opaque.
+- `read_verified_result(request_id, stream, offset=0, limit=65536)` reads only
+  `stdout` or `stderr`, with a maximum 1 MiB chunk.
+
+Execution tools are annotated mutating, destructive, non-idempotent, and
+open-world. List/result tools are annotated read-only, non-destructive,
+idempotent, and closed-world. Codex-side approval based on those annotations is
+only additive; broker-terminal approval remains authoritative.
+
+`run_argv` and `run_script` block for the broker result and return the request
+ID, transport status, optional remote exit status/detail, and length plus
+SHA-256 for each stream. A stream of at most 64 KiB is included as base64;
+larger content is omitted and marked truncated. `read_verified_result` returns
+base64 chunk bytes, current/next offsets, EOF, complete stream size/digest,
+exit status, and manifest digest. It never contacts SSH and never reads tmux
+pane history.
+
+Before a result byte is exposed, the broker requires durable state to mark the
+local spool verified with a manifest digest and binds the current manifest and
+exit status back to that record. It exact-validates both stream files, then
+hashes only the selected stream in fixed 64 KiB reads while retaining at most
+the requested 1 MiB range. Missing, corrupt, mismatched, unverified, abandoned,
+or recovery-required results fail closed. `list_jobs` exposes only the request
+ID, logical machine, state, decision, timestamps, exit status, verified-result
+availability, and recovery requirement.
+
+### Unix broker protocol and implementation boundary
+
 Each client sends exactly one request frame, then shuts down its socket's write
-side. The broker requires that EOF before considering the request complete;
-multiple result frames may flow in the opposite direction. Frame reads have a
-bounded deadline, and argv/cwd/environment filesystem bytes are base64 fields
-inside the JSON header so non-UTF-8 bytes survive exactly.
+side. The broker requires EOF before considering the request complete. Frame
+reads have a bounded deadline, and argv/cwd/environment filesystem bytes are
+base64 fields inside the JSON header so non-UTF-8 bytes survive exactly.
+Execution responses may contain multiple status/result frames. The three MCP
+control requests (`list_machines`, `list_jobs`, and `read_verified_result`) use
+the same one-frame, EOF-terminated, same-UID-validated socket boundary and one
+strictly decoded response.
 
-### Current implementation boundary
-
-The public broker composes the local socket boundary, one-shot bound planner,
-real broker-owned OpenSSH master/channels, durable state, dedicated remote tmux
-jobs, canonical result spool, and client delivery. `--fake` remains available
-for local tests. Successful jobs auto-collect and auto-clean. Local `collect`
+The broker composes that local socket boundary, one-shot bound planner, real
+broker-owned OpenSSH master/channels, durable state, dedicated remote tmux jobs,
+canonical result spool, and client delivery. `--fake` remains available for
+local tests. Successful jobs auto-collect and auto-clean. Local `collect`
 replays a checksummed spool. `attach` enters an active request's private local
-viewer without issuing a new remote command. Standalone remote `cleanup`
-remains deliberately disabled and fail closed until its broker-control
-protocol is implemented.
+viewer without issuing a new remote command.
 
-Ephemeral socket, control, and singleton-lock files live below
+The embedded MCP layer uses separate bounded thread pools for execution waits
+and read-only control requests. Long `run_argv`/`run_script` calls therefore
+cannot consume the workers used by `list_machines`, `list_jobs`, or
+`read_verified_result`. The broker client-session limit includes a matching
+control-session reserve, so execution saturation cannot move the starvation
+point down to the Unix listener. A disconnected coroutine does not free its
+execution slot while its synchronous Unix client remains live, preventing
+unbounded queued work after repeated HTTP cancellations.
+
+Ephemeral socket, control, viewer, and `broker.lock` socket-lifecycle files live below
 `$XDG_RUNTIME_DIR/tmuxgate`. The durable boundary is
-`$XDG_STATE_HOME/tmuxgate` (default `~/.local/state/tmuxgate`) with an
-owner-only spool. The owner-only durable job store now uses checksummed,
+`$XDG_STATE_HOME/tmuxgate` (default `~/.local/state/tmuxgate`) with the
+`state.lock` lifecycle singleton, token, job records, and owner-only spool. The
+durable job store uses checksummed,
 generation-checked JSON records, mode `0600`, same-directory atomic replacement,
 file `fsync`, and directory `fsync`. Startup recovery atomically terminalizes
 records proven to be pre-remote and blocks all new approvals for possibly
@@ -68,16 +321,15 @@ and fsynced; the verified spool flag is inseparable from its exact manifest
 digest. The real executor uses this store directly; there is no second state
 path.
 
-The complete approval document can now bind the exact client request to the
-ordered route plan, canonical network-snapshot digest, strict `ssh -G`
-identity, SSH policy digest, host-key alias/evidence, proxy configuration, and
-fallback order. The connection-plan component resolves every eligible fallback
-up front and fails the entire plan if any resolved identity is inconsistent.
-The one-shot planner now composes collection, route policy, `ssh -G`
-resolution, and optional bound terminal approval without opening SSH. An
-authorized context contains only the request digest and immutable plan, is
-consumed once, and multiple request-bound contexts may await parallel executor
-workers.
+The complete approval document binds the exact client request to the ordered
+route plan, canonical network-snapshot digest, strict `ssh -G` identity, SSH
+policy digest, host-key alias/evidence, proxy configuration, and fallback order.
+The connection-plan component resolves every eligible fallback up front and
+fails the entire plan if any resolved identity is inconsistent. The one-shot
+planner composes collection, route policy, `ssh -G` resolution, and optional
+bound terminal approval without opening SSH. An authorized context contains
+only the request digest and immutable plan, is consumed once, and multiple
+request-bound contexts may await parallel executor workers.
 
 ## Bounded command leases and retained transports
 
@@ -93,6 +345,21 @@ held until:
 Detaching while a command runs does not release that request's lease. An
 uncertain job holds its own lease in recovery-required state; other configured
 slots continue independently.
+
+`approval_mode = "disabled"` is the default and performs no confirmation
+prompt after authentication and broker validation. `approval_mode = "always"`
+enables the terminal approval UI. Its compact decision card contains advisory
+purpose, logical machine, selected route and resolved identity, host-key status,
+working directory, a JSON-quoted shell-escaped argv view or script identity/source,
+environment, timeout, and human-readable advisories. Enter/`y` approves, `n`
+denies, `c` opens the exact structured argv or complete escaped script, and `d`
+opens the exhaustive network/SSH-policy/evidence/binding record. Both views use
+the sealed secure pager and return to the same prompt. Client-controlled text
+is rendered with reversible ASCII escapes, and a final renderer invariant
+rejects every non-newline character outside printable ASCII, preventing ANSI,
+C0/C1, DEL, Unicode bidi, or similar terminal-display injection. Approval is read only
+from the application's `/dev/tty`; pager output, HTTP or Unix-socket data,
+process stdin, and client-supplied purpose text cannot answer it.
 
 Each SSH viewer runs in a separate owner-only local tmux server below the
 runtime directory. A broker-owned monitor checks only the visible cursor row of
@@ -138,12 +405,23 @@ inspection, Ctrl-C, or manual detach. Lost viewers are recreated automatically.
 Normal completion closes the remote pane and local viewer automatically;
 canonical capture does not depend on pane history.
 
-One process-local terminal lock serializes the optional approval UI, fallback
-approval, interactive first-master SSH authentication, and automatic prompt
-presenter. Thus parallel execution never places two password prompts or an
-approval and a password prompt on `/dev/tty` concurrently. This serialization
-applies only to human terminal interaction; the three remote command leases
-continue independently.
+One process-local `TerminalArbiter` serializes dashboard transactions, the
+optional approval UI, fallback approval, interactive first-master SSH
+authentication, and the automatic prompt presenter. The dashboard polls for a
+complete canonical `/dev/tty` line in bounded slices without retaining a lease
+while idle. It acquires the lowest-priority lease only immediately before
+reading. Any intervening non-dashboard handoff increments a generation and
+makes that pending dashboard line stale.
+
+Non-dashboard claims reopen and revalidate `/dev/tty` and discard queued input
+before displaying their trusted interaction. Therefore pretyped dashboard text
+cannot become an approval, fallback acknowledgement, SSH password, or sudo
+secret. An active terminal transaction is not forcibly interrupted; priorities
+choose the next owner. Reentrant ownership allows existing approval and SSH
+components to use the arbiter through their lock-compatible interface. Parallel
+execution never places two password prompts or an approval and password prompt
+on `/dev/tty` concurrently. This serialization applies only to human terminal
+interaction; the remote command leases continue independently.
 
 Separately, up to three authenticated `ssh -N` ControlMaster transports may
 remain idle. Reusing a transport never reuses request identity. Queued requests

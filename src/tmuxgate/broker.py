@@ -13,9 +13,17 @@ import time
 from typing import Protocol
 
 from tmuxgate.approval import ApprovalDecision
+from tmuxgate.broker_api import (
+    BrokerControlError,
+    ControlRequest,
+    ControlService,
+    control_error_wire,
+    decode_control_request,
+    is_control_request_header,
+)
 from tmuxgate.fake import FakeExecution
 from tmuxgate.models import RequestSpec, ValidationError, new_request_id, validate_alias
-from tmuxgate.protocol import ProtocolError, receive_single_request
+from tmuxgate.protocol import ProtocolError, receive_single_request, send_frame
 from tmuxgate.result import ExecutionResult, TransportStatus, send_result, send_status
 from tmuxgate.runtime import require_same_uid
 from tmuxgate.scheduler import QueueFullError, RequestState, SequentialScheduler
@@ -65,6 +73,8 @@ class _WriteOperation:
     request_id: str | None = None
     state: str | None = None
     result: ExecutionResult | None = None
+    control_header: dict[str, object] | None = None
+    control_payload: bytes = b""
     callback: Callable[[BaseException | None], None] | None = None
     finished: threading.Event = field(default_factory=threading.Event)
     error: BaseException | None = None
@@ -101,6 +111,15 @@ class _ClientSession:
 
     def send_result(self, result: ExecutionResult) -> None:
         self._write(_WriteOperation("result", result=result))
+
+    def send_control(self, header: dict[str, object], payload: bytes = b"") -> None:
+        self._write(
+            _WriteOperation(
+                "control",
+                control_header=header,
+                control_payload=payload,
+            )
+        )
 
     def send_result_async(
         self,
@@ -152,6 +171,13 @@ class _ClientSession:
                             self.connection,
                             operation.result,
                             timeout_seconds=self._send_timeout_seconds,
+                        )
+                    elif operation.kind == "control":
+                        assert operation.control_header is not None
+                        send_frame(
+                            self.connection,
+                            operation.control_header,
+                            operation.control_payload,
                         )
                     else:
                         raise BrokerError(f"unknown socket write operation: {operation.kind}")
@@ -280,6 +306,7 @@ class BrokerServer:
         delivery_observer: Callable[[str, bool], object] = (
             lambda request_id, delivered: None
         ),
+        control_service: ControlService | None = None,
     ) -> None:
         if listener.family != socket.AF_UNIX:
             raise ValueError("broker listener must be an AF_UNIX socket")
@@ -294,6 +321,10 @@ class BrokerServer:
             )
         ):
             raise TypeError("broker callbacks must be callable")
+        if control_service is not None and not callable(
+            getattr(control_service, "handle", None)
+        ):
+            raise TypeError("control service must provide a callable handle method")
         if not _is_positive_finite_number(request_timeout_seconds):
             raise ValueError("request timeout must be a positive number")
         if not _is_positive_finite_number(send_timeout_seconds):
@@ -333,6 +364,7 @@ class BrokerServer:
         self._peer_validator = peer_validator
         self._approval_discarder = approval_discarder
         self._delivery_observer = delivery_observer
+        self._control_service = control_service
         self._request_timeout_seconds = float(request_timeout_seconds)
         self._send_timeout_seconds = float(send_timeout_seconds)
         self._approval_heartbeat_seconds = float(approval_heartbeat_seconds)
@@ -404,9 +436,12 @@ class BrokerServer:
             raise BrokerError("broker server has already been started")
         self._started = True
         self._listener.settimeout(0.1)
-        self._coordinator_thread.start()
-        self._terminal_thread.start()
-        self._accept_thread.start()
+        try:
+            self._coordinator_thread.start()
+            self._terminal_thread.start()
+            self._accept_thread.start()
+        except Exception as exc:
+            raise BrokerError("could not start all broker workers") from exc
 
     def stop(self) -> bool:
         """Request shutdown and report whether all broker workers stopped.
@@ -441,15 +476,20 @@ class BrokerServer:
             self._terminal_thread,
         )
         for thread in core_threads:
-            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            # Thread.start() can fail after an earlier broker thread started.
+            # An unstarted Thread cannot be joined during rollback.
+            if thread.ident is not None:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._reader_threads_lock:
             readers = tuple(self._reader_threads)
         for thread in readers:
-            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.ident is not None:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._execution_threads_lock:
             executions = tuple(self._execution_threads)
         for thread in executions:
-            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.ident is not None:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
         with self._sessions_lock:
             sessions_remain = bool(self._sessions)
@@ -517,30 +557,91 @@ class BrokerServer:
             self._session_slots.release()
 
     def _read_one_request(self, session: _ClientSession) -> None:
-        event: _IncomingRequest | _InvalidIncomingRequest
+        event: _IncomingRequest | _InvalidIncomingRequest | None = None
+        control_request: ControlRequest | None = None
+        control_error: BrokerControlError | None = None
         try:
             frame = receive_single_request(
                 session.connection,
                 timeout_seconds=self._request_timeout_seconds,
             )
-            request = RequestSpec.from_wire(frame.header, frame.payload)
+            if is_control_request_header(frame.header):
+                try:
+                    control_request = decode_control_request(frame)
+                except (ProtocolError, ValidationError, ValueError) as exc:
+                    detail = f"invalid control request: {exc}"
+                    control_error = BrokerControlError(
+                        "invalid_request",
+                        detail[:4096],
+                    )
+            else:
+                request = RequestSpec.from_wire(frame.header, frame.payload)
+                event = _IncomingRequest(session, request)
         except (ProtocolError, ValidationError, OSError, ValueError) as exc:
             event = _InvalidIncomingRequest(session, str(exc))
         except BaseException:
             # Unexpected reader faults still fail closed without disclosing
             # process internals to the untrusted client.
             event = _InvalidIncomingRequest(session, "internal request reader failure")
-        else:
-            event = _IncomingRequest(session, request)
         finally:
             # The event must not become visible to the coordinator until the
             # reader has restored the socket timeout and handed ownership to
             # the sole writer.
             session.finish_reading()
+        try:
+            if control_request is not None or control_error is not None:
+                self._handle_control_request(
+                    session,
+                    control_request,
+                    error=control_error,
+                )
+            else:
+                assert event is not None
+                self._events.put(event)
+        finally:
             current = threading.current_thread()
             with self._reader_threads_lock:
                 self._reader_threads.discard(current)
-        self._events.put(event)
+
+    def _handle_control_request(
+        self,
+        session: _ClientSession,
+        request: ControlRequest | None,
+        *,
+        error: BrokerControlError | None,
+    ) -> None:
+        response_error = error
+        response_wire: tuple[dict[str, object], bytes] | None = None
+        if response_error is None:
+            if self._control_service is None:
+                response_error = BrokerControlError(
+                    "unavailable",
+                    "broker control service is unavailable",
+                )
+            else:
+                assert request is not None
+                try:
+                    response = self._control_service.handle(request)
+                    response_wire = response.to_wire()
+                except BrokerControlError as exc:
+                    response_error = exc
+                except BaseException:
+                    self._record("control-error")
+                    response_error = BrokerControlError(
+                        "internal_error",
+                        "broker control request failed closed",
+                    )
+        if response_error is not None:
+            response_wire = control_error_wire(response_error)
+        assert response_wire is not None
+        try:
+            session.send_control(*response_wire)
+        except ClientWriteError:
+            self._record("control-client-disconnected")
+            session.abort()
+            return
+        self._record("control-result")
+        session.close()
 
     def _terminal_loop(self) -> None:
         while True:

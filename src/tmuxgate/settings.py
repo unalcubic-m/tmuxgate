@@ -19,14 +19,15 @@ def _array(values: object) -> str:
 
 
 def serialize_config(config: AppConfig) -> bytes:
-    """Serialize the complete supported v1 settings schema as canonical TOML."""
+    """Serialize the complete supported v2 settings schema as canonical TOML."""
 
     if not isinstance(config, AppConfig):
         raise TypeError("config must be an AppConfig")
     broker = config.broker
+    mcp = config.mcp
     lines = [
         "# Managed by tmuxgate configuration commands.",
-        "version = 1",
+        "version = 2",
         "",
         "[broker]",
         f"max_active_remote_commands = {broker.max_active_remote_commands}",
@@ -35,6 +36,10 @@ def serialize_config(config: AppConfig) -> bytes:
         f"queue_policy = {_quote(broker.queue_policy)}",
         f"ssh_master_idle_timeout_seconds = {broker.ssh_master_idle_timeout_seconds}",
         f"approval_mode = {_quote(broker.approval_mode)}",
+        "",
+        "[mcp]",
+        f"host = {_quote(mcp.host)}",
+        f"port = {mcp.port}",
     ]
     if config.home is not None:
         home = config.home

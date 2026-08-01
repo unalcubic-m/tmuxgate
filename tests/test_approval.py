@@ -440,9 +440,49 @@ raise SystemExit(9)
             purpose="Show one harmless formatted value",
         )
         summary = render_approval_summary(REQUEST_ID, request)
-        self.assertIn("WHY        Show one harmless formatted value", summary)
-        self.assertIn("RUN\n---\nprintf 'space value'", summary)
+        self.assertIn(
+            f"WHY        {json.dumps(request.purpose, ensure_ascii=True)}",
+            summary,
+        )
+        expected_command = json.dumps("printf 'space value'", ensure_ascii=True)
+        self.assertIn(
+            f"RUN\n---\n{expected_command}",
+            summary,
+        )
         self.assertNotIn("ssh_g_argv", summary)
+
+    def test_compact_and_paged_documents_escape_terminal_control_and_bidi(self):
+        request = RequestSpec(
+            "host",
+            ExecutionMode.ARGV,
+            "/tmp/\x1b[2J",
+            argv=(
+                "printf",
+                "\x1b[2JFAKE SAFE COMMAND",
+                "reverse-\u202e-txt",
+                "bell-\x07",
+            ),
+            environment={"DISPLAY_TEXT": "\x9b31mspoof\x7f"},
+            purpose="reverse-\u202e-status",
+        )
+
+        documents = (
+            render_code_document(REQUEST_ID, request),
+            render_approval_summary(REQUEST_ID, request),
+            render_approval_document(REQUEST_ID, request),
+        )
+
+        for document in documents:
+            with self.subTest(document=document[:40]):
+                document.encode("ascii")
+                self.assertTrue(
+                    all(
+                        character == "\n" or 0x20 <= ord(character) <= 0x7E
+                        for character in document
+                    )
+                )
+                self.assertNotIn("\x1b", document)
+                self.assertNotIn("\u202e", document)
 
     def test_pager_failure_stops_before_terminal_input(self):
         request = RequestSpec("host", ExecutionMode.SCRIPT, "/", script=b"echo safe\n")

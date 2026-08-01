@@ -18,125 +18,123 @@ REQUEST_ID = "0123456789abcdef0123456789abcdef"
 
 
 class CommandLineParsingTests(unittest.TestCase):
-    def test_exec_accepts_options_after_machine_and_preserves_exact_argv(self):
-        argv = [
-            "exec",
-            "app-server",
-            "--cwd",
-            "/opt/a path",
-            "--timeout",
-            "19",
-            "--env",
-            "B=two words",
-            "--env",
-            "A=$value",
-            "--socket",
-            "/tmp/broker.sock",
-            "--",
-            "printf",
-            "space value",
-            "quote'\"",
-            "$HOME; touch never",
-            "line one\nline two",
-            "Türkçe",
-        ]
-        captured = []
-
-        def fake_submit(request, *, socket_path):
-            captured.append((request, socket_path))
-            return 23
-
-        with mock.patch("tmuxgate.cli.submit_and_present", side_effect=fake_submit):
-            status = cli.main(argv)
-
-        self.assertEqual(status, 23)
-        request, socket_path = captured[0]
-        self.assertEqual(socket_path, "/tmp/broker.sock")
-        self.assertEqual(request.machine_alias, "app-server")
-        self.assertEqual(request.cwd, "/opt/a path")
-        self.assertEqual(request.timeout_seconds, 19)
-        self.assertEqual(request.environment, (("A", "$value"), ("B", "two words")))
-        self.assertEqual(
-            request.argv,
-            (
-                "printf",
-                "space value",
-                "quote'\"",
-                "$HOME; touch never",
-                "line one\nline two",
-                "Türkçe",
-            ),
-        )
-
-    def test_exec_requires_command_payload(self):
+    def test_exec_and_script_are_not_public_commands(self):
         parser = cli.build_parser()
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
-            parser.parse_args(["exec", "app-server", "--cwd", "/tmp"])
-        self.assertEqual(raised.exception.code, 2)
+        for command in ("exec", "script"):
+            with self.subTest(command=command):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                    parser.parse_args([command])
+                self.assertEqual(raised.exception.code, 2)
 
-    def test_script_file_preserves_exact_bytes(self):
-        content = b"#!/bin/bash\nprintf '\\xff'\n\xff\x00\n"
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "payload.sh"
-            path.write_bytes(content)
-            captured = []
+    def test_help_omits_removed_execution_commands(self):
+        help_text = cli.build_parser().format_help()
+        self.assertNotIn("tmuxgate exec", help_text)
+        self.assertNotIn("tmuxgate script", help_text)
+        self.assertNotIn("{exec,", help_text)
 
-            def fake_submit(request, *, socket_path):
-                captured.append(request)
-                return 0
+    def test_unified_alias_help_renders_with_inherited_options(self):
+        parser = cli.build_parser()
+        for command in ("broker", "dashboard"):
+            with self.subTest(command=command):
+                with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                    parser.parse_args([command, "--help"])
+                self.assertEqual(raised.exception.code, 0)
 
-            with mock.patch("tmuxgate.cli.submit_and_present", side_effect=fake_submit):
+    def test_global_config_path_applies_to_config_subcommand(self):
+        commands = (
+            ("_config_check", ("check",)),
+            ("_config_list", ("list",)),
+            ("_config_path", ("path",)),
+            ("_config_edit", ("edit",)),
+            ("_config_set_broker", ("set-broker",)),
+            ("_config_add_machine", ("add-machine",)),
+            ("_config_remove_machine", ("remove-machine", "app-server")),
+            ("_config_enroll_home", ("enroll-home",)),
+        )
+        for handler_name, command in commands:
+            with self.subTest(command=command[0]), mock.patch.object(
+                cli, handler_name, return_value=0
+            ) as handler:
+                status = cli.main(
+                    ["--config", "/global/config.toml", "config", *command]
+                )
+
+            self.assertEqual(status, 0)
+            self.assertEqual(handler.call_args.args[0].path, "/global/config.toml")
+
+    def test_config_subcommand_path_overrides_global_config(self):
+        commands = (
+            ("_config_check", ("check",)),
+            ("_config_list", ("list",)),
+            ("_config_path", ("path",)),
+            ("_config_edit", ("edit",)),
+            ("_config_set_broker", ("set-broker",)),
+            ("_config_add_machine", ("add-machine",)),
+            ("_config_remove_machine", ("remove-machine", "app-server")),
+            ("_config_enroll_home", ("enroll-home",)),
+        )
+        for handler_name, command in commands:
+            with self.subTest(command=command[0]), mock.patch.object(
+                cli, handler_name, return_value=0
+            ) as handler:
                 status = cli.main(
                     [
-                        "script",
-                        "app-server",
-                        "--cwd",
-                        "/tmp",
-                        "--file",
-                        str(path),
+                        "--config",
+                        "/global/config.toml",
+                        "config",
+                        *command,
+                        "--path",
+                        "/override/config.toml",
                     ]
                 )
 
-        self.assertEqual(status, 0)
-        self.assertEqual(captured[0].mode, ExecutionMode.SCRIPT)
-        self.assertEqual(captured[0].script, content)
+            self.assertEqual(status, 0)
+            self.assertEqual(handler.call_args.args[0].path, "/override/config.toml")
 
-    def test_invalid_environment_is_usage_error_before_socket_contact(self):
-        errors = io.StringIO()
-        with (
-            mock.patch("tmuxgate.cli.submit_request") as submit,
-            redirect_stderr(errors),
-        ):
-            status = cli.main(
-                ["exec", "app-server", "--cwd", "/tmp", "--env", "BROKEN", "--", "true"]
-            )
-        self.assertEqual(status, cli.EXIT_USAGE)
-        self.assertIn("NAME=VALUE", errors.getvalue())
-        submit.assert_not_called()
+    def test_settings_prompt_uses_the_controlling_terminal(self):
+        terminal = SimpleNamespace(
+            reader=io.StringIO("\nlogical-machine\n"),
+            writer=io.StringIO(),
+        )
+        with mock.patch(
+            "tmuxgate.cli.open_approval_terminal",
+            return_value=nullcontext(terminal),
+        ) as opener:
+            value = cli._prompt("Logical machine name")
 
-    def test_duplicate_environment_is_rejected_by_request_model(self):
-        errors = io.StringIO()
-        with (
-            mock.patch("tmuxgate.cli.submit_request") as submit,
-            redirect_stderr(errors),
-        ):
-            status = cli.main(
-                [
-                    "exec",
-                    "app-server",
-                    "--cwd",
-                    "/tmp",
-                    "--env",
-                    "A=one",
-                    "--env",
-                    "A=two",
-                    "--",
-                    "true",
-                ]
+        self.assertEqual(value, "logical-machine")
+        self.assertEqual(
+            terminal.writer.getvalue(),
+            "Logical machine name: A value is required.\nLogical machine name: ",
+        )
+        opener.assert_called_once_with()
+
+    def test_settings_editor_is_attached_to_the_controlling_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_bytes(b"version = 2\n")
+            terminal = SimpleNamespace(
+                reader=io.StringIO(),
+                writer=io.StringIO(),
             )
-        self.assertEqual(status, cli.EXIT_USAGE)
-        self.assertIn("duplicate environment variable", errors.getvalue())
-        submit.assert_not_called()
+            with (
+                mock.patch("tmuxgate.cli.load_config", return_value=object()),
+                mock.patch(
+                    "tmuxgate.cli.open_approval_terminal",
+                    return_value=nullcontext(terminal),
+                ),
+                mock.patch(
+                    "tmuxgate.cli.subprocess.run",
+                    return_value=SimpleNamespace(returncode=1),
+                ) as run,
+                redirect_stderr(io.StringIO()),
+            ):
+                status = cli._config_edit(SimpleNamespace(path=str(path)))
+
+        self.assertEqual(status, cli.EXIT_UNAVAILABLE)
+        self.assertIs(run.call_args.kwargs["stdin"], terminal.reader)
+        self.assertIs(run.call_args.kwargs["stdout"], terminal.writer)
+        self.assertIs(run.call_args.kwargs["stderr"], terminal.writer)
 
 
 class ResultPresentationTests(unittest.TestCase):
@@ -226,10 +224,10 @@ class FailClosedSurfaceTests(unittest.TestCase):
         errors = io.StringIO()
         with (
             mock.patch(
-                "tmuxgate.cli.load_config",
+                "tmuxgate.application.load_config",
                 side_effect=cli.ConfigError("missing protected config"),
             ) as load,
-            mock.patch("tmuxgate.cli.open_broker_listener") as listen,
+            mock.patch("tmuxgate.application.open_broker_listener") as listen,
             redirect_stderr(errors),
         ):
             status = cli.main(["broker"])
@@ -278,21 +276,6 @@ class FailClosedSurfaceTests(unittest.TestCase):
                 status = cli.main(["jobs", "--state-dir", str(state_dir)])
         self.assertEqual(status, 0)
         self.assertEqual(output.getvalue(), "No durable tmuxgate jobs.\n")
-
-    def test_broker_connection_failure_maps_to_unavailable(self):
-        errors = io.StringIO()
-        with (
-            mock.patch(
-                "tmuxgate.cli.submit_request",
-                side_effect=cli.BrokerConnectionError("broker absent"),
-            ),
-            redirect_stderr(errors),
-        ):
-            status = cli.main(
-                ["exec", "app-server", "--cwd", "/tmp", "--", "true"]
-            )
-        self.assertEqual(status, cli.EXIT_UNAVAILABLE)
-        self.assertIn("broker absent", errors.getvalue())
 
     def test_job_json_document_exposes_every_recovery_gate(self):
         record = SimpleNamespace(
@@ -354,7 +337,7 @@ class FailClosedSurfaceTests(unittest.TestCase):
 
         with (
             mock.patch("tmuxgate.cli.prepare_runtime_layout", return_value=paths),
-            mock.patch("tmuxgate.cli.acquire_broker_lock", return_value=nullcontext()),
+            mock.patch("tmuxgate.cli.acquire_state_lock", return_value=nullcontext()),
             mock.patch("tmuxgate.cli.DurableStateStore", return_value=store),
             mock.patch(
                 "tmuxgate.cli.open_approval_terminal",
@@ -391,7 +374,7 @@ class FailClosedSurfaceTests(unittest.TestCase):
 
         with (
             mock.patch("tmuxgate.cli.prepare_runtime_layout", return_value=paths),
-            mock.patch("tmuxgate.cli.acquire_broker_lock", return_value=nullcontext()),
+            mock.patch("tmuxgate.cli.acquire_state_lock", return_value=nullcontext()),
             mock.patch("tmuxgate.cli.DurableStateStore", return_value=store),
             mock.patch(
                 "tmuxgate.cli.open_approval_terminal",
@@ -433,7 +416,7 @@ class FailClosedSurfaceTests(unittest.TestCase):
 
         with (
             mock.patch("tmuxgate.cli.prepare_runtime_layout", return_value=paths),
-            mock.patch("tmuxgate.cli.acquire_broker_lock", return_value=nullcontext()),
+            mock.patch("tmuxgate.cli.acquire_state_lock", return_value=nullcontext()),
             mock.patch("tmuxgate.cli.DurableStateStore", return_value=store),
             mock.patch(
                 "tmuxgate.cli.open_approval_terminal",
@@ -472,7 +455,7 @@ class FailClosedSurfaceTests(unittest.TestCase):
 
         with (
             mock.patch("tmuxgate.cli.prepare_runtime_layout", return_value=paths),
-            mock.patch("tmuxgate.cli.acquire_broker_lock", return_value=nullcontext()),
+            mock.patch("tmuxgate.cli.acquire_state_lock", return_value=nullcontext()),
             mock.patch("tmuxgate.cli.DurableStateStore", return_value=store),
             mock.patch(
                 "tmuxgate.cli.open_approval_terminal",
@@ -505,7 +488,7 @@ class FailClosedSurfaceTests(unittest.TestCase):
 
         with (
             mock.patch("tmuxgate.cli.prepare_runtime_layout", return_value=paths),
-            mock.patch("tmuxgate.cli.acquire_broker_lock", return_value=nullcontext()),
+            mock.patch("tmuxgate.cli.acquire_state_lock", return_value=nullcontext()),
             mock.patch("tmuxgate.cli.DurableStateStore", return_value=store),
             mock.patch(
                 "tmuxgate.cli.open_approval_terminal",
@@ -544,7 +527,7 @@ class FailClosedSurfaceTests(unittest.TestCase):
 
         with (
             mock.patch("tmuxgate.cli.prepare_runtime_layout", return_value=paths),
-            mock.patch("tmuxgate.cli.acquire_broker_lock", return_value=nullcontext()),
+            mock.patch("tmuxgate.cli.acquire_state_lock", return_value=nullcontext()),
             mock.patch("tmuxgate.cli.DurableStateStore", return_value=store),
             mock.patch(
                 "tmuxgate.cli.open_approval_terminal",

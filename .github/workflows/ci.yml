@@ -37,13 +37,23 @@ jobs:
           command -v tmux
           command -v script
 
+      - name: Install runtime dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install .
+
       - name: Run test suite
         env:
           PYTHONPATH: src
         run: python -m unittest discover -s tests -v
 
-      - name: Compile package
-        run: python -m compileall -q src
+      - name: Validate shell launchers
+        run: |
+          sh -n install.sh
+          sh -n bin/tmuxgate
+
+      - name: Compile Python sources and installer
+        run: python -m compileall -q src scripts
 
   package:
     name: Package smoke test

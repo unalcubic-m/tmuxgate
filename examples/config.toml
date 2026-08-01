@@ -1,6 +1,6 @@
 # All addresses in this file are RFC 5737 documentation ranges.
 # Replace every example alias, address, user, and SSH profile before use.
-version = 1
+version = 2
 
 [broker]
 max_active_remote_commands = 3
@@ -9,6 +9,10 @@ max_pending_requests = 16
 queue_policy = "fifo"
 ssh_master_idle_timeout_seconds = 600
 approval_mode = "always"
+
+[mcp]
+host = "127.0.0.1"
+port = 8765
 
 [contexts.home]
 gateway = "192.0.2.1"

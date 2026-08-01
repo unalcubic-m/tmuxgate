@@ -214,7 +214,7 @@ class BoundApprovalTests(unittest.TestCase):
             REQUEST_ID, self.request, self.plan, terminal=terminal, pager=None
         )
         self.assertIs(decision, ApprovalDecision.APPROVED)
-        self.assertIn("CONNECT    app-server ->", output.getvalue())
+        self.assertIn('CONNECT    "app-server" ->', output.getvalue())
 
     def test_request_machine_must_match_plan(self):
         request = RequestSpec("other", ExecutionMode.ARGV, "/", argv=("true",))

@@ -6,8 +6,9 @@ tests.
 
 ## Development setup
 
-tmuxgate requires Linux and Python 3.11 or newer. It has no third-party Python
-runtime dependencies.
+tmuxgate requires Linux and Python 3.11 or newer. Its declared runtime
+dependencies include the official Python MCP SDK and Uvicorn; the editable
+install below installs them with the package.
 
 ```bash
 git clone https://github.com/unalcubic-m/tmuxgate.git
