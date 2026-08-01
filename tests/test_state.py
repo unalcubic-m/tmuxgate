@@ -169,6 +169,21 @@ class DurableStateTests(unittest.TestCase):
         with self.assertRaisesRegex(StateCorruptionError, "unexpected"):
             store.load_all()
 
+    def test_read_only_store_ignores_but_never_unlinks_atomic_temporaries(self):
+        writer = self.make_store()
+        writer.write(record())
+        in_progress = writer.jobs_dir / f".{REQUEST_ID}.{'d' * 32}.tmp"
+        in_progress.write_bytes(b"write still in progress")
+        os.chmod(in_progress, 0o600)
+        reader = DurableStateStore(
+            writer.jobs_dir.parent,
+            cleanup_stale_temporaries=False,
+        )
+        self.addCleanup(reader.close)
+
+        self.assertEqual(reader.load_all(), (record(),))
+        self.assertTrue(in_progress.exists())
+
     def test_remote_start_permit_is_returned_only_after_durable_boundary(self):
         store = self.make_store()
         approved = store.write(record())

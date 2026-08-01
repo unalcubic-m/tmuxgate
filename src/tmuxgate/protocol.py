@@ -55,6 +55,12 @@ def _encode_header(header: Mapping[str, Any]) -> bytes:
     return encoded
 
 
+def encoded_header_size(header: Mapping[str, Any]) -> int:
+    """Validate a frame header and return its exact encoded byte length."""
+
+    return len(_encode_header(header))
+
+
 def encode_frame(header: Mapping[str, Any], payload: bytes = b"") -> bytes:
     if not isinstance(payload, (bytes, bytearray)):
         raise ProtocolError("frame payload must be bytes")

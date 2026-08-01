@@ -3,10 +3,19 @@ set -eu
 
 launcher=$(readlink -f -- "$0")
 project_root=$(dirname -- "$(dirname -- "$launcher")")
+development_python=$project_root/.venv/bin/python
+
+if [ ! -x "$development_python" ] || ! "$development_python" -c \
+    'import mcp, uvicorn' >/dev/null 2>&1; then
+    echo "tmuxgate: this checkout launcher has no dependency-complete .venv" >&2
+    echo "tmuxgate: run $project_root/install.sh to install the application for this user" >&2
+    exit 127
+fi
+
 if [ -n "${PYTHONPATH:-}" ]; then
     PYTHONPATH="$project_root/src:$PYTHONPATH"
 else
     PYTHONPATH="$project_root/src"
 fi
 export PYTHONPATH
-exec /usr/bin/python3 -m tmuxgate "$@"
+exec "$development_python" -m tmuxgate "$@"

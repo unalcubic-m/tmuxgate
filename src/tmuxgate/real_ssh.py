@@ -15,7 +15,7 @@ import threading
 import time
 from typing import BinaryIO
 
-from tmuxgate.transport import SshInvocation, TransportError
+from tmuxgate.transport import SshInvocation, SshMasterStartError, TransportError
 
 
 MAX_BATCH_OUTPUT_BYTES = 300 * 1024 * 1024
@@ -136,6 +136,12 @@ class SubprocessMasterBackend:
             raise TransportError("master start requires the interactive start invocation")
         with self.terminal_lock:
             with self.terminal_opener("/dev/tty", "r+b", buffering=0) as terminal:
+                terminal.write(
+                    b"\r\n[tmuxgate] Establishing the approved SSH connection. "
+                    b"Complete any OpenSSH prompt below; no remote command has "
+                    b"started.\r\n"
+                )
+                terminal.flush()
                 completed = self.runner(
                     invocation.argv,
                     stdin=terminal,
@@ -145,8 +151,10 @@ class SubprocessMasterBackend:
                     env=_safe_environment(),
                 )
         returncode = getattr(completed, "returncode", None)
-        if type(returncode) is not int or returncode != 0:
-            raise TransportError("interactive SSH master authentication failed")
+        if type(returncode) is not int:
+            raise TransportError("interactive SSH master runner returned no exit status")
+        if returncode != 0:
+            raise SshMasterStartError(returncode)
 
     def _control(self, invocation: SshInvocation, label: str) -> bool:
         completed = _run_completed(
@@ -171,7 +179,10 @@ class SubprocessMasterBackend:
     def stop_master(self, invocation: SshInvocation, control_path: Path) -> None:
         if invocation.kind != "master-exit" or invocation.interactive_terminal:
             raise TransportError("master stop requires a batch control invocation")
-        self._control(invocation, "master stop")
+        if not self._control(invocation, "master stop"):
+            raise TransportError(
+                "SSH master stop command failed; shutdown was not confirmed"
+            )
 
 
 @dataclass(frozen=True, slots=True)

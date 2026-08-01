@@ -1,15 +1,20 @@
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import re
 import socket
 import stat
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 from tmuxgate.runtime import (
+    BrokerListenerLifecycle,
     PeerCredentialError,
     RuntimeSecurityError,
     acquire_broker_lock,
+    acquire_state_lock,
     cleanup_socket_path,
     create_broker_socket,
     default_socket_path,
@@ -20,6 +25,7 @@ from tmuxgate.runtime import (
     ensure_socket_parent,
     ensure_spool_directory,
     ensure_state_directory,
+    load_or_create_mcp_token,
     open_broker_listener,
     peer_credentials,
     prepare_runtime_layout,
@@ -72,6 +78,7 @@ class RuntimePathTests(unittest.TestCase):
             self.assertEqual(paths.lock_path, paths.runtime_dir / "broker.lock")
             self.assertEqual(paths.state_dir, state_home / "tmuxgate")
             self.assertEqual(paths.spool_dir, paths.state_dir / "spool")
+            self.assertEqual(paths.mcp_token_path, paths.state_dir / "mcp-token")
             self.assertFalse((paths.runtime_dir / "state").exists())
             for directory in (
                 paths.runtime_dir,
@@ -169,6 +176,76 @@ class RuntimePathTests(unittest.TestCase):
                 ensure_state_directory(linked / "state")
             with self.assertRaisesRegex(RuntimeSecurityError, "symlink"):
                 ensure_socket_parent(linked / "runtime" / "broker.sock")
+
+    def test_mcp_token_is_created_once_with_canonical_owner_only_contents(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            ensure_state_directory(state_dir)
+
+            token = load_or_create_mcp_token(state_dir)
+            token_path = state_dir / "mcp-token"
+            self.assertRegex(token, re.compile(r"[0-9a-f]{64}\Z", re.ASCII))
+            self.assertEqual(token_path.read_bytes(), token.encode("ascii") + b"\n")
+            metadata = os.lstat(token_path)
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_uid, os.geteuid())
+            self.assertEqual(load_or_create_mcp_token(state_dir), token)
+            self.assertEqual(tuple(state_dir.glob(".mcp-token.*.tmp")), ())
+
+    def test_concurrent_mcp_token_creation_returns_one_fully_written_token(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            ensure_state_directory(state_dir)
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                tokens = tuple(
+                    executor.map(
+                        lambda _: load_or_create_mcp_token(state_dir),
+                        range(16),
+                    )
+                )
+            self.assertEqual(len(set(tokens)), 1)
+            self.assertEqual(
+                (state_dir / "mcp-token").read_bytes(),
+                tokens[0].encode("ascii") + b"\n",
+            )
+
+    def test_mcp_token_rejects_symlink_unsafe_mode_and_malformed_contents(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            ensure_state_directory(state_dir)
+            target = state_dir / "target"
+            target.write_text("0" * 64 + "\n", encoding="ascii")
+            target.chmod(0o600)
+            (state_dir / "mcp-token").symlink_to(target)
+            with self.assertRaisesRegex(RuntimeSecurityError, "securely open"):
+                load_or_create_mcp_token(state_dir)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            ensure_state_directory(state_dir)
+            token_path = state_dir / "mcp-token"
+            token_path.write_text("0" * 64 + "\n", encoding="ascii")
+            token_path.chmod(0o640)
+            with self.assertRaisesRegex(RuntimeSecurityError, "0600"):
+                load_or_create_mcp_token(state_dir)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            ensure_state_directory(state_dir)
+            token_path = state_dir / "mcp-token"
+            token_path.write_text("A" * 64 + "\n", encoding="ascii")
+            token_path.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeSecurityError, "canonical"):
+                load_or_create_mcp_token(state_dir)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            ensure_state_directory(state_dir)
+            token_path = state_dir / "mcp-token"
+            os.mkfifo(token_path, mode=0o600)
+            with self.assertRaisesRegex(RuntimeSecurityError, "regular file"):
+                load_or_create_mcp_token(state_dir)
 
 
 class BrokerSocketTests(unittest.TestCase):
@@ -324,6 +401,110 @@ class BrokerLifecycleTests(unittest.TestCase):
             self.assertFalse(path.exists())
             reopened = open_broker_listener(path)
             reopened.close()
+
+    def test_listener_uses_a_distinct_runtime_lock_while_state_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            path = self._new_path(base)
+            state_dir = base / "state"
+            ensure_private_directory(state_dir)
+            lock = acquire_state_lock(state_dir)
+            try:
+                lifecycle = open_broker_listener(path)
+                self.assertEqual(lifecycle.lock_path, path.parent / "broker.lock")
+                self.assertEqual(lock.path, state_dir / "state.lock")
+                lifecycle.close()
+                self.assertFalse(lock.closed)
+                self.assertFalse(path.exists())
+                with self.assertRaisesRegex(RuntimeSecurityError, "state lifecycle"):
+                    acquire_state_lock(state_dir)
+            finally:
+                lock.close()
+
+    def test_state_and_listener_locks_coexist_in_one_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            shared_dir = Path(temporary) / "shared"
+            ensure_private_directory(shared_dir)
+            path = shared_dir / "broker.sock"
+
+            state_lock = acquire_state_lock(shared_dir)
+            try:
+                listener = open_broker_listener(path)
+                try:
+                    self.assertEqual(state_lock.path, shared_dir / "state.lock")
+                    self.assertEqual(listener.lock_path, shared_dir / "broker.lock")
+                    with self.assertRaisesRegex(
+                        RuntimeSecurityError, "state lifecycle"
+                    ):
+                        acquire_state_lock(shared_dir)
+                    with self.assertRaisesRegex(
+                        RuntimeSecurityError, "broker lifecycle"
+                    ):
+                        open_broker_listener(path)
+                finally:
+                    listener.close()
+            finally:
+                state_lock.close()
+
+    def test_distinct_state_locks_cannot_race_one_stale_socket(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            path = self._new_path(base)
+            for name in ("state-a", "state-b"):
+                ensure_private_directory(base / name)
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(os.fspath(path))
+            os.chmod(path, 0o600)
+            stale.close()
+
+            barrier = threading.Barrier(2)
+            release_winner = threading.Event()
+            attempts_done = threading.Event()
+            outcomes: list[object] = []
+            outcomes_lock = threading.Lock()
+
+            def record(outcome: object) -> None:
+                with outcomes_lock:
+                    outcomes.append(outcome)
+                    if len(outcomes) == 2:
+                        attempts_done.set()
+
+            def start(state_name: str) -> None:
+                with acquire_state_lock(base / state_name):
+                    barrier.wait(timeout=2)
+                    try:
+                        lifecycle = open_broker_listener(path)
+                    except RuntimeSecurityError as exc:
+                        record(exc)
+                        return
+                    record(lifecycle)
+                    release_winner.wait(timeout=2)
+                    lifecycle.close()
+
+            workers = [
+                threading.Thread(target=start, args=(name,), daemon=True)
+                for name in ("state-a", "state-b")
+            ]
+            for worker in workers:
+                worker.start()
+            try:
+                self.assertTrue(attempts_done.wait(timeout=2))
+                self.assertEqual(
+                    sum(isinstance(item, BrokerListenerLifecycle) for item in outcomes),
+                    1,
+                )
+                self.assertEqual(
+                    sum(isinstance(item, RuntimeSecurityError) for item in outcomes),
+                    1,
+                )
+                self.assertTrue(path.exists())
+            finally:
+                release_winner.set()
+                for worker in workers:
+                    worker.join(timeout=2)
+
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertFalse(path.exists())
 
     def test_lock_prevents_bound_not_listening_socket_from_being_cleaned(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -27,6 +27,8 @@ SPOOL_DIRECTORY_NAME = "results"
 SPOOL_FORMAT_VERSION = 1
 SPOOL_FILE_MODE = 0o600
 MAX_MANIFEST_BYTES = 64 * 1024
+MAX_VERIFIED_RANGE_BYTES = 1024 * 1024
+SPOOL_STREAM_READ_BYTES = 64 * 1024
 
 STDOUT_NAME = "stdout.raw"
 STDERR_NAME = "stderr.raw"
@@ -45,6 +47,14 @@ class SpoolCorruptionError(SpoolError):
 
 class SpoolConflictError(SpoolError):
     """A different result already exists for this request."""
+
+
+class SpoolStateMismatchError(SpoolError):
+    """Durable state does not bind the published spool manifest."""
+
+
+class SpoolRangeError(ValueError):
+    """A requested byte range is outside the selected verified stream."""
 
 
 def _canonical_json(document: Mapping[str, object]) -> bytes:
@@ -73,12 +83,61 @@ class SpoolResult:
         validate_request_id(self.request_id)
         if not isinstance(self.stdout, bytes) or not isinstance(self.stderr, bytes):
             raise ValueError("spooled streams must be bytes")
-        if len(self.stdout) > MAX_RESULT_STREAM_BYTES or len(self.stderr) > MAX_RESULT_STREAM_BYTES:
+        if (
+            len(self.stdout) > MAX_RESULT_STREAM_BYTES
+            or len(self.stderr) > MAX_RESULT_STREAM_BYTES
+        ):
             raise ValueError("spooled stream exceeds the configured limit")
         if type(self.exit_status) is not int or not 0 <= self.exit_status <= 255:
             raise ValueError("spooled exit status must be from 0 to 255")
         if re.fullmatch(r"[0-9a-f]{64}", self.manifest_payload_sha256) is None:
             raise ValueError("manifest payload digest is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedSpoolRange:
+    """A bounded slice backed by a fully hashed selected spool stream."""
+
+    request_id: str
+    stream: str
+    offset: int
+    data: bytes
+    total_size: int
+    sha256: str
+    exit_status: int
+    manifest_payload_sha256: str
+
+    def __post_init__(self) -> None:
+        validate_request_id(self.request_id)
+        if self.stream not in {"stdout", "stderr"}:
+            raise ValueError("verified spool stream is invalid")
+        if type(self.offset) is not int or self.offset < 0:
+            raise ValueError("verified spool offset is invalid")
+        if not isinstance(self.data, bytes) or len(self.data) > MAX_VERIFIED_RANGE_BYTES:
+            raise ValueError("verified spool range is invalid")
+        if (
+            type(self.total_size) is not int
+            or self.total_size < self.offset + len(self.data)
+            or self.total_size > MAX_RESULT_STREAM_BYTES
+        ):
+            raise ValueError("verified spool total size is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", self.sha256) is None:
+            raise ValueError("verified spool stream digest is invalid")
+        if type(self.exit_status) is not int or not 0 <= self.exit_status <= 255:
+            raise ValueError("verified spool exit status is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", self.manifest_payload_sha256) is None:
+            raise ValueError("verified spool manifest digest is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class _SpoolManifest:
+    request_id: str
+    stdout_size: int
+    stdout_sha256: str
+    stderr_size: int
+    stderr_sha256: str
+    exit_status: int
+    payload_sha256: str
 
 
 class ResultSpool:
@@ -192,6 +251,157 @@ class ResultSpool:
             return content
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _decode_manifest(request_id: str, content: bytes) -> _SpoolManifest:
+        def no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            document: dict[str, object] = {}
+            for key, value in pairs:
+                if key in document:
+                    raise SpoolCorruptionError(f"duplicate manifest key: {key}")
+                document[key] = value
+            return document
+
+        try:
+            envelope = json.loads(
+                content.decode("ascii"),
+                object_pairs_hook=no_duplicates,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    SpoolCorruptionError(f"nonstandard manifest constant: {value}")
+                ),
+            )
+        except SpoolCorruptionError:
+            raise
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SpoolCorruptionError(
+                "result manifest is not valid ASCII JSON"
+            ) from exc
+        if not isinstance(envelope, dict) or set(envelope) != {"payload", "sha256"}:
+            raise SpoolCorruptionError("result manifest envelope is invalid")
+        payload = envelope["payload"]
+        digest = envelope["sha256"]
+        expected_fields = {
+            "exit_status",
+            "request_id",
+            "spool_version",
+            "stderr_sha256",
+            "stderr_size",
+            "stdout_sha256",
+            "stdout_size",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected_fields:
+            raise SpoolCorruptionError("result manifest payload is invalid")
+        if not isinstance(digest, str) or _payload_sha256(payload) != digest:
+            raise SpoolCorruptionError("result manifest checksum does not match")
+        if content != _canonical_json(envelope) + b"\n":
+            raise SpoolCorruptionError("result manifest is not canonical")
+        if (
+            type(payload["spool_version"]) is not int
+            or payload["spool_version"] != SPOOL_FORMAT_VERSION
+        ):
+            raise SpoolCorruptionError("result spool version is unsupported")
+        if payload["request_id"] != request_id:
+            raise SpoolCorruptionError(
+                "manifest request ID does not match its directory"
+            )
+        exit_status = payload["exit_status"]
+        if type(exit_status) is not int or not 0 <= exit_status <= 255:
+            raise SpoolCorruptionError("manifest exit status is invalid")
+        for stream in ("stdout", "stderr"):
+            size = payload[f"{stream}_size"]
+            stream_digest = payload[f"{stream}_sha256"]
+            if (
+                type(size) is not int
+                or not 0 <= size <= MAX_RESULT_STREAM_BYTES
+                or not isinstance(stream_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", stream_digest) is None
+            ):
+                raise SpoolCorruptionError(
+                    f"manifest {stream} metadata is invalid"
+                )
+        return _SpoolManifest(
+            request_id=request_id,
+            stdout_size=payload["stdout_size"],
+            stdout_sha256=payload["stdout_sha256"],
+            stderr_size=payload["stderr_size"],
+            stderr_sha256=payload["stderr_sha256"],
+            exit_status=exit_status,
+            payload_sha256=digest,
+        )
+
+    def _open_stream_file(
+        self,
+        directory_fd: int,
+        name: str,
+        *,
+        expected_size: int,
+    ) -> int:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+        except OSError as exc:
+            raise SpoolCorruptionError(f"cannot safely open {name}") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != self.expected_uid
+                or stat.S_IMODE(metadata.st_mode) != SPOOL_FILE_MODE
+                or metadata.st_size != expected_size
+            ):
+                raise SpoolCorruptionError(
+                    f"unsafe result file metadata: {name}"
+                )
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _read_hashed_range(
+        self,
+        descriptor: int,
+        *,
+        name: str,
+        expected_size: int,
+        expected_sha256: str,
+        offset: int,
+        limit: int,
+    ) -> bytes:
+        digest = hashlib.sha256()
+        captured = bytearray()
+        position = 0
+        range_end = min(expected_size, offset + limit)
+        while True:
+            try:
+                block = os.read(descriptor, SPOOL_STREAM_READ_BYTES)
+            except OSError as exc:
+                raise SpoolCorruptionError(
+                    f"cannot safely read result stream: {name}"
+                ) from exc
+            if not block:
+                break
+            digest.update(block)
+            block_end = position + len(block)
+            if block_end > expected_size:
+                raise SpoolCorruptionError(f"result file changed size: {name}")
+            overlap_start = max(position, offset)
+            overlap_end = min(block_end, range_end)
+            if overlap_start < overlap_end:
+                captured.extend(
+                    block[overlap_start - position : overlap_end - position]
+                )
+            position = block_end
+        if position != expected_size or digest.hexdigest() != expected_sha256:
+            raise SpoolCorruptionError(
+                f"raw result stream does not match the manifest: {name}"
+            )
+        if len(captured) > limit:  # pragma: no cover - defensive bound assertion
+            raise SpoolCorruptionError("verified result range exceeded its limit")
+        return bytes(captured)
 
     @staticmethod
     def _manifest_payload(
@@ -318,6 +528,122 @@ class ResultSpool:
                     self._cleanup_private_temp(temporary)
         return result
 
+    def read_verified_range(
+        self,
+        request_id: str,
+        stream: str,
+        *,
+        offset: int,
+        limit: int,
+        expected_manifest_payload_sha256: str,
+        expected_exit_status: int,
+    ) -> VerifiedSpoolRange:
+        """Verify one selected stream and return at most one bounded range.
+
+        The manifest is bound to durable state before any raw stream is read.
+        Both raw files must have exact safe metadata, but only the selected file
+        is read and hashed.  Hashing uses a fixed buffer and the retained range
+        can never exceed ``MAX_VERIFIED_RANGE_BYTES``.
+        """
+
+        request_id = validate_request_id(request_id)
+        if stream not in {"stdout", "stderr"}:
+            raise ValueError("result stream must be stdout or stderr")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("result offset must be a non-negative integer")
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= MAX_VERIFIED_RANGE_BYTES
+        ):
+            raise ValueError(
+                f"result range limit must be between 1 and "
+                f"{MAX_VERIFIED_RANGE_BYTES}"
+            )
+        if (
+            not isinstance(expected_manifest_payload_sha256, str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", expected_manifest_payload_sha256
+            ) is None
+        ):
+            raise ValueError("expected manifest digest is invalid")
+        if (
+            type(expected_exit_status) is not int
+            or not 0 <= expected_exit_status <= 255
+        ):
+            raise ValueError("expected exit status is invalid")
+
+        directory_fd = self._open_result_directory(request_id)
+        try:
+            entries = set(os.listdir(directory_fd))
+            if entries != _EXPECTED_ENTRIES:
+                raise SpoolCorruptionError(
+                    "result directory entries are not exact"
+                )
+            manifest_content = self._read_file(
+                directory_fd,
+                MANIFEST_NAME,
+                MAX_MANIFEST_BYTES,
+            )
+            manifest = self._decode_manifest(request_id, manifest_content)
+            if (
+                manifest.payload_sha256
+                != expected_manifest_payload_sha256
+                or manifest.exit_status != expected_exit_status
+            ):
+                raise SpoolStateMismatchError(
+                    "durable state and result spool do not match"
+                )
+
+            selected_name = STDOUT_NAME if stream == "stdout" else STDERR_NAME
+            other_name = STDERR_NAME if stream == "stdout" else STDOUT_NAME
+            selected_size = getattr(manifest, f"{stream}_size")
+            selected_sha256 = getattr(manifest, f"{stream}_sha256")
+            other_stream = "stderr" if stream == "stdout" else "stdout"
+            other_size = getattr(manifest, f"{other_stream}_size")
+            if offset > selected_size:
+                raise SpoolRangeError(
+                    "result offset is beyond the verified stream"
+                )
+
+            # Open and validate the unselected stream, but never read it into
+            # memory merely to answer a range request for the other stream.
+            other_descriptor = self._open_stream_file(
+                directory_fd,
+                other_name,
+                expected_size=other_size,
+            )
+            os.close(other_descriptor)
+
+            selected_descriptor = self._open_stream_file(
+                directory_fd,
+                selected_name,
+                expected_size=selected_size,
+            )
+            try:
+                data = self._read_hashed_range(
+                    selected_descriptor,
+                    name=selected_name,
+                    expected_size=selected_size,
+                    expected_sha256=selected_sha256,
+                    offset=offset,
+                    limit=limit,
+                )
+            finally:
+                os.close(selected_descriptor)
+        finally:
+            os.close(directory_fd)
+
+        return VerifiedSpoolRange(
+            request_id=request_id,
+            stream=stream,
+            offset=offset,
+            data=data,
+            total_size=selected_size,
+            sha256=selected_sha256,
+            exit_status=manifest.exit_status,
+            manifest_payload_sha256=manifest.payload_sha256,
+        )
+
     def load(self, request_id: str) -> SpoolResult:
         request_id = validate_request_id(request_id)
         directory_fd = self._open_result_directory(request_id)
@@ -330,6 +656,7 @@ class ResultSpool:
                 MANIFEST_NAME,
                 MAX_MANIFEST_BYTES,
             )
+            manifest = self._decode_manifest(request_id, manifest_content)
             stdout = self._read_file(
                 directory_fd,
                 STDOUT_NAME,
@@ -343,53 +670,17 @@ class ResultSpool:
         finally:
             os.close(directory_fd)
 
-        def no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-            document: dict[str, object] = {}
-            for key, value in pairs:
-                if key in document:
-                    raise SpoolCorruptionError(f"duplicate manifest key: {key}")
-                document[key] = value
-            return document
-
-        try:
-            envelope = json.loads(
-                manifest_content.decode("ascii"),
-                object_pairs_hook=no_duplicates,
-                parse_constant=lambda value: (_ for _ in ()).throw(
-                    SpoolCorruptionError(f"nonstandard manifest constant: {value}")
-                ),
-            )
-        except SpoolCorruptionError:
-            raise
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise SpoolCorruptionError("result manifest is not valid ASCII JSON") from exc
-        if not isinstance(envelope, dict) or set(envelope) != {"payload", "sha256"}:
-            raise SpoolCorruptionError("result manifest envelope is invalid")
-        payload = envelope["payload"]
-        digest = envelope["sha256"]
-        expected_fields = {
-            "exit_status",
-            "request_id",
-            "spool_version",
-            "stderr_sha256",
-            "stderr_size",
-            "stdout_sha256",
-            "stdout_size",
-        }
-        if not isinstance(payload, dict) or set(payload) != expected_fields:
-            raise SpoolCorruptionError("result manifest payload is invalid")
-        if not isinstance(digest, str) or _payload_sha256(payload) != digest:
-            raise SpoolCorruptionError("result manifest checksum does not match")
-        if manifest_content != _canonical_json(envelope) + b"\n":
-            raise SpoolCorruptionError("result manifest is not canonical")
-        if payload["spool_version"] != SPOOL_FORMAT_VERSION:
-            raise SpoolCorruptionError("result spool version is unsupported")
-        if payload["request_id"] != request_id:
-            raise SpoolCorruptionError("manifest request ID does not match its directory")
-        exit_status = payload["exit_status"]
-        if type(exit_status) is not int or not 0 <= exit_status <= 255:
-            raise SpoolCorruptionError("manifest exit status is invalid")
-        expected = self._manifest_payload(request_id, stdout, stderr, exit_status)
-        if payload != expected:
+        if (
+            len(stdout) != manifest.stdout_size
+            or hashlib.sha256(stdout).hexdigest() != manifest.stdout_sha256
+            or len(stderr) != manifest.stderr_size
+            or hashlib.sha256(stderr).hexdigest() != manifest.stderr_sha256
+        ):
             raise SpoolCorruptionError("raw result streams do not match the manifest")
-        return SpoolResult(request_id, stdout, stderr, exit_status, digest)
+        return SpoolResult(
+            request_id,
+            stdout,
+            stderr,
+            manifest.exit_status,
+            manifest.payload_sha256,
+        )

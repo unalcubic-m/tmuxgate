@@ -1,3 +1,4 @@
+from dataclasses import replace
 import threading
 import unittest
 
@@ -11,7 +12,7 @@ from tmuxgate.planning import (
     PlanningError,
 )
 from test_config import valid_config
-from test_connection_plan import build_plan
+from test_connection_plan import build_plan, complete_snapshot, configured, resolved
 
 
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
@@ -142,6 +143,128 @@ class BoundRequestPlannerTests(unittest.TestCase):
         self.assertTrue(planner.discard(REQUEST_ID))
         self.assertFalse(planner.discard(REQUEST_ID))
         self.assertEqual(planner.take(SECOND_ID, second_request).request_id, SECOND_ID)
+
+    def test_retry_revalidation_reproves_plan_without_a_second_approval(self):
+        harness = PlannerHarness()
+        planner = harness.planner()
+        spec = request()
+        planner(REQUEST_ID, spec)
+        approved = planner.take(REQUEST_ID, spec).connection_plan
+
+        current = planner.revalidate_connection_plan(
+            REQUEST_ID,
+            spec,
+            approved,
+            retried_endpoint_id=approved.selected.resolved.endpoint_id,
+        )
+
+        self.assertEqual(current, approved)
+        self.assertEqual(len(harness.snapshot_calls), 2)
+        self.assertEqual(len(harness.connection_calls), 2)
+        self.assertEqual(len(harness.approval_calls), 1)
+
+    def test_retry_revalidation_allows_volatile_neighbor_state_change(self):
+        reachable = complete_snapshot()
+        neighbor_key, neighbor = next(iter(reachable.neighbors.items()))
+        stale = replace(
+            reachable,
+            neighbors={neighbor_key: replace(neighbor, state="STALE")},
+        )
+        snapshots = iter((reachable, stale))
+        approval_calls = []
+
+        def approve(*args):
+            approval_calls.append(args)
+            return ApprovalDecision.APPROVED
+
+        planner = BoundRequestPlanner(
+            configured(),
+            snapshot_collector=lambda *args, **kwargs: next(snapshots),
+            endpoint_resolver=resolved,
+            approver=approve,
+        )
+        spec = request()
+        planner(REQUEST_ID, spec)
+        approved = planner.take(REQUEST_ID, spec).connection_plan
+
+        current = planner.revalidate_connection_plan(
+            REQUEST_ID,
+            spec,
+            approved,
+            retried_endpoint_id="home-lan",
+        )
+
+        self.assertNotEqual(
+            current.network_snapshot_sha256,
+            approved.network_snapshot_sha256,
+        )
+        self.assertNotEqual(current.plan_sha256, approved.plan_sha256)
+        self.assertEqual(current.candidates, approved.candidates)
+        self.assertEqual(current.endpoints, approved.endpoints)
+        self.assertEqual(len(approval_calls), 1)
+
+    def test_retry_revalidation_rejects_changed_ssh_identity(self):
+        harness = PlannerHarness()
+        original = build_plan()
+        changed_selected = replace(
+            original.selected,
+            resolved=replace(
+                original.selected.resolved,
+                resolved_user="different-user",
+            ),
+        )
+        changed = replace(
+            original,
+            endpoints=(changed_selected, *original.fallbacks),
+            plan_sha256="e" * 64,
+        )
+        plans = iter((original, changed))
+
+        def connect(route_plan, snapshot, *, resolver):
+            harness.connection_calls.append((route_plan, snapshot, resolver))
+            return next(plans)
+
+        harness.connect = connect
+        planner = harness.planner()
+        spec = request()
+        planner(REQUEST_ID, spec)
+        approved = planner.take(REQUEST_ID, spec).connection_plan
+
+        with self.assertRaisesRegex(PlanningError, "plan changed"):
+            planner.revalidate_connection_plan(
+                REQUEST_ID,
+                spec,
+                approved,
+                retried_endpoint_id="home-lan",
+            )
+
+        self.assertEqual(len(harness.approval_calls), 1)
+
+    def test_retry_revalidation_rejects_endpoint_that_is_no_longer_eligible(self):
+        reachable = complete_snapshot()
+        neighbor_key, neighbor = next(iter(reachable.neighbors.items()))
+        failed = replace(
+            reachable,
+            neighbors={neighbor_key: replace(neighbor, state="FAILED")},
+        )
+        snapshots = iter((reachable, failed))
+        planner = BoundRequestPlanner(
+            configured(),
+            snapshot_collector=lambda *args, **kwargs: next(snapshots),
+            endpoint_resolver=resolved,
+            approver=lambda *args, **kwargs: ApprovalDecision.APPROVED,
+        )
+        spec = request()
+        planner(REQUEST_ID, spec)
+        approved = planner.take(REQUEST_ID, spec).connection_plan
+
+        with self.assertRaisesRegex(PlanningError, "no longer eligible"):
+            planner.revalidate_connection_plan(
+                REQUEST_ID,
+                spec,
+                approved,
+                retried_endpoint_id="home-lan",
+            )
 
     def test_unknown_machine_fails_before_snapshot_or_approval(self):
         harness = PlannerHarness()

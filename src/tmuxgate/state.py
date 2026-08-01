@@ -415,10 +415,19 @@ class StartupRecoveryReport:
 class DurableStateStore:
     """Atomic per-request JSON records under one validated private directory."""
 
-    def __init__(self, state_dir: os.PathLike[str] | str, *, expected_uid: int | None = None):
+    def __init__(
+        self,
+        state_dir: os.PathLike[str] | str,
+        *,
+        expected_uid: int | None = None,
+        cleanup_stale_temporaries: bool = True,
+    ):
         self.expected_uid = os.geteuid() if expected_uid is None else expected_uid
         if type(self.expected_uid) is not int or self.expected_uid < 0:
             raise StateError("expected UID must be a non-negative integer")
+        if not isinstance(cleanup_stale_temporaries, bool):
+            raise TypeError("cleanup_stale_temporaries must be boolean")
+        self._cleanup_stale_temporaries = cleanup_stale_temporaries
         root = ensure_private_directory(state_dir, expected_uid=self.expected_uid)
         self.jobs_dir = ensure_private_directory(
             root / STATE_JOBS_DIRECTORY_NAME, expected_uid=self.expected_uid
@@ -603,8 +612,9 @@ class DurableStateStore:
             for name in sorted(os.listdir(self._directory_fd)):
                 temp = _TEMP_RE.fullmatch(name)
                 if temp is not None:
-                    self._remove_stale_temp(name)
-                    removed_temp = True
+                    if self._cleanup_stale_temporaries:
+                        self._remove_stale_temp(name)
+                        removed_temp = True
                     continue
                 final = _FINAL_RE.fullmatch(name)
                 if final is None:

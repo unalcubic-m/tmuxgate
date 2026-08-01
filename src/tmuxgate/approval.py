@@ -138,6 +138,20 @@ def _quoted_text(value: str) -> str:
     return json.dumps(value, ensure_ascii=True, allow_nan=False)
 
 
+def _terminal_safe_document(lines: list[str]) -> str:
+    """Join display lines only when every non-newline byte is printable ASCII."""
+
+    document = "\n".join(lines) + "\n"
+    if any(
+        character != "\n" and not 0x20 <= ord(character) <= 0x7E
+        for character in document
+    ):
+        raise ApprovalDisplayError(
+            "approval renderer produced a non-printable terminal character"
+        )
+    return document
+
+
 def _canonical_sha256(document: dict[str, object]) -> str:
     encoded = json.dumps(
         document,
@@ -353,7 +367,9 @@ def render_code_document(request_id: str, request: RequestSpec) -> str:
         f"cwd: {_quoted_text(request.cwd)}",
     ]
     if request.argv:
-        lines.append(f"shell_escaped_view: {shlex.join(request.argv)}")
+        lines.append(
+            f"shell_escaped_view: {_quoted_text(shlex.join(request.argv))}"
+        )
         lines.append("exact_structured_argv:")
         lines.extend(
             f"  [{index}] {_quoted_text(argument)}"
@@ -369,7 +385,7 @@ def render_code_document(request_id: str, request: RequestSpec) -> str:
             ]
         )
     lines.append("=== end code ===")
-    return "\n".join(lines) + "\n"
+    return _terminal_safe_document(lines)
 
 
 def render_approval_summary(
@@ -386,21 +402,26 @@ def render_approval_summary(
         "TMUXGATE APPROVAL",
         "=================",
         (
-            f"WHY        {request.purpose}"
+            f"WHY        {_quoted_text(request.purpose)}"
             if request.purpose is not None
             else "WHY        No explanation supplied; review the exact command"
         ),
     ]
     if connection_plan is None:
-        lines.append(f"CONNECT    {request.machine_alias} (route details unavailable)")
+        lines.append(
+            f"CONNECT    {_quoted_text(request.machine_alias)} "
+            "(route details unavailable)"
+        )
     else:
         selected = connection_plan.selected.resolved
         lines.extend(
             [
                 (
-                    f"CONNECT    {request.machine_alias} -> "
-                    f"{selected.resolved_user}@{selected.resolved_hostname}:"
-                    f"{selected.resolved_port} via {selected.required_context}"
+                    f"CONNECT    {_quoted_text(request.machine_alias)} -> "
+                    f"{_quoted_text(selected.resolved_user)}@"
+                    f"{_quoted_text(selected.resolved_hostname)}:"
+                    f"{selected.resolved_port} via "
+                    f"{_quoted_text(selected.required_context)}"
                 ),
                 (
                     f"IDENTITY   Host key {selected.host_key_evidence.status}; "
@@ -410,7 +431,9 @@ def render_approval_summary(
         )
     lines.append(f"DIRECTORY  {_quoted_text(request.cwd)}")
     if request.argv:
-        lines.extend(["", "RUN", "---", shlex.join(request.argv)])
+        lines.extend(
+            ["", "RUN", "---", _quoted_text(shlex.join(request.argv))]
+        )
     else:
         lines.extend(["", f"RUN SCRIPT ({len(request.script)} bytes)", "----------"])
         if len(request.script) <= INLINE_SCRIPT_BYTES:
@@ -420,7 +443,8 @@ def render_approval_summary(
     if request.environment:
         lines.extend(["", "ADDED ENVIRONMENT"])
         lines.extend(
-            f"  {name}={_quoted_text(value)}" for name, value in request.environment
+            f"  {_quoted_text(name)}={_quoted_text(value)}"
+            for name, value in request.environment
         )
     timeout = "none" if request.timeout_seconds is None else f"{request.timeout_seconds}s"
     lines.extend(["", f"TIMEOUT    {timeout}"])
@@ -430,7 +454,7 @@ def render_approval_summary(
     else:
         lines.append("SAFETY     No obvious advisory flags")
     lines.extend(["", "Press d for technical identities, evidence, and binding hashes."])
-    return "\n".join(lines) + "\n"
+    return _terminal_safe_document(lines)
 
 
 def render_approval_document(
@@ -500,7 +524,7 @@ def render_approval_document(
     lines.extend(f"  risk: {risk}" for risk in risks)
     lines.extend(_script_lines(request.script))
     lines.append("=== end complete request ===")
-    return "\n".join(lines) + "\n"
+    return _terminal_safe_document(lines)
 
 
 def _write_all(writer: TextIO, content: str) -> None:
@@ -853,7 +877,7 @@ def render_fallback_approval_document(
     )
     old = failed.resolved
     new = fallback.resolved
-    return "\n".join(
+    return _terminal_safe_document(
         [
             "=== tmuxgate broker fallback approval ===",
             f"request_id: {request_id}",
@@ -861,11 +885,11 @@ def render_fallback_approval_document(
             f"connection_plan_sha256: {connection_plan.plan_sha256}",
             f"fallback_binding_sha256: {fallback_binding}",
             f"failed_endpoint_id: {_quoted_text(old.endpoint_id)}",
-            f"failed_target: {old.configured_address}:{old.configured_port}",
+            f"failed_target: {_quoted_text(old.configured_address)}:{old.configured_port}",
             f"failure_detail: {_quoted_text(failure_detail)}",
             "remote_mutation_started: false",
             f"fallback_endpoint_id: {_quoted_text(new.endpoint_id)}",
-            f"fallback_target: {new.configured_address}:{new.configured_port}",
+            f"fallback_target: {_quoted_text(new.configured_address)}:{new.configured_port}",
             f"fallback_resolved_identity: {_quoted_text(new.resolved_user)}@{_quoted_text(new.resolved_hostname)}:{new.resolved_port}",
             f"fallback_host_key_alias: {_quoted_text(new.host_key_alias)}",
             f"fallback_host_key_status: {new.host_key_evidence.status}",
@@ -951,3 +975,144 @@ def request_fallback_approval(
         pager_threshold_bytes=pager_threshold_bytes,
     )
     return _read_fallback_decision(terminal, request_id[:8], fallback_endpoint_id)
+
+
+def render_ssh_retry_document(
+    request_id: str,
+    request: RequestSpec,
+    connection_plan: ConnectionPlan,
+    *,
+    endpoint_id: str,
+    failure_detail: str,
+    remote_mutation_started: bool,
+) -> str:
+    """Render one bounded retry decision for the same approved SSH endpoint."""
+
+    request_id = validate_request_id(request_id)
+    if remote_mutation_started:
+        raise ApprovalError("SSH setup retry is forbidden after remote mutation")
+    if not isinstance(failure_detail, str) or "\x00" in failure_detail:
+        raise ApprovalError("SSH setup failure detail must be valid text")
+    approval_binding_sha256(request_id, request, connection_plan)
+    endpoint = next(
+        (
+            item
+            for item in connection_plan.endpoints
+            if item.resolved.endpoint_id == endpoint_id
+        ),
+        None,
+    )
+    if endpoint is None:
+        raise ApprovalError("SSH retry endpoint is not in the approved plan")
+    resolved = endpoint.resolved
+    retry_binding = _canonical_sha256(
+        {
+            "client_request_sha256": request.client_request_sha256(),
+            "connection_plan_sha256": connection_plan.plan_sha256,
+            "endpoint_id": endpoint_id,
+            "failure_detail": failure_detail,
+            "request_id": request_id,
+            "ssh_retry_binding_version": 1,
+        }
+    )
+    return _terminal_safe_document(
+        [
+            "=== tmuxgate SSH setup retry ===",
+            f"request_id: {request_id}",
+            f"approval_short_id: {request_id[:8]}",
+            f"machine: {_quoted_text(connection_plan.machine_name)}",
+            f"endpoint_id: {_quoted_text(endpoint_id)}",
+            "target: "
+            f"{_quoted_text(resolved.configured_address)}:"
+            f"{resolved.configured_port}",
+            "resolved_identity: "
+            f"{_quoted_text(resolved.resolved_user)}@"
+            f"{_quoted_text(resolved.resolved_hostname)}:"
+            f"{resolved.resolved_port}",
+            f"failure_detail: {_quoted_text(failure_detail)}",
+            f"ssh_retry_binding_sha256: {retry_binding}",
+            "remote_mutation_started: false",
+            "No remote command started. OpenSSH printed its diagnostic "
+            "immediately above.",
+            "One broker-terminal-confirmed retry is allowed for this endpoint.",
+            "=== end SSH setup retry ===",
+            "",
+        ]
+    )
+
+
+def _read_ssh_retry_decision(
+    terminal: ApprovalTerminal,
+    short_id: str,
+    endpoint_id: str,
+) -> ApprovalDecision:
+    retry_line = f"RETRY {short_id} {endpoint_id}"
+    instruction = (
+        f"Type exactly {retry_line} to try SSH setup once more, or CANCEL.\n"
+    )
+    _write_all(terminal.writer, instruction)
+    while True:
+        _write_all(terminal.writer, "tmuxgate ssh> ")
+        try:
+            raw_line = terminal.reader.readline()
+        except Exception as exc:
+            raise ApprovalInputError("unable to read from the broker terminal") from exc
+        if raw_line == "":
+            raise ApprovalInputError(
+                "broker terminal reached EOF before an SSH retry decision"
+            )
+        if not isinstance(raw_line, str):
+            raise ApprovalInputError("broker terminal returned non-text retry input")
+        response = _line_without_terminal_ending(raw_line)
+        raw_line = ""
+        if response == retry_line:
+            response = ""
+            return ApprovalDecision.APPROVED
+        if response == "CANCEL":
+            response = ""
+            return ApprovalDecision.DENIED
+        response = ""
+        _write_all(
+            terminal.writer,
+            "Invalid response; no retry decision was recorded.\n" + instruction,
+        )
+
+
+def request_ssh_retry(
+    request_id: str,
+    request: RequestSpec,
+    connection_plan: ConnectionPlan,
+    *,
+    endpoint_id: str,
+    failure_detail: str,
+    remote_mutation_started: bool,
+    terminal: ApprovalTerminal | None = None,
+) -> ApprovalDecision:
+    """Ask only the broker terminal for one same-endpoint SSH setup retry."""
+
+    document = render_ssh_retry_document(
+        request_id,
+        request,
+        connection_plan,
+        endpoint_id=endpoint_id,
+        failure_detail=failure_detail,
+        remote_mutation_started=remote_mutation_started,
+    )
+    if terminal is None:
+        with open_approval_terminal() as opened_terminal:
+            _display_document(
+                opened_terminal,
+                document,
+                pager=None,
+                pager_threshold_bytes=DEFAULT_PAGER_THRESHOLD_BYTES,
+            )
+            return _read_ssh_retry_decision(
+                opened_terminal, request_id[:8], endpoint_id
+            )
+    _display_document(
+        terminal,
+        document,
+        pager=None,
+        pager_threshold_bytes=DEFAULT_PAGER_THRESHOLD_BYTES,
+    )
+    return _read_ssh_retry_decision(terminal, request_id[:8], endpoint_id)

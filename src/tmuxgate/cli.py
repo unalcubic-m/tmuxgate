@@ -1,4 +1,4 @@
-"""Public command-line surface for the local approval broker and clients."""
+"""Public command-line surface for the unified local tmuxgate application."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import ipaddress
 import json
 import os
 from pathlib import Path
-import signal
 import secrets
 import stat
 import subprocess
@@ -18,14 +17,9 @@ from types import MappingProxyType
 from typing import BinaryIO, Callable
 
 from tmuxgate import __version__
-from tmuxgate.approval import (
-    ApprovalDecision,
-    ApprovalError,
-    open_approval_terminal,
-    request_approval,
-    request_fallback_approval,
-)
-from tmuxgate.broker import BrokerServer
+from tmuxgate.application import RecoveryBlockedError, UnifiedApplication
+from tmuxgate.approval import ApprovalError, open_approval_terminal
+from tmuxgate.broker import BrokerError
 from tmuxgate.client import BrokerConnectionError, submit_request
 from tmuxgate.config import (
     ConfigError,
@@ -35,32 +29,21 @@ from tmuxgate.config import (
     default_config_path,
     load_config,
 )
-from tmuxgate.fake import FakeExecution
-from tmuxgate.executor import RealExecutor
 from tmuxgate.models import (
-    MAX_SCRIPT_BYTES,
-    ExecutionMode,
     RequestSpec,
     ResultFormat,
     ValidationError,
     validate_alias,
 )
+from tmuxgate.mcp_server import McpServerError
 from tmuxgate.network_collect import collect_network_snapshot
 from tmuxgate.protocol import ProtocolError
-from tmuxgate.planning import BoundRequestPlanner
-from tmuxgate.real_remote import RealRemoteJobBackend
-from tmuxgate.real_ssh import (
-    SecretPromptPresenter,
-    SshChannelRunner,
-    SubprocessMasterBackend,
-)
 from tmuxgate.result import ExecutionResult, relay_transparent
 from tmuxgate.runtime import (
     RuntimeSecurityError,
-    acquire_broker_lock,
+    acquire_state_lock,
     default_socket_path,
     default_state_dir,
-    open_broker_listener,
     prepare_runtime_layout,
 )
 from tmuxgate.scheduler import RequestState
@@ -68,13 +51,10 @@ from tmuxgate.state import (
     DurableStateStore,
     StateConflictError,
     StateError,
-    recover_startup,
 )
 from tmuxgate.spool import ResultSpool, SpoolError
-from tmuxgate.ssh import ResolvedSshEndpoint, resolve_ssh_endpoint
-from tmuxgate.ssh_key import AutoSshKeyManager
 from tmuxgate.settings import publish_config
-from tmuxgate.transport import MasterTransportPool
+from tmuxgate.terminal import TerminalArbiter, TerminalError, TerminalPriority
 
 
 EXIT_USAGE = 64
@@ -83,43 +63,28 @@ EXIT_SOFTWARE = 70
 EXIT_CONFIG = 78
 
 
-def _add_local_paths(parser: argparse.ArgumentParser, *, config: bool = False) -> None:
+def _add_local_paths(
+    parser: argparse.ArgumentParser,
+    *,
+    config: bool = False,
+    inherit: bool = False,
+) -> None:
+    default: object = argparse.SUPPRESS if inherit else None
     parser.add_argument(
         "--socket",
-        default=None,
+        default=default,
         help=f"broker Unix socket (default: {default_socket_path() if os.environ.get('XDG_RUNTIME_DIR') else '$XDG_RUNTIME_DIR/tmuxgate/broker.sock'})",
     )
     if config:
         parser.add_argument(
             "--config",
-            default=str(default_config_path()),
-            help="protected host configuration (default: %(default)s)",
+            default=(argparse.SUPPRESS if inherit else str(default_config_path())),
+            help=(
+                "protected host configuration"
+                if inherit
+                else "protected host configuration (default: %(default)s)"
+            ),
         )
-
-
-def _add_request_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("host", help="configured logical machine name")
-    parser.add_argument("--cwd", required=True, help="absolute remote working directory")
-    parser.add_argument(
-        "--purpose",
-        default=None,
-        help="short advisory explanation shown beside the exact command",
-    )
-    parser.add_argument("--timeout", type=int, default=None, help="requested command timeout")
-    parser.add_argument(
-        "--env",
-        action="append",
-        default=[],
-        metavar="NAME=VALUE",
-        help="environment variable to add; repeat as needed",
-    )
-    parser.add_argument(
-        "--result",
-        choices=("transparent", "json"),
-        default="transparent",
-        help="result presentation (default: %(default)s)",
-    )
-    _add_local_paths(parser)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -128,27 +93,34 @@ def build_parser() -> argparse.ArgumentParser:
         description="Owner-controlled broker for isolated remote tmux jobs",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    _add_local_paths(parser, config=True)
+    parser.add_argument("--state-dir", default=None)
+    parser.add_argument(
+        "--fake",
+        action="store_true",
+        help="run local canned fake execution; never opens SSH",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     config_parser = subparsers.add_parser("config", help="configuration tools")
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
     check_parser = config_subparsers.add_parser("check", help="validate protected config")
-    check_parser.add_argument("--path", default=str(default_config_path()))
+    check_parser.add_argument("--path", default=argparse.SUPPRESS)
     check_parser.set_defaults(handler=_config_check)
     list_parser = config_subparsers.add_parser(
         "list", help="show configured remote machine names and endpoints"
     )
-    list_parser.add_argument("--path", default=str(default_config_path()))
+    list_parser.add_argument("--path", default=argparse.SUPPRESS)
     list_parser.set_defaults(handler=_config_list)
     path_parser = config_subparsers.add_parser(
         "path", help="show the active configuration file path"
     )
-    path_parser.add_argument("--path", default=str(default_config_path()))
+    path_parser.add_argument("--path", default=argparse.SUPPRESS)
     path_parser.set_defaults(handler=_config_path)
     edit_parser = config_subparsers.add_parser(
         "edit", help="edit and validate settings in the terminal"
     )
-    edit_parser.add_argument("--path", default=str(default_config_path()))
+    edit_parser.add_argument("--path", default=argparse.SUPPRESS)
     edit_parser.set_defaults(handler=_config_edit)
     broker_settings_parser = config_subparsers.add_parser(
         "set-broker", help="atomically update supported broker behavior"
@@ -159,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     broker_settings_parser.add_argument(
         "--max-active-remote-commands", type=int, default=None
     )
-    broker_settings_parser.add_argument("--path", default=str(default_config_path()))
+    broker_settings_parser.add_argument("--path", default=argparse.SUPPRESS)
     broker_settings_parser.set_defaults(handler=_config_set_broker)
     add_parser = config_subparsers.add_parser(
         "add-machine", help="guided addition of one logical remote machine"
@@ -170,52 +142,50 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("--lan-ip", default=None)
     add_parser.add_argument("--wireguard-ip", default=None)
     add_parser.add_argument("--port", type=int, default=22)
-    add_parser.add_argument("--path", default=str(default_config_path()))
+    add_parser.add_argument("--path", default=argparse.SUPPRESS)
     add_parser.set_defaults(handler=_config_add_machine)
     remove_parser = config_subparsers.add_parser(
         "remove-machine", help="remove one logical machine from local settings"
     )
     remove_parser.add_argument("name")
     remove_parser.add_argument("--yes", action="store_true")
-    remove_parser.add_argument("--path", default=str(default_config_path()))
+    remove_parser.add_argument("--path", default=argparse.SUPPRESS)
     remove_parser.set_defaults(handler=_config_remove_machine)
     enroll_parser = config_subparsers.add_parser(
         "enroll-home", help="learn the directly connected physical home network"
     )
     enroll_parser.add_argument("--id", default=None)
     enroll_parser.add_argument("--yes", action="store_true")
-    enroll_parser.add_argument("--path", default=str(default_config_path()))
+    enroll_parser.add_argument("--path", default=argparse.SUPPRESS)
     enroll_parser.set_defaults(handler=_config_enroll_home)
 
-    exec_parser = subparsers.add_parser("exec", help="submit structured argv")
-    _add_request_options(exec_parser)
-    exec_parser.add_argument(
-        "argv",
-        nargs="+",
-        metavar="COMMAND",
-        help="command and arguments following --",
+    broker_parser = subparsers.add_parser(
+        "broker",
+        help="deprecated alias for the unified foreground application",
     )
-    exec_parser.set_defaults(handler=_exec_command)
-
-    script_parser = subparsers.add_parser("script", help="submit exact script bytes")
-    _add_request_options(script_parser)
-    source = script_parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--file", help="read exact script bytes from a local file")
-    source.add_argument("--stdin", action="store_true", help="read exact script bytes from stdin")
-    script_parser.set_defaults(handler=_script_command)
-
-    broker_parser = subparsers.add_parser("broker", help="run the interactive broker")
-    _add_local_paths(broker_parser, config=True)
-    broker_parser.add_argument("--state-dir", default=None)
+    _add_local_paths(broker_parser, config=True, inherit=True)
+    broker_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
     broker_parser.add_argument(
         "--fake",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="run local canned fake execution; never opens SSH",
     )
-    broker_parser.set_defaults(handler=_broker_command)
+    broker_parser.set_defaults(handler=_broker_alias_command)
+
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        help="run the unified foreground application and terminal dashboard",
+    )
+    _add_local_paths(dashboard_parser, config=True, inherit=True)
+    dashboard_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
+    dashboard_parser.add_argument(
+        "--fake", action="store_true", default=argparse.SUPPRESS
+    )
+    dashboard_parser.set_defaults(handler=_unified_command)
 
     jobs_parser = subparsers.add_parser("jobs", help="list durable local job records")
-    jobs_parser.add_argument("--state-dir", default=None)
+    jobs_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
     jobs_parser.add_argument("--json", action="store_true")
     jobs_parser.set_defaults(handler=_jobs_command)
 
@@ -230,16 +200,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="record that a full machine reboot abandoned an uncertain request",
     )
     after_reboot_parser.add_argument("request_id")
-    after_reboot_parser.add_argument("--state-dir", default=None)
-    _add_local_paths(after_reboot_parser)
+    after_reboot_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
+    _add_local_paths(after_reboot_parser, inherit=True)
     after_reboot_parser.set_defaults(handler=_recover_after_reboot)
     after_dead_pane_parser = recover_subparsers.add_parser(
         "after-dead-pane",
         help="record that the operator visibly observed the dedicated pane dead",
     )
     after_dead_pane_parser.add_argument("request_id")
-    after_dead_pane_parser.add_argument("--state-dir", default=None)
-    _add_local_paths(after_dead_pane_parser)
+    after_dead_pane_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
+    _add_local_paths(after_dead_pane_parser, inherit=True)
     after_dead_pane_parser.set_defaults(handler=_recover_after_dead_pane)
 
     for name, help_text in (
@@ -249,9 +219,9 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         control = subparsers.add_parser(name, help=help_text)
         control.add_argument("request_id")
-        _add_local_paths(control)
+        _add_local_paths(control, inherit=True)
         if name in {"attach", "collect"}:
-            control.add_argument("--state-dir", default=None)
+            control.add_argument("--state-dir", default=argparse.SUPPRESS)
         if name == "collect":
             control.add_argument(
                 "--result", choices=("transparent", "json"), default="transparent"
@@ -289,7 +259,7 @@ def _config_list(args: argparse.Namespace) -> int:
                 f"when={endpoint.required_context}"
             )
     print("\nEdit: tmuxgate config edit")
-    print("Restart a running broker after changing settings.")
+    print("Restart tmuxgate after changing settings.")
     return 0
 
 
@@ -317,7 +287,7 @@ def _config_set_broker(args: argparse.Namespace) -> int:
         f"approval_mode={updated.broker.approval_mode}, "
         f"max_active_remote_commands={updated.broker.max_active_remote_commands}."
     )
-    print("Restart a running broker to load them.")
+    print("Restart tmuxgate to load them.")
     return 0
 
 
@@ -352,13 +322,14 @@ def _config_edit(args: argparse.Namespace) -> int:
     published = False
     try:
         while True:
-            completed = subprocess.run(
-                ("/usr/bin/nano", "--", os.fspath(temporary)),
-                stdin=None,
-                stdout=None,
-                stderr=None,
-                check=False,
-            )
+            with open_approval_terminal() as terminal:
+                completed = subprocess.run(
+                    ("/usr/bin/nano", "--", os.fspath(temporary)),
+                    stdin=terminal.reader,
+                    stdout=terminal.writer,
+                    stderr=terminal.writer,
+                    check=False,
+                )
             if completed.returncode != 0:
                 print("tmuxgate: editor exited without publishing settings", file=sys.stderr)
                 return EXIT_UNAVAILABLE
@@ -377,7 +348,7 @@ def _config_edit(args: argparse.Namespace) -> int:
             published = True
             print(
                 f"Settings valid: {len(config.machines)} machines. "
-                "Restart the broker to load them."
+                "Restart tmuxgate to load them."
             )
             return 0
     finally:
@@ -390,16 +361,23 @@ def _config_edit(args: argparse.Namespace) -> int:
 
 def _prompt(label: str, *, default: str | None = None, allow_empty: bool = False) -> str:
     suffix = f" [{default}]" if default is not None else ""
-    while True:
-        try:
-            value = input(f"{label}{suffix}: ")
-        except EOFError as exc:
-            raise ConfigError("settings input ended before completion") from exc
-        if not value and default is not None:
-            return default
-        if value or allow_empty:
-            return value
-        print("A value is required.")
+    with open_approval_terminal() as terminal:
+        while True:
+            terminal.writer.write(f"{label}{suffix}: ")
+            terminal.writer.flush()
+            try:
+                value = terminal.reader.readline()
+            except EOFError as exc:
+                raise ConfigError("settings input ended before completion") from exc
+            if value == "":
+                raise ConfigError("settings input ended before completion")
+            value = value.rstrip("\r\n")
+            if not value and default is not None:
+                return default
+            if value or allow_empty:
+                return value
+            terminal.writer.write("A value is required.\n")
+            terminal.writer.flush()
 
 
 def _ipv4_or_none(value: str, label: str) -> ipaddress.IPv4Address | None:
@@ -462,7 +440,7 @@ def _config_add_machine(args: argparse.Namespace) -> int:
     machines = dict(config.machines)
     machines[name] = machine
     publish_config(path, replace(config, machines=MappingProxyType(machines)))
-    print(f"Added {name}. Restart the broker to load the new machine.")
+    print(f"Added {name}. Restart tmuxgate to load the new machine.")
     return 0
 
 
@@ -619,29 +597,8 @@ def _config_enroll_home(args: argparse.Namespace) -> int:
     )
     updated_home = replace(home, fingerprints=(*home.fingerprints, fingerprint))
     publish_config(path, replace(config, home=updated_home))
-    print(f"Enrolled {fingerprint_id}. Restart the broker to use home-LAN routing.")
+    print(f"Enrolled {fingerprint_id}. Restart tmuxgate to use home-LAN routing.")
     return 0
-
-
-def _environment(values: list[str]) -> tuple[tuple[str, str], ...]:
-    entries: list[tuple[str, str]] = []
-    for value in values:
-        name, separator, content = value.partition("=")
-        if not separator:
-            raise ValidationError("--env values must use NAME=VALUE")
-        entries.append((name, content))
-    return tuple(entries)
-
-
-def _request_common(args: argparse.Namespace) -> dict[str, object]:
-    return {
-        "machine_alias": args.host,
-        "cwd": args.cwd,
-        "environment": _environment(args.env),
-        "timeout_seconds": args.timeout,
-        "result_format": ResultFormat(args.result),
-        "purpose": args.purpose,
-    }
 
 
 def present_result(
@@ -674,201 +631,6 @@ def submit_and_present(
     return present_result(result, request.result_format, stdout=output, stderr=errors)
 
 
-def _exec_command(args: argparse.Namespace) -> int:
-    argv = tuple(args.argv)
-    if argv and argv[0] == "--":
-        argv = argv[1:]
-    if not argv:
-        raise ValidationError("exec requires a command after --")
-    request = RequestSpec(mode=ExecutionMode.ARGV, argv=argv, **_request_common(args))
-    return submit_and_present(request, socket_path=args.socket)
-
-
-def _read_bounded(stream: BinaryIO) -> bytes:
-    content = stream.read(MAX_SCRIPT_BYTES + 1)
-    if len(content) > MAX_SCRIPT_BYTES:
-        raise ValidationError(f"script exceeds {MAX_SCRIPT_BYTES} bytes")
-    return content
-
-
-def _script_command(args: argparse.Namespace) -> int:
-    if args.stdin:
-        script = _read_bounded(sys.stdin.buffer)
-    else:
-        with open(args.file, "rb") as source:
-            script = _read_bounded(source)
-    request = RequestSpec(
-        mode=ExecutionMode.SCRIPT,
-        script=script,
-        **_request_common(args),
-    )
-    return submit_and_present(request, socket_path=args.socket)
-
-
-class _ZeroFakeExecutor:
-    def __call__(self, request_id: str, request: RequestSpec) -> FakeExecution:
-        # Never inspect or execute request contents.
-        return FakeExecution()
-
-
-def _approve_without_prompt(*args: object) -> ApprovalDecision:
-    """Honor the owner-controlled disabled approval mode."""
-
-    return ApprovalDecision.APPROVED
-
-
-def _broker_command(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
-    paths = prepare_runtime_layout(socket_path=args.socket, state_dir=args.state_dir)
-    with DurableStateStore(paths.state_dir) as store, ResultSpool(paths.state_dir) as spool:
-        recovery = recover_startup(store)
-        if not recovery.safe_to_accept_new_approvals:
-            blocked = ", ".join(recovery.blocking_request_ids)
-            print(f"tmuxgate: recovery blocks new approvals: {blocked}", file=sys.stderr)
-            return EXIT_SOFTWARE
-        with open_broker_listener(paths.socket_path) as lifecycle:
-            pool = None
-            executor = None
-            prompt_presenter = None
-            if args.fake:
-                approver = (
-                    request_approval
-                    if config.broker.approval_mode == "always"
-                    else _approve_without_prompt
-                )
-                selected_executor = _ZeroFakeExecutor()
-                approval_discarder = lambda request_id: None
-                delivery_observer = lambda request_id, delivered: None
-            else:
-                terminal_lock = threading.RLock()
-                if config.broker.approval_mode == "always":
-                    planner = BoundRequestPlanner(config)
-
-                    def serialized_planner(
-                        request_id: str,
-                        request: RequestSpec,
-                    ) -> ApprovalDecision:
-                        with terminal_lock:
-                            return planner(request_id, request)
-
-                    approver = serialized_planner
-                else:
-                    planner = BoundRequestPlanner(
-                        config, approver=_approve_without_prompt
-                    )
-                    approver = planner
-
-                def revalidate(resolved: ResolvedSshEndpoint) -> ResolvedSshEndpoint:
-                    machine = config.machines[resolved.machine_name]
-                    endpoint = next(
-                        item for item in machine.endpoints
-                        if item.id == resolved.endpoint_id
-                    )
-                    return resolve_ssh_endpoint(machine, endpoint)
-
-                pool = MasterTransportPool(
-                    paths.control_dir,
-                    backend=SubprocessMasterBackend(
-                        terminal_lock=terminal_lock
-                    ),
-                    identity_revalidator=revalidate,
-                    max_masters=config.broker.max_open_ssh_masters,
-                    idle_timeout_seconds=(
-                        config.broker.ssh_master_idle_timeout_seconds
-                    ),
-                    key_manager=AutoSshKeyManager(),
-                )
-                prompt_presenter = SecretPromptPresenter(
-                    terminal_lock=terminal_lock,
-                    reporter=lambda message: print(
-                        f"tmuxgate: {message}", file=sys.stderr, flush=True
-                    ),
-                )
-                channels = SshChannelRunner(
-                    prompt_presenter=prompt_presenter
-                )
-
-                def serialized_fallback_approval(
-                    *arguments: object,
-                    **keywords: object,
-                ) -> ApprovalDecision:
-                    with terminal_lock:
-                        return request_fallback_approval(
-                            *arguments, **keywords
-                        )
-
-                executor = RealExecutor(
-                    planner=planner,
-                    transports=pool,
-                    state=store,
-                    spool=spool,
-                    backend_factory=lambda transport: RealRemoteJobBackend(
-                        transport,
-                        channels=channels,
-                        viewer_dir=paths.viewer_dir,
-                    ),
-                    fallback_approver=(
-                        serialized_fallback_approval
-                        if config.broker.approval_mode == "always"
-                        else _approve_without_prompt
-                    ),
-                )
-                selected_executor = executor
-                approval_discarder = executor.discard_approval
-                delivery_observer = executor.result_delivery_finished
-            server = BrokerServer(
-                lifecycle.listener,
-                allowed_machines=config.machines,
-                approver=approver,
-                executor=selected_executor,
-                max_pending_requests=config.broker.max_pending_requests,
-                max_active_remote_commands=(
-                    config.broker.max_active_remote_commands
-                ),
-                approval_discarder=approval_discarder,
-                delivery_observer=delivery_observer,
-            )
-            stop = threading.Event()
-
-            def request_stop(signum: int, frame: object) -> None:
-                stop.set()
-
-            previous = {
-                number: signal.signal(number, request_stop)
-                for number in (signal.SIGINT, signal.SIGTERM)
-            }
-            try:
-                server.start()
-                kind = "fake" if args.fake else "real"
-                print(f"tmuxgate {kind} broker listening on {lifecycle.socket_path}")
-                print("Configured machines: " + ", ".join(config.machines))
-                print(f"Approval mode: {config.broker.approval_mode}")
-                if config.broker.approval_mode == "disabled":
-                    print(
-                        "WARNING: owner-authorized same-UID requests run without "
-                        "per-command approval."
-                    )
-                print("Settings: tmuxgate config list | tmuxgate config edit")
-                while not stop.wait(0.25):
-                    pass
-            finally:
-                clean = server.stop()
-                if prompt_presenter is not None:
-                    clean = prompt_presenter.close() and clean
-                if pool is not None:
-                    try:
-                        pool.close_idle()
-                    except BaseException as exc:
-                        clean = False
-                        print(
-                            f"tmuxgate: could not close all idle SSH masters: {exc}",
-                            file=sys.stderr,
-                        )
-                for number, handler in previous.items():
-                    signal.signal(number, handler)
-            return 0 if clean else EXIT_SOFTWARE
-
-
 def _job_document(record: object) -> dict[str, object]:
     return {
         "completion_time": record.completion_time,
@@ -894,7 +656,13 @@ def _job_document(record: object) -> dict[str, object]:
 
 def _jobs_command(args: argparse.Namespace) -> int:
     state_dir = default_state_dir() if args.state_dir is None else Path(args.state_dir)
-    with DurableStateStore(state_dir) as store:
+    # A live broker may be between creating and atomically publishing a state
+    # temporary.  This read-only administrative view must ignore, never unlink,
+    # such entries; singleton-owned startup recovery performs stale cleanup.
+    with DurableStateStore(
+        state_dir,
+        cleanup_stale_temporaries=False,
+    ) as store:
         records = store.load_all()
     if args.json:
         print(json.dumps([_job_document(record) for record in records], sort_keys=True))
@@ -950,7 +718,7 @@ def _recover_after_reboot(args: argparse.Namespace) -> int:
         socket_path=args.socket,
         state_dir=args.state_dir,
     )
-    with acquire_broker_lock(paths.runtime_dir):
+    with acquire_state_lock(paths.state_dir):
         with DurableStateStore(paths.state_dir) as store:
             record = store.load(args.request_id)
             if record.state is not RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING:
@@ -1023,7 +791,7 @@ def _recover_after_dead_pane(args: argparse.Namespace) -> int:
         socket_path=args.socket,
         state_dir=args.state_dir,
     )
-    with acquire_broker_lock(paths.runtime_dir):
+    with acquire_state_lock(paths.state_dir):
         with DurableStateStore(paths.state_dir) as store:
             record = store.load(args.request_id)
             if record.state is not RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING:
@@ -1127,56 +895,121 @@ def _collect_local_result(args: argparse.Namespace) -> int:
     )
 
 
-def _interactive_menu() -> int:
-    """Small terminal dashboard for ordinary personal operation."""
+def _running_dashboard(
+    stop: threading.Event,
+    terminal: TerminalArbiter,
+    config_path: str,
+    state_dir: str | None,
+) -> None:
+    """Integrated dashboard that yields idle terminal ownership to broker work."""
 
-    while True:
-        print(
-            "\nTMUXGATE\n"
-            "========\n"
-            "1  Start execution broker\n"
-            "2  List remote machines\n"
-            "3  Add remote machine\n"
-            "4  Remove remote machine\n"
-            "5  Enroll this physical home network\n"
-            "6  Advanced settings editor\n"
-            "q  Quit\n"
-        )
+    menu = (
+        "\nTMUXGATE RUNNING\n"
+        "================\n"
+        "1  List durable jobs\n"
+        "2  List remote machines\n"
+        "3  Add remote machine\n"
+        "4  Remove remote machine\n"
+        "5  Enroll this physical home network\n"
+        "6  Advanced settings editor\n"
+        "q  Stop tmuxgate\n"
+        "Choose: "
+    )
+    redraw = True
+    while not stop.is_set():
+        if redraw:
+            with terminal.claim(
+                priority=TerminalPriority.DASHBOARD,
+                purpose="dashboard rendering",
+                flush_input=False,
+            ):
+                print(menu, end="", flush=True)
+            redraw = False
         try:
-            choice = input("Choose [1]: ").strip().casefold() or "1"
+            line = terminal.poll_dashboard_line(timeout=0.25)
         except (EOFError, KeyboardInterrupt):
             print()
-            return 0
-        if choice in {"q", "quit", "exit"}:
-            return 0
-        if choice == "1":
-            print("Starting broker. Press Ctrl-C to return to this menu.\n")
-            status = main(["broker"])
-        elif choice == "2":
-            status = main(["config", "list"])
-        elif choice == "3":
-            status = main(["config", "add-machine"])
-        elif choice == "4":
-            name = _prompt("Logical machine name to remove")
-            status = main(["config", "remove-machine", name])
-        elif choice == "5":
-            status = main(["config", "enroll-home"])
-        elif choice == "6":
-            status = main(["config", "edit"])
-        else:
-            print("Unknown choice.")
+            stop.set()
+            return
+        if line is None:
             continue
-        if status != 0:
-            print(f"Operation ended with local status {status}.")
+        choice = line.strip().casefold()
+        if choice in {"q", "quit", "exit"}:
+            stop.set()
+            return
+        status = 0
+        with terminal.claim(
+            priority=TerminalPriority.INTERACTIVE,
+            purpose="dashboard operation",
+        ):
+            if choice == "1":
+                arguments = ["jobs"]
+                if state_dir is not None:
+                    arguments.extend(("--state-dir", state_dir))
+                status = main(arguments)
+            elif choice == "2":
+                status = main(["config", "list", "--path", config_path])
+            elif choice == "3":
+                status = main(["config", "add-machine", "--path", config_path])
+            elif choice == "4":
+                name = _prompt("Logical machine name to remove")
+                status = main(
+                    ["config", "remove-machine", name, "--path", config_path]
+                )
+            elif choice == "5":
+                status = main(["config", "enroll-home", "--path", config_path])
+            elif choice == "6":
+                status = main(["config", "edit", "--path", config_path])
+            else:
+                print("Unknown choice.")
+                redraw = True
+                continue
+            if status != 0:
+                print(f"Operation ended with local status {status}.")
+            elif choice != "1":
+                print("Configuration changes take effect after tmuxgate restarts.")
+        redraw = True
+
+
+def _unified_command(args: argparse.Namespace) -> int:
+    config_path = str(args.config)
+    state_dir = None if args.state_dir is None else str(args.state_dir)
+    application = UnifiedApplication(
+        config_path=config_path,
+        socket_path=args.socket,
+        state_dir=args.state_dir,
+        fake=args.fake,
+        dashboard=lambda stop, terminal, config: _running_dashboard(
+            stop,
+            terminal,
+            config_path,
+            state_dir,
+        ),
+    )
+    return application.run()
+
+
+def _broker_alias_command(args: argparse.Namespace) -> int:
+    print(
+        "tmuxgate: 'broker' is deprecated; run 'tmuxgate' directly.",
+        file=sys.stderr,
+    )
+    return _unified_command(args)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command is None:
-        return _interactive_menu()
+    if args.command == "config" and not hasattr(args, "path"):
+        # A global --config supplied before the subcommand selects the same
+        # protected file unless the legacy per-command --path overrides it.
+        args.path = args.config
     try:
-        return int(args.handler(args))
+        handler = _unified_command if args.command is None else args.handler
+        return int(handler(args))
+    except RecoveryBlockedError as exc:
+        print(f"tmuxgate: {exc}", file=sys.stderr)
+        return EXIT_SOFTWARE
     except (ConfigError, RuntimeSecurityError) as exc:
         print(f"tmuxgate: configuration/security error: {exc}", file=sys.stderr)
         return EXIT_CONFIG
@@ -1185,10 +1018,13 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
     except (
         ApprovalError,
+        BrokerError,
         BrokerConnectionError,
+        McpServerError,
         ProtocolError,
         StateError,
         SpoolError,
+        TerminalError,
         OSError,
     ) as exc:
         print(f"tmuxgate: operation failed: {exc}", file=sys.stderr)

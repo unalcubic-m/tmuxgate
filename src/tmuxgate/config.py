@@ -19,6 +19,10 @@ from tmuxgate.models import ValidationError, validate_alias
 
 _MAC_RE = re.compile(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\Z", re.ASCII)
 _USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}\Z", re.ASCII)
+MCP_LOOPBACK_HOST = "127.0.0.1"
+MCP_DEFAULT_PORT = 8765
+
+
 class ConfigError(ValueError):
     """Configuration is unsafe, malformed, or internally inconsistent."""
 
@@ -48,9 +52,23 @@ class BrokerConfig:
             if type(value) is not int or not minimum <= value <= maximum:
                 raise ConfigError(f"broker.{name} must be between {minimum} and {maximum}")
         if self.queue_policy != "fifo":
-            raise ConfigError("broker.queue_policy must be 'fifo' in version 1")
+            raise ConfigError("broker.queue_policy must be 'fifo'")
         if self.approval_mode not in {"always", "disabled"}:
             raise ConfigError("broker.approval_mode must be 'always' or 'disabled'")
+
+
+@dataclass(frozen=True, slots=True)
+class McpConfig:
+    host: str = MCP_LOOPBACK_HOST
+    port: int = MCP_DEFAULT_PORT
+
+    def __post_init__(self) -> None:
+        if self.host != MCP_LOOPBACK_HOST:
+            raise ConfigError(
+                f"mcp.host must be the literal loopback address {MCP_LOOPBACK_HOST!r}"
+            )
+        if type(self.port) is not int or not 1 <= self.port <= 65535:
+            raise ConfigError("mcp.port must be between 1 and 65535")
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +120,7 @@ class AppConfig:
     home: HomeContext | None
     wireguard: WireGuardContext | None
     machines: Mapping[str, Machine]
+    mcp: McpConfig = McpConfig()
 
 
 def default_config_path() -> Path:
@@ -190,7 +209,7 @@ def _parse_broker(raw: object) -> BrokerConfig:
     pending = _integer(table.get("max_pending_requests", 16), "broker.max_pending_requests", 1, 64)
     policy = _string(table.get("queue_policy", "fifo"), "broker.queue_policy")
     if policy != "fifo":
-        raise ConfigError("broker.queue_policy must be 'fifo' in version 1")
+        raise ConfigError("broker.queue_policy must be 'fifo'")
     idle = _integer(
         table.get("ssh_master_idle_timeout_seconds", 600),
         "broker.ssh_master_idle_timeout_seconds",
@@ -208,6 +227,18 @@ def _parse_broker(raw: object) -> BrokerConfig:
         ssh_master_idle_timeout_seconds=idle,
         approval_mode=approval_mode,
     )
+
+
+def _parse_mcp(raw: object) -> McpConfig:
+    table = _table(raw, "mcp")
+    _only(table, {"host", "port"}, "mcp")
+    host = _string(table.get("host", MCP_LOOPBACK_HOST), "mcp.host")
+    if host != MCP_LOOPBACK_HOST:
+        raise ConfigError(
+            f"mcp.host must be the literal loopback address {MCP_LOOPBACK_HOST!r}"
+        )
+    port = _integer(table.get("port", MCP_DEFAULT_PORT), "mcp.port", 1, 65535)
+    return McpConfig(host=host, port=port)
 
 
 def _parse_home(raw: object) -> HomeContext:
@@ -298,7 +329,7 @@ def _parse_endpoint(raw: object, name: str) -> Endpoint:
     priority = _integer(table.get("priority", 100), f"{name}.priority", 0, 10000)
     required = _string(table.get("requires"), f"{name}.requires")
     if required not in {"home", "wireguard"}:
-        raise ConfigError(f"{name}.requires must be home or wireguard in version 1")
+        raise ConfigError(f"{name}.requires must be home or wireguard")
     return Endpoint(endpoint_id, address, port, priority, required)
 
 
@@ -360,11 +391,15 @@ def _parse_machine(name: str, raw: object, home: HomeContext | None, wireguard: 
 
 def parse_config(data: Mapping[str, Any]) -> AppConfig:
     table = _table(data, "configuration")
-    _only(table, {"version", "broker", "contexts", "machines"}, "configuration")
     version = table.get("version")
-    if type(version) is not int or version != 1:
-        raise ConfigError("configuration version must equal 1")
+    if type(version) is not int or version not in {1, 2}:
+        raise ConfigError("configuration version must equal 1 or 2")
+    allowed = {"version", "broker", "contexts", "machines"}
+    if version == 2:
+        allowed.add("mcp")
+    _only(table, allowed, "configuration")
     broker = _parse_broker(table.get("broker", {}))
+    mcp = _parse_mcp(table.get("mcp", {}))
     contexts = _table(table.get("contexts", {}), "contexts")
     _only(contexts, {"home", "wireguard"}, "contexts")
     home = _parse_home(contexts["home"]) if "home" in contexts else None
@@ -376,7 +411,10 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
         name: _parse_machine(name, raw, home, wireguard)
         for name, raw in raw_machines.items()
     })
-    return AppConfig(1, broker, home, wireguard, machines)
+    # Version 1 is accepted as an input compatibility format.  The in-memory
+    # model is normalized to the current schema so subsequent managed writes
+    # publish version 2 rather than preserving the legacy format.
+    return AppConfig(2, broker, home, wireguard, machines, mcp)
 
 
 def _open_secure_config(path: Path):

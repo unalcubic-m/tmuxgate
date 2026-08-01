@@ -19,7 +19,7 @@ from tmuxgate.real_ssh import (
     _discard_pending_terminal_input,
     secret_prompt_signature,
 )
-from tmuxgate.transport import SshInvocation, TransportError
+from tmuxgate.transport import SshInvocation, SshMasterStartError, TransportError
 
 
 class FakeTerminal(BytesIO):
@@ -305,6 +305,45 @@ class RealSshProcessTests(unittest.TestCase):
         self.assertIs(kwargs["stdin"], terminal)
         self.assertIs(kwargs["stdout"], terminal)
         self.assertIs(kwargs["stderr"], terminal)
+        self.assertIn(b"no remote command has started", terminal.getvalue())
+
+    def test_master_failure_reports_status_without_copying_terminal_output(self):
+        terminal = FakeTerminal()
+
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv,
+                255,
+                b"secret-like stdout that must remain terminal-only",
+                b"secret-like stderr that must remain terminal-only",
+            )
+
+        backend = SubprocessMasterBackend(
+            runner=run,
+            terminal_opener=lambda *args, **kwargs: terminal,
+        )
+        invocation = SshInvocation("start-master", ("/usr/bin/ssh",), True)
+
+        with self.assertRaises(SshMasterStartError) as raised:
+            backend.start_master(invocation, Path("/tmp/master.sock"))
+
+        self.assertEqual(raised.exception.returncode, 255)
+        detail = str(raised.exception)
+        self.assertIn("status 255", detail)
+        self.assertIn("before remote execution", detail)
+        self.assertIn("broker terminal", detail)
+        self.assertNotIn("secret-like", detail)
+        self.assertIn(b"Complete any OpenSSH prompt", terminal.getvalue())
+
+    def test_master_stop_failure_is_observable(self):
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 255, b"", b"failed")
+
+        backend = SubprocessMasterBackend(runner=run)
+        invocation = SshInvocation("master-exit", ("/usr/bin/ssh",), False)
+
+        with self.assertRaisesRegex(TransportError, "shutdown was not confirmed"):
+            backend.stop_master(invocation, Path("/tmp/master.sock"))
 
     def test_post_auth_batch_channel_cannot_prompt(self):
         calls = []

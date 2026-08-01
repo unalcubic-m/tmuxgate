@@ -26,7 +26,7 @@ DEFAULT_SSH_KEYGEN_PATH = Path("/usr/bin/ssh-keygen")
 DEFAULT_RESOLUTION_TIMEOUT_SECONDS = 5.0
 MAX_SSH_G_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_KNOWN_HOSTS_BYTES = 16 * 1024 * 1024
-SSH_POLICY_VERSION = 1
+SSH_POLICY_VERSION = 2
 
 _KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*\Z", re.ASCII)
 _SAFE_STRICT_HOST_KEY_CHECKING = frozenset({"ask", "yes"})
@@ -217,6 +217,8 @@ def build_ssh_g_argv(
         f"HostName={endpoint.address.exploded}",
         "-o",
         f"IdentityFile={default_tmuxgate_identity_file(machine.name)}",
+        "-o",
+        "IdentitiesOnly=yes",
         "-o",
         "PermitLocalCommand=no",
         "-o",
@@ -413,11 +415,16 @@ def _policy_document(machine: Machine, endpoint: Endpoint) -> dict[str, object]:
     return {
         "batch_mode_for_initial_master": False,
         "batch_mode_for_post_auth_channels": True,
+        "certificate_files": [],
         "canonicalize_hostname": False,
         "connect_timeout_seconds": machine.connect_timeout_seconds,
         "endpoint_address": endpoint.address.exploded,
         "endpoint_port": endpoint.port,
         "host_key_alias": machine.host_key_alias,
+        "identity_files": [
+            os.fspath(default_tmuxgate_identity_file(machine.name))
+        ],
+        "identities_only": True,
         "machine_control": {
             "remote_command": "none",
             "request_tty": False,
@@ -481,6 +488,7 @@ def resolve_ssh_endpoint(
     strict = _single(parsed, "stricthostkeychecking")
     request_tty = _single(parsed, "requesttty")
     batch_mode = _single(parsed, "batchmode")
+    identities_only = _single(parsed, "identitiesonly")
     canonicalize = _single(parsed, "canonicalizehostname")
     permit_local = _single(parsed, "permitlocalcommand")
     remote_command = _optional_value(parsed, "remotecommand")
@@ -507,6 +515,22 @@ def resolve_ssh_endpoint(
         raise SshResolutionError("machine-control SSH did not disable RequestTTY")
     if batch_mode not in _FALSE_VALUES:
         raise SshResolutionError("initial SSH master must remain interactive")
+    if identities_only not in {"true", "yes"}:
+        raise SshResolutionError(
+            "SSH must use only explicitly configured identities"
+        )
+    expected_identity_file = os.fspath(
+        default_tmuxgate_identity_file(machine.name)
+    )
+    identity_files = tuple(parsed.get("identityfile", ()))
+    if identity_files != (expected_identity_file,):
+        raise SshResolutionError(
+            "SSH must use exactly the dedicated tmuxgate identity file"
+        )
+    if parsed.get("certificatefile"):
+        raise SshResolutionError(
+            "SSH profile must not add certificate files"
+        )
     if canonicalize not in _FALSE_VALUES:
         raise SshResolutionError("SSH hostname canonicalization was not disabled")
     if permit_local not in _FALSE_VALUES:
@@ -564,7 +588,7 @@ def resolve_ssh_endpoint(
         proxy_jump=_optional_value(parsed, "proxyjump"),
         proxy_command=_optional_value(parsed, "proxycommand"),
         identity_agent=_optional_value(parsed, "identityagent"),
-        identity_files=tuple(parsed.get("identityfile", ())),
+        identity_files=identity_files,
         enabled_authentication_methods=enabled_authentication,
         ssh_g_output_sha256=hashlib.sha256(raw_output).hexdigest(),
         ssh_policy_sha256=policy_sha256,

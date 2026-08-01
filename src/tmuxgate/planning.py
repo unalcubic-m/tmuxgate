@@ -28,6 +28,34 @@ ConnectionBuilder = Callable[..., ConnectionPlan]
 BoundApprover = Callable[..., ApprovalDecision]
 
 
+def _candidate_retry_semantics(plan: ConnectionPlan) -> tuple[tuple[object, ...], ...]:
+    """Return ordered route-candidate fields that affect retry eligibility."""
+
+    return tuple(
+        (
+            candidate.endpoint_id,
+            candidate.address,
+            candidate.port,
+            candidate.required_context,
+            candidate.priority,
+            candidate.result,
+        )
+        for candidate in plan.candidates
+    )
+
+
+def _retry_semantics_match(expected: ConnectionPlan, current: ConnectionPlan) -> bool:
+    """Compare security semantics while ignoring volatile observation bytes."""
+
+    return (
+        current.machine_name == expected.machine_name
+        and current.fallback_policy == expected.fallback_policy
+        and _candidate_retry_semantics(current)
+        == _candidate_retry_semantics(expected)
+        and current.endpoints == expected.endpoints
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovedRequestContext:
     request_id: str
@@ -89,8 +117,7 @@ class BoundRequestPlanner:
         with self._lock:
             return tuple(sorted(self._approved))
 
-    def __call__(self, request_id: str, request: RequestSpec) -> ApprovalDecision:
-        request_id = validate_request_id(request_id)
+    def _build_connection_plan(self, request: RequestSpec) -> ConnectionPlan:
         if not isinstance(request, RequestSpec):
             raise TypeError("request must be a RequestSpec")
         try:
@@ -99,34 +126,50 @@ class BoundRequestPlanner:
             raise PlanningError(
                 f"unknown configured machine: {request.machine_alias}"
             ) from exc
+        destinations = tuple(endpoint.address for endpoint in machine.endpoints)
+        snapshot = self.snapshot_collector(
+            destinations,
+            home_gateway=(
+                None if self.config.home is None else self.config.home.gateway
+            ),
+        )
+        if not isinstance(snapshot, NetworkSnapshot):
+            raise PlanningError("snapshot collector returned an invalid object")
+        route_plan = self.route_builder(
+            machine,
+            snapshot,
+            self.config.home,
+            self.config.wireguard,
+        )
+        if not isinstance(route_plan, RoutePlan):
+            raise PlanningError("route builder returned an invalid object")
+        connection_plan = self.connection_builder(
+            route_plan,
+            snapshot,
+            resolver=self.endpoint_resolver,
+        )
+        if not isinstance(connection_plan, ConnectionPlan):
+            raise PlanningError("connection builder returned an invalid object")
+        return connection_plan
+
+    def _begin_planning(self, request_id: str) -> None:
         with self._lock:
             if self._planning_request_id is not None:
                 raise PlanningError("another request is currently being planned")
             self._planning_request_id = request_id
 
+    def _finish_planning(self, request_id: str) -> None:
+        with self._lock:
+            if self._planning_request_id == request_id:
+                self._planning_request_id = None
+
+    def __call__(self, request_id: str, request: RequestSpec) -> ApprovalDecision:
+        request_id = validate_request_id(request_id)
+        if not isinstance(request, RequestSpec):
+            raise TypeError("request must be a RequestSpec")
+        self._begin_planning(request_id)
         try:
-            destinations = tuple(endpoint.address for endpoint in machine.endpoints)
-            snapshot = self.snapshot_collector(
-                destinations,
-                home_gateway=None if self.config.home is None else self.config.home.gateway,
-            )
-            if not isinstance(snapshot, NetworkSnapshot):
-                raise PlanningError("snapshot collector returned an invalid object")
-            route_plan = self.route_builder(
-                machine,
-                snapshot,
-                self.config.home,
-                self.config.wireguard,
-            )
-            if not isinstance(route_plan, RoutePlan):
-                raise PlanningError("route builder returned an invalid object")
-            connection_plan = self.connection_builder(
-                route_plan,
-                snapshot,
-                resolver=self.endpoint_resolver,
-            )
-            if not isinstance(connection_plan, ConnectionPlan):
-                raise PlanningError("connection builder returned an invalid object")
+            connection_plan = self._build_connection_plan(request)
             decision = ApprovalDecision(
                 self.approver(request_id, request, connection_plan)
             )
@@ -145,9 +188,53 @@ class BoundRequestPlanner:
                 self._approved[request_id] = context
             return decision
         finally:
-            with self._lock:
-                if self._planning_request_id == request_id:
-                    self._planning_request_id = None
+            self._finish_planning(request_id)
+
+    def revalidate_connection_plan(
+        self,
+        request_id: str,
+        request: RequestSpec,
+        expected: ConnectionPlan,
+        *,
+        retried_endpoint_id: str,
+    ) -> ConnectionPlan:
+        """Re-prove stable route and SSH semantics before a pre-remote retry."""
+
+        request_id = validate_request_id(request_id)
+        if not isinstance(request, RequestSpec):
+            raise TypeError("request must be a RequestSpec")
+        if not isinstance(expected, ConnectionPlan):
+            raise TypeError("expected must be a ConnectionPlan")
+        if not isinstance(retried_endpoint_id, str):
+            raise TypeError("retried_endpoint_id must be a string")
+        if not retried_endpoint_id:
+            raise ValueError("retried_endpoint_id must not be empty")
+        if expected.machine_name != request.machine_alias:
+            raise PlanningError("retry plan belongs to a different machine")
+        approved_endpoint_ids = tuple(
+            endpoint.resolved.endpoint_id for endpoint in expected.endpoints
+        )
+        if retried_endpoint_id not in approved_endpoint_ids:
+            raise PlanningError("retry endpoint was not eligible in the approved plan")
+        self._begin_planning(request_id)
+        try:
+            current = self._build_connection_plan(request)
+        finally:
+            self._finish_planning(request_id)
+        current_endpoint_ids = tuple(
+            endpoint.resolved.endpoint_id for endpoint in current.endpoints
+        )
+        if retried_endpoint_id not in current_endpoint_ids:
+            raise PlanningError(
+                "retry endpoint is no longer eligible; submit a fresh request "
+                "for a new approval"
+            )
+        if not _retry_semantics_match(expected, current):
+            raise PlanningError(
+                "approved route or SSH plan changed before retry; submit a fresh "
+                "request for a new approval"
+            )
+        return current
 
     def take(
         self,

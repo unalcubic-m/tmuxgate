@@ -2,19 +2,37 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import math
 import os
 from pathlib import Path
 import socket
 
+from tmuxgate.broker_api import (
+    ControlRequest,
+    ControlResponse,
+    DEFAULT_JOB_PAGE_SIZE,
+    DEFAULT_RESULT_CHUNK_BYTES,
+    JobPage,
+    ListJobsRequest,
+    ListMachinesRequest,
+    MachineList,
+    MachineSummary,
+    ReadVerifiedResultRequest,
+    ResultStream,
+    VerifiedResultChunk,
+    decode_control_response,
+)
 from tmuxgate.models import PROTOCOL_VERSION, RequestSpec, ValidationError, validate_request_id
-from tmuxgate.protocol import ProtocolError, receive_frame, send_frame
+from tmuxgate.protocol import ProtocolError, receive_frame, receive_single_request, send_frame
 from tmuxgate.result import ExecutionResult, receive_result
 from tmuxgate.runtime import default_socket_path, require_same_uid
 
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
 DEFAULT_REQUEST_SEND_TIMEOUT_SECONDS = 5.0
+DEFAULT_CONTROL_RESPONSE_TIMEOUT_SECONDS = 10.0
+DEFAULT_VERIFIED_RESULT_RESPONSE_TIMEOUT_SECONDS = 5 * 60.0
 
 
 class BrokerConnectionError(ConnectionError):
@@ -132,3 +150,164 @@ def submit_request(
             raise BrokerConnectionError(f"broker connection failed: {exc}") from exc
     finally:
         client.close()
+
+
+def exchange_control_request(
+    sock: socket.socket,
+    request: ControlRequest,
+    *,
+    send_timeout_seconds: float = DEFAULT_REQUEST_SEND_TIMEOUT_SECONDS,
+    response_timeout_seconds: float = DEFAULT_CONTROL_RESPONSE_TIMEOUT_SECONDS,
+) -> ControlResponse:
+    """Send one typed control request and require one EOF-terminated response."""
+
+    if not isinstance(
+        request,
+        (ListMachinesRequest, ListJobsRequest, ReadVerifiedResultRequest),
+    ):
+        raise TypeError("request must be a broker control request")
+    send_timeout = _positive_finite_timeout(
+        send_timeout_seconds,
+        label="request send timeout",
+    )
+    response_timeout = _positive_finite_timeout(
+        response_timeout_seconds,
+        label="control response timeout",
+    )
+    sock.settimeout(send_timeout)
+    try:
+        send_frame(sock, request.to_wire_header())
+        sock.shutdown(socket.SHUT_WR)
+    finally:
+        sock.settimeout(None)
+    response = receive_single_request(sock, timeout_seconds=response_timeout)
+    return decode_control_response(request, response)
+
+
+def _submit_control_request(
+    request: ControlRequest,
+    *,
+    socket_path: os.PathLike[str] | str | None,
+    connect_timeout_seconds: float,
+    request_send_timeout_seconds: float,
+    response_timeout_seconds: float,
+    broker_peer_validator,
+) -> ControlResponse:
+    if not callable(broker_peer_validator):
+        raise TypeError("broker peer validator must be callable")
+    connect_timeout = _positive_finite_timeout(
+        connect_timeout_seconds,
+        label="connect timeout",
+    )
+    request_send_timeout = _positive_finite_timeout(
+        request_send_timeout_seconds,
+        label="request send timeout",
+    )
+    response_timeout = _positive_finite_timeout(
+        response_timeout_seconds,
+        label="control response timeout",
+    )
+    path = default_socket_path() if socket_path is None else Path(socket_path)
+    if not path.is_absolute():
+        raise ValueError("broker socket path must be absolute")
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(connect_timeout)
+        try:
+            client.connect(os.fspath(path))
+        except OSError as exc:
+            raise BrokerConnectionError(f"cannot connect to broker socket {path}: {exc}") from exc
+        try:
+            broker_peer_validator(client)
+        except Exception as exc:
+            raise BrokerConnectionError("broker socket peer UID validation failed") from exc
+        try:
+            return exchange_control_request(
+                client,
+                request,
+                send_timeout_seconds=request_send_timeout,
+                response_timeout_seconds=response_timeout,
+            )
+        except OSError as exc:
+            raise BrokerConnectionError(f"broker connection failed: {exc}") from exc
+    finally:
+        client.close()
+
+
+def list_machines(
+    socket_path: os.PathLike[str] | str | None = None,
+    *,
+    connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    request_send_timeout_seconds: float = DEFAULT_REQUEST_SEND_TIMEOUT_SECONDS,
+    response_timeout_seconds: float = DEFAULT_CONTROL_RESPONSE_TIMEOUT_SECONDS,
+    broker_peer_validator=require_same_uid,
+) -> tuple[MachineSummary, ...]:
+    """Return sanitized logical machine metadata from the broker snapshot."""
+
+    response = _submit_control_request(
+        ListMachinesRequest(),
+        socket_path=socket_path,
+        connect_timeout_seconds=connect_timeout_seconds,
+        request_send_timeout_seconds=request_send_timeout_seconds,
+        response_timeout_seconds=response_timeout_seconds,
+        broker_peer_validator=broker_peer_validator,
+    )
+    if not isinstance(response, MachineList):
+        raise ProtocolError("broker returned the wrong control response type")
+    return response.machines
+
+
+def list_jobs(
+    socket_path: os.PathLike[str] | str | None = None,
+    *,
+    states: Sequence[str] = (),
+    limit: int = DEFAULT_JOB_PAGE_SIZE,
+    cursor: str | None = None,
+    connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    request_send_timeout_seconds: float = DEFAULT_REQUEST_SEND_TIMEOUT_SECONDS,
+    response_timeout_seconds: float = DEFAULT_CONTROL_RESPONSE_TIMEOUT_SECONDS,
+    broker_peer_validator=require_same_uid,
+) -> JobPage:
+    """Return one sanitized, durable job page without contacting a remote host."""
+
+    request = ListJobsRequest(tuple(states), limit, cursor)
+    response = _submit_control_request(
+        request,
+        socket_path=socket_path,
+        connect_timeout_seconds=connect_timeout_seconds,
+        request_send_timeout_seconds=request_send_timeout_seconds,
+        response_timeout_seconds=response_timeout_seconds,
+        broker_peer_validator=broker_peer_validator,
+    )
+    if not isinstance(response, JobPage):
+        raise ProtocolError("broker returned the wrong control response type")
+    return response
+
+
+def read_verified_result(
+    socket_path: os.PathLike[str] | str | None = None,
+    *,
+    request_id: str,
+    stream: ResultStream | str,
+    offset: int = 0,
+    limit: int = DEFAULT_RESULT_CHUNK_BYTES,
+    connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    request_send_timeout_seconds: float = DEFAULT_REQUEST_SEND_TIMEOUT_SECONDS,
+    response_timeout_seconds: float = DEFAULT_VERIFIED_RESULT_RESPONSE_TIMEOUT_SECONDS,
+    broker_peer_validator=require_same_uid,
+) -> VerifiedResultChunk:
+    """Read a bounded chunk only after durable state and spool verification."""
+
+    request = ReadVerifiedResultRequest(request_id, stream, offset, limit)
+    response = _submit_control_request(
+        request,
+        socket_path=socket_path,
+        connect_timeout_seconds=connect_timeout_seconds,
+        request_send_timeout_seconds=request_send_timeout_seconds,
+        response_timeout_seconds=response_timeout_seconds,
+        broker_peer_validator=broker_peer_validator,
+    )
+    if not isinstance(response, VerifiedResultChunk):
+        raise ProtocolError("broker returned the wrong control response type")
+    return response

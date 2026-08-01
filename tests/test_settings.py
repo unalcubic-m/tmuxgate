@@ -6,7 +6,7 @@ import unittest
 from unittest import mock
 
 from tmuxgate import cli
-from tmuxgate.config import load_config, parse_config
+from tmuxgate.config import default_config_path, load_config, parse_config
 from tmuxgate.network import NetworkSnapshot
 from tmuxgate.settings import serialize_config
 from test_config import valid_config
@@ -27,6 +27,9 @@ class SettingsCommandTests(unittest.TestCase):
 
     def test_serializer_round_trips_all_machine_and_context_settings(self):
         config = load_config(self.path)
+        self.assertEqual(config.version, 2)
+        self.assertEqual(config.mcp.host, "127.0.0.1")
+        self.assertEqual(config.mcp.port, 8765)
         self.assertEqual(config.broker.approval_mode, "disabled")
         self.assertEqual(tuple(config.machines), ("app-server",))
         self.assertEqual(config.home.gateway.exploded, "192.0.2.1")
@@ -37,6 +40,14 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertEqual(
             [item.id for item in config.machines["app-server"].endpoints],
             ["home-lan", "wireguard"],
+        )
+
+    def test_serializer_upgrades_v1_input_to_explicit_v2_mcp_schema(self):
+        content = serialize_config(parse_config(valid_config()))
+        self.assertIn(b"version = 2\n", content)
+        self.assertIn(
+            b'[mcp]\nhost = "127.0.0.1"\nport = 8765\n',
+            content,
         )
 
     def test_list_and_structured_add_remove_are_atomic_and_need_no_remote(self):
@@ -165,12 +176,18 @@ class SettingsCommandTests(unittest.TestCase):
         refresh.assert_not_called()
         self.assertEqual(self.path.read_bytes(), before)
 
-    def test_no_argument_cli_opens_dashboard_and_can_quit(self):
-        output = io.StringIO()
-        with mock.patch("builtins.input", return_value="q"), redirect_stdout(output):
+    def test_no_argument_cli_starts_the_unified_application(self):
+        with mock.patch("tmuxgate.cli.UnifiedApplication") as application:
+            application.return_value.run.return_value = 0
             self.assertEqual(cli.main([]), 0)
-        self.assertIn("Start execution broker", output.getvalue())
-        self.assertIn("Add remote machine", output.getvalue())
+        application.assert_called_once()
+        arguments = application.call_args.kwargs
+        self.assertEqual(arguments["config_path"], str(default_config_path()))
+        self.assertIsNone(arguments["socket_path"])
+        self.assertIsNone(arguments["state_dir"])
+        self.assertFalse(arguments["fake"])
+        self.assertTrue(callable(arguments["dashboard"]))
+        application.return_value.run.assert_called_once_with()
 
 
 if __name__ == "__main__":

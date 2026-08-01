@@ -8,6 +8,8 @@ import errno
 import fcntl
 import os
 from pathlib import Path
+import re
+import secrets
 import socket
 import stat
 import struct
@@ -20,8 +22,11 @@ SPOOL_DIRECTORY_NAME = "spool"
 CONTROL_DIRECTORY_NAME = "control"
 VIEWER_DIRECTORY_NAME = "viewers"
 BROKER_LOCK_FILE_NAME = "broker.lock"
+STATE_LOCK_FILE_NAME = "state.lock"
+MCP_TOKEN_FILE_NAME = "mcp-token"
 SOCKET_MODE = 0o600
 LOCK_MODE = 0o600
+TOKEN_MODE = 0o600
 PRIVATE_DIRECTORY_MODE = 0o700
 DEFAULT_LISTEN_BACKLOG = 16
 
@@ -50,6 +55,7 @@ class RuntimePaths:
     viewer_dir: Path
     spool_dir: Path
     lock_path: Path
+    mcp_token_path: Path
 
 
 _UCRED = struct.Struct("=iII")
@@ -65,6 +71,7 @@ _LOCK_OPEN_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
     | getattr(os, "O_NOFOLLOW", 0)
 )
+_MCP_TOKEN_PATTERN = re.compile(rb"[0-9a-f]{64}\n\Z", re.ASCII)
 
 
 def _expected_uid(value: int | None) -> int:
@@ -429,6 +436,228 @@ def ensure_state_directory(
     return ensure_private_directory(selected, expected_uid=uid)
 
 
+def _validate_mcp_token_stat(
+    path: Path,
+    metadata: os.stat_result,
+    *,
+    expected_uid: int,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeSecurityError(f"MCP token is not a regular file: {path}")
+    if metadata.st_uid != expected_uid:
+        raise RuntimeSecurityError(
+            f"MCP token is not owned by UID {expected_uid}: {path}"
+        )
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode != TOKEN_MODE:
+        raise RuntimeSecurityError(
+            f"MCP token must have mode 0600, found {mode:04o}: {path}"
+        )
+
+
+def _read_mcp_token(
+    directory_descriptor: int,
+    token_path: Path,
+    *,
+    expected_uid: int,
+) -> str | None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(
+            MCP_TOKEN_FILE_NAME,
+            flags,
+            dir_fd=directory_descriptor,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeSecurityError(
+            f"cannot securely open MCP token {token_path}: {exc}"
+        ) from exc
+
+    try:
+        opened = os.fstat(descriptor)
+        _validate_mcp_token_stat(token_path, opened, expected_uid=expected_uid)
+        chunks: list[bytes] = []
+        total = 0
+        # Read at most one byte beyond the canonical representation so an
+        # oversized or newline-appended secret is rejected without allocation.
+        while total < 66:
+            chunk = os.read(descriptor, 66 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        payload = b"".join(chunks)
+        if _MCP_TOKEN_PATTERN.fullmatch(payload) is None:
+            raise RuntimeSecurityError(
+                f"MCP token must contain one canonical 64-character lowercase "
+                f"hex token: {token_path}"
+            )
+        try:
+            named = os.stat(
+                MCP_TOKEN_FILE_NAME,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise RuntimeSecurityError(
+                f"cannot revalidate MCP token {token_path}: {exc}"
+            ) from exc
+        if not _same_object(opened, named):
+            raise RuntimeSecurityError(
+                f"MCP token changed while opening: {token_path}"
+            )
+        return payload[:-1].decode("ascii")
+    finally:
+        os.close(descriptor)
+
+
+def load_or_create_mcp_token(
+    state_dir: os.PathLike[str] | str,
+    *,
+    expected_uid: int | None = None,
+) -> str:
+    """Load or atomically create the owner-only MCP bearer token.
+
+    A complete token is fsynced under a private temporary name before an
+    atomic, no-overwrite hard link publishes ``mcp-token``.  Concurrent
+    starters therefore either publish the token or load the fully-written
+    winner; no caller can observe a partially-written credential.
+    """
+
+    uid = _expected_uid(expected_uid)
+    directory = _absolute_path(state_dir, label="state directory")
+    directory_descriptor = _open_private_directory(directory, expected_uid=uid)
+    token_path = directory / MCP_TOKEN_FILE_NAME
+    try:
+        existing = _read_mcp_token(
+            directory_descriptor,
+            token_path,
+            expected_uid=uid,
+        )
+        if existing is not None:
+            return existing
+
+        token = secrets.token_hex(32)
+        payload = token.encode("ascii") + b"\n"
+        temporary_name = f".{MCP_TOKEN_FILE_NAME}.{secrets.token_hex(16)}.tmp"
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        temporary_metadata: os.stat_result | None = None
+        temporary_removed = False
+        try:
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                TOKEN_MODE,
+                dir_fd=directory_descriptor,
+            )
+            os.fchmod(descriptor, TOKEN_MODE)
+            temporary_metadata = os.fstat(descriptor)
+            _validate_mcp_token_stat(
+                directory / temporary_name,
+                temporary_metadata,
+                expected_uid=uid,
+            )
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise RuntimeSecurityError("MCP token write made no progress")
+                offset += written
+            os.fsync(descriptor)
+
+            named_temporary = os.stat(
+                temporary_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if not _same_object(temporary_metadata, named_temporary):
+                raise RuntimeSecurityError(
+                    f"temporary MCP token changed while writing: "
+                    f"{directory / temporary_name}"
+                )
+            try:
+                os.link(
+                    temporary_name,
+                    MCP_TOKEN_FILE_NAME,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                published = True
+            except FileExistsError:
+                published = False
+            except OSError as exc:
+                raise RuntimeSecurityError(
+                    f"cannot atomically publish MCP token {token_path}: {exc}"
+                ) from exc
+
+            named_token = os.stat(
+                MCP_TOKEN_FILE_NAME,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if published and not _same_object(temporary_metadata, named_token):
+                raise RuntimeSecurityError(
+                    f"MCP token changed while publishing: {token_path}"
+                )
+
+            os.unlink(temporary_name, dir_fd=directory_descriptor)
+            temporary_removed = True
+            os.fsync(directory_descriptor)
+            if published:
+                loaded = _read_mcp_token(
+                    directory_descriptor,
+                    token_path,
+                    expected_uid=uid,
+                )
+                if loaded != token:
+                    raise RuntimeSecurityError(
+                        f"MCP token changed after publishing: {token_path}"
+                    )
+                return token
+
+            winner = _read_mcp_token(
+                directory_descriptor,
+                token_path,
+                expected_uid=uid,
+            )
+            if winner is None:  # pragma: no cover - requires a hostile same-UID race
+                raise RuntimeSecurityError(
+                    f"MCP token disappeared during concurrent creation: {token_path}"
+                )
+            return winner
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if not temporary_removed and temporary_metadata is not None:
+                try:
+                    named = os.stat(
+                        temporary_name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if _same_object(temporary_metadata, named):
+                        os.unlink(temporary_name, dir_fd=directory_descriptor)
+                except FileNotFoundError:
+                    pass
+    finally:
+        os.close(directory_descriptor)
+
+
 def ensure_spool_directory(
     state_dir: os.PathLike[str] | str,
     *,
@@ -501,6 +730,7 @@ def prepare_runtime_layout(
         viewer_dir=viewer_dir,
         spool_dir=spool_dir,
         lock_path=runtime_dir / BROKER_LOCK_FILE_NAME,
+        mcp_token_path=durable_state_dir / MCP_TOKEN_FILE_NAME,
     )
 
 
@@ -555,47 +785,57 @@ class BrokerSingletonLock:
     @classmethod
     def acquire(
         cls,
-        runtime_dir: os.PathLike[str] | str,
+        directory: os.PathLike[str] | str,
         *,
         expected_uid: int | None = None,
+        lock_file_name: str = BROKER_LOCK_FILE_NAME,
     ) -> BrokerSingletonLock:
+        if lock_file_name == BROKER_LOCK_FILE_NAME:
+            lifecycle_name = "broker"
+        elif lock_file_name == STATE_LOCK_FILE_NAME:
+            lifecycle_name = "state"
+        else:
+            raise ValueError("unsupported tmuxgate lifecycle lock name")
         uid = _expected_uid(expected_uid)
-        parent = _absolute_path(runtime_dir, label="broker runtime directory")
+        parent = _absolute_path(
+            directory,
+            label=f"{lifecycle_name} lifecycle directory",
+        )
         parent_descriptor = _open_private_directory(parent, expected_uid=uid)
-        lock_path = parent / BROKER_LOCK_FILE_NAME
+        lock_path = parent / lock_file_name
         descriptor: int | None = None
         try:
             try:
                 descriptor = os.open(
-                    BROKER_LOCK_FILE_NAME,
+                    lock_file_name,
                     _LOCK_OPEN_FLAGS,
                     LOCK_MODE,
                     dir_fd=parent_descriptor,
                 )
             except OSError as exc:
                 raise RuntimeSecurityError(
-                    f"cannot securely open broker lock {lock_path}: {exc}"
+                    f"cannot securely open {lifecycle_name} lock {lock_path}: {exc}"
                 ) from exc
             opened = os.fstat(descriptor)
             named = os.stat(
-                BROKER_LOCK_FILE_NAME,
+                lock_file_name,
                 dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
             _validate_lock_stat(lock_path, opened, expected_uid=uid)
             if not _same_object(opened, named):
                 raise RuntimeSecurityError(
-                    f"broker lock changed while opening: {lock_path}"
+                    f"{lifecycle_name} lock changed while opening: {lock_path}"
                 )
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise RuntimeSecurityError(
-                    f"another broker lifecycle already holds {lock_path}"
+                    f"another {lifecycle_name} lifecycle already holds {lock_path}"
                 ) from exc
             except OSError as exc:
                 raise RuntimeSecurityError(
-                    f"cannot acquire broker singleton lock {lock_path}: {exc}"
+                    f"cannot acquire {lifecycle_name} singleton lock {lock_path}: {exc}"
                 ) from exc
             return cls(lock_path, descriptor)
         except BaseException:
@@ -635,6 +875,20 @@ def acquire_broker_lock(
     """Acquire the explicit broker singleton lifecycle lock."""
 
     return BrokerSingletonLock.acquire(runtime_dir, expected_uid=expected_uid)
+
+
+def acquire_state_lock(
+    state_dir: os.PathLike[str] | str,
+    *,
+    expected_uid: int | None = None,
+) -> BrokerSingletonLock:
+    """Acquire the durable-state lifecycle lock independently of the listener."""
+
+    return BrokerSingletonLock.acquire(
+        state_dir,
+        expected_uid=expected_uid,
+        lock_file_name=STATE_LOCK_FILE_NAME,
+    )
 
 
 def _nonblocking_listener_probe(path: Path) -> int:
@@ -899,7 +1153,7 @@ def open_broker_listener(
     environ: Mapping[str, str] | None = None,
     backlog: int = DEFAULT_LISTEN_BACKLOG,
 ) -> BrokerListenerLifecycle:
-    """Open a broker listener with a singleton lock held for its lifetime."""
+    """Open a broker listener with a runtime-path lock held for its lifetime."""
 
     if isinstance(backlog, bool) or not isinstance(backlog, int) or backlog < 1:
         raise RuntimeSecurityError("socket listen backlog must be a positive integer")

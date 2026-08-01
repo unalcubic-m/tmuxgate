@@ -13,7 +13,7 @@ from tmuxgate.approval import (
     ApprovalTerminal,
     request_approval,
 )
-from tmuxgate.broker import BrokerServer, _ClientSession
+from tmuxgate.broker import BrokerError, BrokerServer, _ClientSession
 from tmuxgate.client import BrokerConnectionError, submit_request
 from tmuxgate.fake import FakeExecution, ScriptedApprover, ScriptedFakeExecutor
 from tmuxgate.models import ExecutionMode, RequestSpec
@@ -310,7 +310,38 @@ class BrokerIntegrationTests(unittest.TestCase):
         self.assertFalse(server.stop())
         self.assertTrue(server.wait_for_audit("stop-incomplete"))
         executor.release.set()
-        self.assertTrue(self.wait_until(lambda: not server._terminal_thread.is_alive()))
+
+        def workers_stopped():
+            with server._execution_threads_lock:
+                executions_done = not any(
+                    thread.is_alive() for thread in server._execution_threads
+                )
+            with server._sessions_lock:
+                sessions_done = not server._sessions
+            return executions_done and sessions_done
+
+        self.assertTrue(self.wait_until(workers_stopped))
+        self.assertTrue(server.stop())
+
+    def test_partial_thread_start_failure_can_be_rolled_back(self):
+        listener = create_broker_socket(self.socket_path)
+        server = BrokerServer(
+            listener,
+            allowed_machines=("machine-a",),
+            approver=ScriptedApprover([]),
+            executor=ScriptedFakeExecutor([]),
+            shutdown_timeout_seconds=0.5,
+        )
+        self.servers.append(server)
+
+        with mock.patch.object(
+            server._terminal_thread,
+            "start",
+            side_effect=RuntimeError("injected terminal thread start failure"),
+        ):
+            with self.assertRaisesRegex(BrokerError, "start all broker workers"):
+                server.start()
+
         self.assertTrue(server.stop())
 
     def test_executor_failure_is_incomplete_and_retains_the_command_lease(self):
