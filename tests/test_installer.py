@@ -23,6 +23,69 @@ SPEC.loader.exec_module(installer)
 
 
 class InstallerTransformTests(unittest.TestCase):
+    def test_codex_registration_append_preserves_every_existing_byte(self):
+        original = (
+            b'# formatting and comments are user-owned\r\n'
+            b'[model]\r\nname = "example" # keep this spacing\r\n'
+            b'details = { modes = ["one", "two"], enabled = true }\r\n'
+            b'description = """multiline\r\nconfiguration [is preserved]\r\n"""\r\n'
+            b'\r\n[mcp_servers.other]\r\n'
+            b'args = [\r\n    "one",\r\n    "two",\r\n]\r\n'
+            b'command="other"'
+        )
+        updated = installer.update_codex_registration(
+            original,
+            url="http://127.0.0.1:8765/mcp",
+            replace_conflict=False,
+        )
+
+        self.assertTrue(updated.startswith(original))
+        self.assertEqual(updated[: len(original)], original)
+        self.assertEqual(
+            tomllib.loads(updated.decode("utf-8"))["mcp_servers"]["other"]["command"],
+            "other",
+        )
+
+    def test_codex_registration_replaces_only_a_simple_target_table(self):
+        prefix = b'# byte-for-byte prefix\n[model]\nname = "kept"\n\n'
+        target = b'[mcp_servers.tmuxgate] # old\ncommand = "tmuxgate-mcp"\n\n'
+        suffix = b'[mcp_servers.other]\ncommand = "other" # byte-for-byte suffix\n'
+        updated = installer.update_codex_registration(
+            prefix + target + suffix,
+            url="http://127.0.0.1:8765/mcp",
+            replace_conflict=True,
+        )
+
+        self.assertTrue(updated.startswith(prefix))
+        self.assertTrue(updated.endswith(suffix))
+        parsed = tomllib.loads(updated.decode("utf-8"))
+        self.assertEqual(
+            parsed["mcp_servers"]["tmuxgate"],
+            {
+                "url": "http://127.0.0.1:8765/mcp",
+                "bearer_token_env_var": installer.MCP_TOKEN_ENV,
+                "tool_timeout_sec": installer.MCP_TOOL_TIMEOUT_SECONDS,
+            },
+        )
+
+    def test_codex_registration_rejects_ambiguous_layout_even_with_replace(self):
+        layouts = (
+            b'[mcp_servers."tmuxgate"]\ncommand = "old"\n',
+            (
+                b'[mcp_servers.tmuxgate]\ncommand = "old"\n'
+                b'[mcp_servers.tmuxgate.env]\nSECRET = "not-owned"\n'
+            ),
+            b'mcp_servers.tmuxgate = { command = "old" }\n',
+        )
+        for original in layouts:
+            with self.subTest(original=original):
+                with self.assertRaisesRegex(installer.InstallError, "simple|ambiguous"):
+                    installer.update_codex_registration(
+                        original,
+                        url="http://127.0.0.1:8765/mcp",
+                        replace_conflict=True,
+                    )
+
     def test_codex_timeout_patch_preserves_other_tables_and_is_idempotent(self):
         original = (
             b'[model]\nname = "example"\n\n'
@@ -189,6 +252,41 @@ class InstallerTransformTests(unittest.TestCase):
             absent_snapshot.restore(absent)
             self.assertFalse(absent.exists())
 
+    def test_owned_write_refuses_a_changed_supplied_preimage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_bytes(b"before")
+            path.chmod(0o600)
+            snapshot = installer.FileSnapshot.capture(path)
+            path.write_bytes(b"concurrent edit")
+
+            with self.assertRaisesRegex(installer.InstallError, "concurrent change"):
+                installer._write_owned(
+                    path,
+                    b"installer edit",
+                    0o600,
+                    before=snapshot,
+                )
+
+            self.assertEqual(path.read_bytes(), b"concurrent edit")
+
+    def test_owned_symlink_refuses_a_changed_supplied_preimage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "current"
+            path.symlink_to("first")
+            snapshot = installer.FileSnapshot.capture(path)
+            path.unlink()
+            path.symlink_to("concurrent")
+
+            with self.assertRaisesRegex(installer.InstallError, "concurrent change"):
+                installer._symlink_owned(
+                    path,
+                    "installer",
+                    before=snapshot,
+                )
+
+            self.assertEqual(os.readlink(path), "concurrent")
+
     def test_codex_entry_match_requires_http_url_and_token_variable(self):
         url = "http://127.0.0.1:8765/mcp"
         entry = {
@@ -281,52 +379,86 @@ from pathlib import Path
 import sys
 import tomllib
 
-config = Path(os.environ["FAKE_CODEX_CONFIG"])
-state = Path(os.environ["FAKE_CODEX_STATE"])
+config = Path(os.environ["CODEX_HOME"]) / "config.toml"
 args = sys.argv[1:]
-entry = json.loads(state.read_text()) if state.exists() else None
 if args == ["mcp", "list", "--json"]:
-    if entry is not None and config.exists():
+    entry = None
+    if config.exists():
         parsed = tomllib.loads(config.read_text())
-        timeout = parsed.get("mcp_servers", {}).get("tmuxgate", {}).get("tool_timeout_sec")
-        entry = {**entry, "tool_timeout_sec": timeout}
+        if set(parsed) != {"mcp_servers"} or set(parsed["mcp_servers"]) != {"tmuxgate"}:
+            print("Codex verifier received unrelated live configuration", file=sys.stderr)
+            raise SystemExit(92)
+        if Path.cwd() != Path(os.environ["CODEX_HOME"]):
+            print("Codex verifier cwd was not isolated", file=sys.stderr)
+            raise SystemExit(93)
+        isolated_home = Path(os.environ["CODEX_HOME"])
+        if Path(os.environ["HOME"]) != isolated_home or Path(os.environ["PWD"]) != isolated_home:
+            print("Codex verifier HOME/PWD was not isolated", file=sys.stderr)
+            raise SystemExit(95)
+        isolated_variables = (
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        )
+        if any(Path(os.environ[name]).parent != isolated_home for name in isolated_variables):
+            print("Codex verifier XDG/temp environment was not isolated", file=sys.stderr)
+            raise SystemExit(96)
+        forbidden = ("TMUXGATE_MCP_TOKEN", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
+        if any(name in os.environ for name in forbidden):
+            print("Codex verifier inherited a forbidden variable", file=sys.stderr)
+            raise SystemExit(94)
+        target = parsed.get("mcp_servers", {}).get("tmuxgate")
+        if isinstance(target, dict) and "url" in target:
+            entry = {
+                "name": "tmuxgate",
+                "enabled": target.get("enabled", True),
+                "disabled_reason": None,
+                "transport": {
+                    "type": "streamable_http",
+                    "url": target["url"],
+                    "bearer_token_env_var": target.get("bearer_token_env_var"),
+                    "http_headers": target.get("http_headers"),
+                    "env_http_headers": target.get("env_http_headers"),
+                },
+                "startup_timeout_sec": target.get("startup_timeout_sec"),
+                "tool_timeout_sec": target.get("tool_timeout_sec"),
+            }
+        elif isinstance(target, dict) and "command" in target:
+            entry = {
+                "name": "tmuxgate",
+                "enabled": True,
+                "disabled_reason": None,
+                "transport": {
+                    "type": "stdio",
+                    "command": target["command"],
+                    "args": target.get("args", []),
+                    "env": None,
+                    "env_vars": [],
+                    "cwd": None,
+                },
+                "startup_timeout_sec": None,
+                "tool_timeout_sec": target.get("tool_timeout_sec"),
+            }
+    # Deliberately emulate a Codex build that serializes even for a nominally
+    # read-only listing. The installer must expose only its disposable clone.
+    config.write_text('[clobbered-by-fake-codex]\nvalue = true\n')
+    fallback = Path(os.environ["HOME"]) / ".codex" / "config.toml"
+    fallback.parent.mkdir(mode=0o700)
+    fallback.write_text('[clobbered-home-fallback]\nvalue = true\n')
     print(json.dumps([] if entry is None else [entry]))
-elif len(args) >= 3 and args[:3] == ["mcp", "add", "tmuxgate"]:
-    url = args[args.index("--url") + 1]
-    token_env = args[args.index("--bearer-token-env-var") + 1]
-    entry = {
-        "name": "tmuxgate",
-        "enabled": True,
-        "disabled_reason": None,
-        "transport": {
-            "type": "streamable_http",
-            "url": url,
-            "bearer_token_env_var": token_env,
-            "http_headers": None,
-            "env_http_headers": None,
-        },
-        "startup_timeout_sec": None,
-        "tool_timeout_sec": None,
-    }
-    state.write_text(json.dumps(entry))
-    with config.open("a", encoding="utf-8") as stream:
-        stream.write("\n[mcp_servers.tmuxgate]\n")
-        stream.write(f'url = "{url}"\n')
-        stream.write(f'bearer_token_env_var = "{token_env}"\n')
-elif args == ["mcp", "get", "tmuxgate", "--json"]:
-    parsed = tomllib.loads(config.read_text())
-    current = dict(entry)
-    current.pop("name", None)
-    current["tool_timeout_sec"] = parsed["mcp_servers"]["tmuxgate"].get("tool_timeout_sec")
-    print(json.dumps(current))
-elif args == ["mcp", "remove", "tmuxgate"]:
-    state.unlink(missing_ok=True)
+elif len(args) >= 2 and args[:2] in (["mcp", "add"], ["mcp", "remove"]):
+    config.write_text('[clobbered]\nvalue = true\n')
+    print("mutating Codex MCP command must not be called", file=sys.stderr)
+    raise SystemExit(91)
 else:
     print(f"unexpected fake Codex arguments: {args!r}", file=sys.stderr)
     raise SystemExit(2)
 '''
 
-    def test_registration_uses_cli_preserves_other_config_and_is_idempotent(self):
+    def test_registration_uses_only_cli_list_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             codex = base / "codex"
@@ -336,14 +468,10 @@ else:
             original = b'[unrelated]\nvalue = "kept"\n'
             config.write_bytes(original)
             config.chmod(0o600)
-            state = base / "state.json"
             backups = base / "backups"
             backups.mkdir(mode=0o700)
             url = "http://127.0.0.1:8765/mcp"
-            environment = {
-                "FAKE_CODEX_CONFIG": str(config),
-                "FAKE_CODEX_STATE": str(state),
-            }
+            environment = {"CODEX_HOME": str(base)}
 
             with mock.patch.dict(os.environ, environment, clear=False):
                 mutation = installer._register_codex(
@@ -353,6 +481,7 @@ else:
                     replace_conflict=False,
                     backup_dir=backups,
                 )
+                first_install = config.read_bytes()
                 installer._register_codex(
                     codex,
                     config,
@@ -361,6 +490,7 @@ else:
                     backup_dir=backups,
                 )
 
+            self.assertEqual(config.read_bytes(), first_install)
             parsed = tomllib.loads(config.read_text(encoding="utf-8"))
             self.assertIsNotNone(mutation)
             self.assertEqual(mutation.before.data, original)
@@ -370,6 +500,38 @@ else:
                 installer.MCP_TOOL_TIMEOUT_SECONDS,
             )
             self.assertNotIn("b" * 64, config.read_text(encoding="utf-8"))
+
+    def test_registration_creates_absent_codex_config_without_mutating_cli(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            codex = base / "codex"
+            codex.write_text(self.FAKE_CODEX, encoding="utf-8")
+            codex.chmod(0o700)
+            config = base / "config.toml"
+            backups = base / "backups"
+            backups.mkdir(mode=0o700)
+
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(base)},
+                clear=False,
+            ):
+                mutation = installer._register_codex(
+                    codex,
+                    config,
+                    url="http://127.0.0.1:8765/mcp",
+                    replace_conflict=False,
+                    backup_dir=backups,
+                )
+
+            self.assertIsNotNone(mutation)
+            self.assertFalse(mutation.before.exists)
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+            self.assertEqual(list(backups.iterdir()), [])
+            self.assertEqual(
+                tomllib.loads(config.read_text())["mcp_servers"]["tmuxgate"]["url"],
+                "http://127.0.0.1:8765/mcp",
+            )
 
     def test_conflicting_registration_is_refused_without_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -381,24 +543,11 @@ else:
             original = b'[mcp_servers.tmuxgate]\ncommand = "old"\n'
             config.write_bytes(original)
             config.chmod(0o600)
-            state = base / "state.json"
-            state.write_text(
-                json.dumps(
-                    {
-                        "name": "tmuxgate",
-                        "transport": {
-                            "type": "stdio",
-                            "command": "tmuxgate-mcp",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
             backups = base / "backups"
             backups.mkdir(mode=0o700)
             with mock.patch.dict(
                 os.environ,
-                {"FAKE_CODEX_CONFIG": str(config), "FAKE_CODEX_STATE": str(state)},
+                {"CODEX_HOME": str(base)},
                 clear=False,
             ):
                 with self.assertRaisesRegex(installer.InstallError, "--replace-codex"):
@@ -410,6 +559,40 @@ else:
                         backup_dir=backups,
                     )
             self.assertEqual(config.read_bytes(), original)
+
+    def test_replace_codex_rewrites_only_the_simple_conflicting_table(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            codex = base / "codex"
+            codex.write_text(self.FAKE_CODEX, encoding="utf-8")
+            codex.chmod(0o700)
+            config = base / "config.toml"
+            prefix = b'[unrelated]\nvalue = "kept"\n\n'
+            old = b'[mcp_servers.tmuxgate]\ncommand = "tmuxgate-mcp"\n\n'
+            suffix = b'[mcp_servers.other]\ncommand = "other" # exact suffix\n'
+            config.write_bytes(prefix + old + suffix)
+            config.chmod(0o640)
+            backups = base / "backups"
+            backups.mkdir(mode=0o700)
+
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(base)},
+                clear=False,
+            ):
+                installer._register_codex(
+                    codex,
+                    config,
+                    url="http://127.0.0.1:8765/mcp",
+                    replace_conflict=True,
+                    backup_dir=backups,
+                )
+
+            updated = config.read_bytes()
+            self.assertTrue(updated.startswith(prefix))
+            self.assertTrue(updated.endswith(suffix))
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o640)
+            self.assertEqual(len(list(backups.iterdir())), 1)
 
 
 class InstallerFlowTests(unittest.TestCase):
@@ -449,7 +632,6 @@ class InstallerFlowTests(unittest.TestCase):
         codex = base / "fake-codex"
         codex.write_text(FakeCodexRegistrationTests.FAKE_CODEX, encoding="utf-8")
         codex.chmod(0o700)
-        codex_state = base / "codex-state.json"
         environment = {
             "HOME": str(home),
             "XDG_DATA_HOME": str(data),
@@ -458,8 +640,6 @@ class InstallerFlowTests(unittest.TestCase):
             "CODEX_HOME": str(codex_home),
             "SHELL": "/bin/bash",
             "PATH": os.environ.get("PATH", ""),
-            "FAKE_CODEX_CONFIG": str(codex_config),
-            "FAKE_CODEX_STATE": str(codex_state),
             "TMUXGATE_MCP_TOKEN": "e" * 64,
             "PYTHONPATH": "/must/be/scrubbed",
             "PYTHONHOME": "/must/be/scrubbed",
@@ -480,7 +660,7 @@ class InstallerFlowTests(unittest.TestCase):
         }
 
     def _fake_installer_runner(self, real_run):
-        def run(command, *, env=None, capture=False, label):
+        def run(command, *, env=None, cwd=None, capture=False, label):
             selected = list(command)
             if len(selected) >= 4 and selected[1:3] == ["-m", "venv"]:
                 release = Path(selected[-1])
@@ -501,7 +681,7 @@ class InstallerFlowTests(unittest.TestCase):
                         installer._installed_probe(probe_args)
                     return subprocess.CompletedProcess(selected, 0, output.getvalue(), "")
                 return subprocess.CompletedProcess(selected, 0, "", "")
-            return real_run(command, env=env, capture=capture, label=label)
+            return real_run(command, env=env, cwd=cwd, capture=capture, label=label)
 
         return run
 
@@ -583,6 +763,40 @@ class InstallerFlowTests(unittest.TestCase):
             self.assertEqual((install_root / "install.json").read_bytes(), old_manifest)
             self.assertEqual(len(list((install_root / "releases").iterdir())), 2)
             self.assertTrue((fixture["bin_dir"] / "tmuxgate").resolve().is_file())
+
+    def test_launcher_created_during_build_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            launcher = fixture["bin_dir"] / "tmuxgate"
+            real_run = installer._run
+            fake_run = self._fake_installer_runner(real_run)
+            injected = False
+
+            def racing_run(command, *, env=None, cwd=None, capture=False, label):
+                nonlocal injected
+                result = fake_run(
+                    command,
+                    env=env,
+                    cwd=cwd,
+                    capture=capture,
+                    label=label,
+                )
+                if label == "preparing tmuxgate MCP credential" and not injected:
+                    launcher.write_bytes(b"user launcher created during build\n")
+                    launcher.chmod(0o700)
+                    injected = True
+                return result
+
+            with mock.patch.dict(os.environ, fixture["environment"], clear=True):
+                with mock.patch.object(installer, "_run", side_effect=racing_run):
+                    with self.assertRaisesRegex(
+                        installer.InstallError, "launcher changed during installation"
+                    ):
+                        installer.install(self._arguments(fixture))
+
+            self.assertTrue(injected)
+            self.assertFalse(launcher.is_symlink())
+            self.assertEqual(launcher.read_bytes(), b"user launcher created during build\n")
 
     def test_missing_config_fails_before_creating_a_release(self):
         with tempfile.TemporaryDirectory() as temporary:

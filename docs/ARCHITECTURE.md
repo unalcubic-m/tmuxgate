@@ -145,13 +145,19 @@ default protected configuration must exist before installation. A newly
 created token is durable application state and is intentionally retained if a
 later deployment step fails.
 
-Codex registration is performed through `codex mcp` using the configured
-`http://127.0.0.1:<port>/mcp` Streamable HTTP URL and
-`TMUXGATE_MCP_TOKEN` as `bearer_token_env_var`. The installer then applies and
-verifies `tool_timeout_sec = 604900` in the generated tmuxgate table. It leaves
-unrelated MCP registrations intact and refuses a different registration named
-`tmuxgate` unless `--replace-codex` is explicit. An owner-controlled Codex home
-is hardened to mode `0700` before its configuration is changed. Installer
+Codex registration is written directly to the single
+`[mcp_servers.tmuxgate]` table using the configured
+`http://127.0.0.1:<port>/mcp` Streamable HTTP URL,
+`TMUXGATE_MCP_TOKEN` as `bearer_token_env_var`, and
+`tool_timeout_sec = 604900`. The full candidate is validated with Python's TOML
+parser. For compatibility verification, `codex mcp list --json` receives only
+the canonical tmuxgate table in a private disposable `CODEX_HOME` and runs from
+that isolated directory; neither the live config nor unrelated hooks and
+settings are exposed to CLI serialization. The installer refuses a different
+registration named `tmuxgate` unless `--replace-codex` is explicit, and even
+then replaces only an unambiguous simple table; nested, quoted, or complex
+layouts fail closed for manual review. An owner-controlled Codex home is
+hardened to mode `0700` before its configuration is changed. Installer
 children receive neither the MCP bearer token nor `PYTHONPATH`, `PYTHONHOME`,
 or `VIRTUAL_ENV`, preventing credentials or checkout imports from leaking into
 pip build isolation, smoke tests, or Codex commands.
@@ -167,15 +173,20 @@ registry snapshot, so a new Bash shell and a Codex restart are required.
 Before changing a pre-existing Codex config or Bash profile, the installer
 writes an owner-only backup below `$XDG_DATA_HOME/tmuxgate/backups`. It retains
 snapshots of every managed mutation until the launcher switch and install
-manifest complete. Failure restores a file or link only while its exact
-installer-written post-image is still present, so a concurrent user or Codex
-edit is never overwritten. An unpublished incomplete release is removed; a
-release that may already have been observed through `current` is retained even
-after rollback so a running process cannot lose packaged assets. Successful
-installations retain older versioned releases and backups for operator
-recovery. The application itself is never started, stopped, or killed by the
-installer: `tmuxgate` must still run in the foreground in the terminal that
-owns approvals and authentication.
+manifest complete. Immediately before a managed replacement, the installer
+refuses to proceed if the captured preimage has changed. Failure restores a
+file or link only while its exact installer-written post-image is still
+present. The public launcher is also rechecked against replacement policy at
+publication time so a launcher introduced during the build is not claimed.
+These checks narrow but cannot eliminate the filesystem race between the last
+comparison and an atomic replacement; retained owner-only backups are the
+recovery path if another process writes in that interval. An unpublished
+incomplete release is removed; a release that may already have been observed
+through `current` is retained even after rollback so a running process cannot
+lose packaged assets. Successful installations retain older versioned
+releases and backups for operator recovery. The application itself is never
+started, stopped, or killed by the installer: `tmuxgate` must still run in the
+foreground in the terminal that owns approvals and authentication.
 
 If the preserved configuration has `approval_mode = "disabled"`, installation
 stops before Codex and launcher mutation unless the operator supplies
