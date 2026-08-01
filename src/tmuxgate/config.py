@@ -111,6 +111,11 @@ class Machine:
     host_key_alias: str
     connect_timeout_seconds: int
     endpoints: tuple[Endpoint, ...]
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ConfigError("machine enabled status must be boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +152,12 @@ def _integer(value: object, name: str, minimum: int, maximum: int) -> int:
         raise ConfigError(f"{name} must be an integer")
     if not minimum <= value <= maximum:
         raise ConfigError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _boolean(value: object, name: str) -> bool:
+    if type(value) is not bool:
+        raise ConfigError(f"{name} must be a boolean")
     return value
 
 
@@ -341,10 +352,19 @@ def _parse_machine(name: str, raw: object, home: HomeContext | None, wireguard: 
     table = _table(raw, f"machines.{name}")
     _only(
         table,
-        {"description", "ssh_profile", "user", "host_key_alias", "connect_timeout_seconds", "endpoints"},
+        {
+            "description",
+            "enabled",
+            "ssh_profile",
+            "user",
+            "host_key_alias",
+            "connect_timeout_seconds",
+            "endpoints",
+        },
         f"machines.{name}",
     )
     description = _string(table.get("description", name), f"machines.{name}.description", allow_empty=True)
+    enabled = _boolean(table.get("enabled", True), f"machines.{name}.enabled")
     try:
         ssh_profile = validate_alias(table.get("ssh_profile", name), field_name=f"machines.{name}.ssh_profile")
     except ValidationError as exc:
@@ -386,7 +406,16 @@ def _parse_machine(name: str, raw: object, home: HomeContext | None, wireguard: 
                 endpoint.address in network for network in wireguard.remote_cidrs
             ):
                 raise ConfigError(f"machines.{name} WireGuard endpoint is outside configured remote CIDRs")
-    return Machine(machine_name, description, ssh_profile, user, host_key_alias, timeout, endpoints)
+    return Machine(
+        machine_name,
+        description,
+        ssh_profile,
+        user,
+        host_key_alias,
+        timeout,
+        endpoints,
+        enabled,
+    )
 
 
 def parse_config(data: Mapping[str, Any]) -> AppConfig:
@@ -476,11 +505,30 @@ def _open_secure_config(path: Path):
     return os.fdopen(descriptor, "rb")
 
 
-def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
+def _parse_config_bytes(content: bytes) -> AppConfig:
+    if not isinstance(content, bytes):
+        raise TypeError("configuration content must be bytes")
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"invalid UTF-8 in configuration: {exc}") from exc
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"invalid TOML: {exc}") from exc
+    return parse_config(data)
+
+
+def load_config_snapshot(
+    path: str | os.PathLike[str] | None = None,
+) -> tuple[AppConfig, bytes]:
+    """Return parsed settings and their exact bytes from one secure open."""
+
     config_path = Path(path) if path is not None else default_config_path()
     with _open_secure_config(config_path) as config_file:
-        try:
-            data = tomllib.load(config_file)
-        except tomllib.TOMLDecodeError as exc:
-            raise ConfigError(f"invalid TOML: {exc}") from exc
-    return parse_config(data)
+        content = config_file.read()
+    return _parse_config_bytes(content), content
+
+
+def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
+    return load_config_snapshot(path)[0]

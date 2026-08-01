@@ -22,7 +22,7 @@ import subprocess
 from typing import TextIO
 
 from .connection_plan import ConnectionPlan, PlannedEndpoint
-from .models import RequestSpec, validate_request_id
+from .models import RequestSpec, validate_alias, validate_request_id
 
 
 CONTROLLING_TTY_PATH = "/dev/tty"
@@ -1046,13 +1046,12 @@ def _read_ssh_retry_decision(
     short_id: str,
     endpoint_id: str,
 ) -> ApprovalDecision:
-    retry_line = f"RETRY {short_id} {endpoint_id}"
-    instruction = (
-        f"Type exactly {retry_line} to try SSH setup once more, or CANCEL.\n"
+    prompt = (
+        "Retry SSH setup once for request "
+        f"{short_id} on endpoint {endpoint_id}? [Y/n] "
     )
-    _write_all(terminal.writer, instruction)
     while True:
-        _write_all(terminal.writer, "tmuxgate ssh> ")
+        _write_all(terminal.writer, prompt)
         try:
             raw_line = terminal.reader.readline()
         except Exception as exc:
@@ -1063,18 +1062,18 @@ def _read_ssh_retry_decision(
             )
         if not isinstance(raw_line, str):
             raise ApprovalInputError("broker terminal returned non-text retry input")
-        response = _line_without_terminal_ending(raw_line)
+        response = _line_without_terminal_ending(raw_line).casefold()
         raw_line = ""
-        if response == retry_line:
+        if response in {"", "y", "yes"}:
             response = ""
             return ApprovalDecision.APPROVED
-        if response == "CANCEL":
+        if response in {"n", "no"}:
             response = ""
             return ApprovalDecision.DENIED
         response = ""
         _write_all(
             terminal.writer,
-            "Invalid response; no retry decision was recorded.\n" + instruction,
+            "Please answer y or n.\n",
         )
 
 
@@ -1116,3 +1115,98 @@ def request_ssh_retry(
         pager_threshold_bytes=DEFAULT_PAGER_THRESHOLD_BYTES,
     )
     return _read_ssh_retry_decision(terminal, request_id[:8], endpoint_id)
+
+
+def render_machine_disable_document(
+    request_id: str,
+    machine_name: str,
+    *,
+    failure_detail: str,
+    remote_mutation_started: bool,
+) -> str:
+    """Render the local-only choice offered after SSH setup is exhausted."""
+
+    request_id = validate_request_id(request_id)
+    machine_name = validate_alias(machine_name)
+    if remote_mutation_started:
+        raise ApprovalError("machine disable prompt is forbidden after remote mutation")
+    if not isinstance(failure_detail, str) or "\x00" in failure_detail:
+        raise ApprovalError("SSH setup failure detail must be valid text")
+    return _terminal_safe_document(
+        [
+            "=== tmuxgate machine unavailable ===",
+            f"request_id: {request_id}",
+            f"machine: {_quoted_text(machine_name)}",
+            f"failure_detail: {_quoted_text(failure_detail)}",
+            "remote_mutation_started: false",
+            "All permitted SSH setup attempts are finished. No remote command started.",
+            "Disabling changes only local tmuxgate configuration and blocks future runs.",
+            "=== end tmuxgate machine unavailable ===",
+            "",
+        ]
+    )
+
+
+def _read_machine_disable_decision(
+    terminal: ApprovalTerminal,
+    machine_name: str,
+) -> ApprovalDecision:
+    prompt = f"Disable machine {machine_name}? [y/N] "
+    while True:
+        _write_all(terminal.writer, prompt)
+        try:
+            raw_line = terminal.reader.readline()
+        except Exception as exc:
+            raise ApprovalInputError("unable to read from the broker terminal") from exc
+        if raw_line == "":
+            raise ApprovalInputError(
+                "broker terminal reached EOF before a machine disable decision"
+            )
+        if not isinstance(raw_line, str):
+            raise ApprovalInputError(
+                "broker terminal returned non-text machine disable input"
+            )
+        response = _line_without_terminal_ending(raw_line).casefold()
+        raw_line = ""
+        if response in {"y", "yes"}:
+            response = ""
+            return ApprovalDecision.APPROVED
+        if response in {"", "n", "no"}:
+            response = ""
+            return ApprovalDecision.DENIED
+        response = ""
+        _write_all(terminal.writer, "Please answer y or n.\n")
+
+
+def request_machine_disable(
+    request_id: str,
+    machine_name: str,
+    *,
+    failure_detail: str,
+    remote_mutation_started: bool,
+    terminal: ApprovalTerminal | None = None,
+) -> ApprovalDecision:
+    """Ask only the broker terminal whether an unavailable machine is disabled."""
+
+    document = render_machine_disable_document(
+        request_id,
+        machine_name,
+        failure_detail=failure_detail,
+        remote_mutation_started=remote_mutation_started,
+    )
+    if terminal is None:
+        with open_approval_terminal() as opened_terminal:
+            _display_document(
+                opened_terminal,
+                document,
+                pager=None,
+                pager_threshold_bytes=DEFAULT_PAGER_THRESHOLD_BYTES,
+            )
+            return _read_machine_disable_decision(opened_terminal, machine_name)
+    _display_document(
+        terminal,
+        document,
+        pager=None,
+        pager_threshold_bytes=DEFAULT_PAGER_THRESHOLD_BYTES,
+    )
+    return _read_machine_disable_decision(terminal, machine_name)

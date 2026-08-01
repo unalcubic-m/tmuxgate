@@ -1,14 +1,28 @@
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 import io
+import os
 from pathlib import Path
+import stat
 import tempfile
+from types import MappingProxyType
 import unittest
 from unittest import mock
 
 from tmuxgate import cli
-from tmuxgate.config import default_config_path, load_config, parse_config
+from tmuxgate.config import (
+    default_config_path,
+    load_config,
+    load_config_snapshot,
+    parse_config,
+)
 from tmuxgate.network import NetworkSnapshot
-from tmuxgate.settings import serialize_config
+from tmuxgate.settings import (
+    ConfigWriteConflictError,
+    publish_edited_config,
+    serialize_config,
+    set_machine_enabled,
+)
 from test_config import valid_config
 from test_connection_plan import complete_snapshot
 
@@ -41,6 +55,8 @@ class SettingsCommandTests(unittest.TestCase):
             [item.id for item in config.machines["app-server"].endpoints],
             ["home-lan", "wireguard"],
         )
+        self.assertTrue(config.machines["app-server"].enabled)
+        self.assertIn(b"enabled = true\n", self.path.read_bytes())
 
     def test_serializer_upgrades_v1_input_to_explicit_v2_mcp_schema(self):
         content = serialize_config(parse_config(valid_config()))
@@ -96,6 +112,167 @@ class SettingsCommandTests(unittest.TestCase):
         )
         self.assertEqual(load_config(self.path).broker.approval_mode, "always")
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_enable_disable_commands_are_atomic_idempotent_and_list_status(self):
+        self.assertEqual(
+            cli.main(
+                [
+                    "config",
+                    "disable-machine",
+                    "app-server",
+                    "--path",
+                    str(self.path),
+                ]
+            ),
+            0,
+        )
+        self.assertFalse(load_config(self.path).machines["app-server"].enabled)
+        self.assertIn(b"enabled = false\n", self.path.read_bytes())
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+        unchanged = self.path.read_bytes()
+        self.assertEqual(
+            cli.main(
+                [
+                    "config",
+                    "disable-machine",
+                    "app-server",
+                    "--path",
+                    str(self.path),
+                ]
+            ),
+            0,
+        )
+        self.assertEqual(self.path.read_bytes(), unchanged)
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(
+                cli.main(["config", "list", "--path", str(self.path)]),
+                0,
+            )
+        self.assertIn("app-server  status=disabled", output.getvalue())
+
+        self.assertEqual(
+            cli.main(
+                [
+                    "config",
+                    "enable-machine",
+                    "app-server",
+                    "--path",
+                    str(self.path),
+                ]
+            ),
+            0,
+        )
+        self.assertTrue(load_config(self.path).machines["app-server"].enabled)
+
+    def test_set_machine_enabled_reloads_and_preserves_unrelated_current_settings(self):
+        first = load_config(self.path)
+        current = parse_config(valid_config())
+        current = replace(
+            current,
+            broker=replace(current.broker, max_active_remote_commands=2),
+        )
+        self.path.write_bytes(serialize_config(current))
+        self.path.chmod(0o600)
+
+        updated, changed = set_machine_enabled(
+            self.path,
+            "app-server",
+            enabled=False,
+        )
+
+        self.assertTrue(first.machines["app-server"].enabled)
+        self.assertTrue(changed)
+        self.assertFalse(updated.machines["app-server"].enabled)
+        self.assertEqual(updated.broker.max_active_remote_commands, 2)
+        self.assertEqual(load_config(self.path), updated)
+        lock_path = self.path.parent / f".{self.path.name}.lock"
+        self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+
+    def test_machine_disable_refuses_a_repointed_machine_preimage(self):
+        startup = load_config(self.path)
+        machines = dict(startup.machines)
+        machines["app-server"] = replace(
+            machines["app-server"],
+            description="Repointed while broker was running",
+        )
+        current = replace(startup, machines=MappingProxyType(machines))
+        self.path.write_bytes(serialize_config(current))
+        self.path.chmod(0o600)
+
+        with self.assertRaises(ConfigWriteConflictError):
+            set_machine_enabled(
+                self.path,
+                "app-server",
+                enabled=False,
+                expected_machine=startup.machines["app-server"],
+            )
+
+        after = load_config(self.path)
+        self.assertEqual(after, current)
+        self.assertTrue(after.machines["app-server"].enabled)
+
+    def test_editor_cas_rejects_comment_only_concurrent_change(self):
+        _original, expected_content = load_config_snapshot(self.path)
+        edited_content = b"# editor output\n" + expected_content
+        temporary = self.root / ".config.editor.tmp"
+        temporary.write_bytes(edited_content)
+        temporary.chmod(0o600)
+
+        concurrent_content = b"# concurrent comment-only update\n" + expected_content
+        self.path.write_bytes(concurrent_content)
+        self.path.chmod(0o600)
+
+        with self.assertRaises(ConfigWriteConflictError):
+            publish_edited_config(
+                self.path,
+                temporary,
+                expected_content=expected_content,
+            )
+
+        self.assertEqual(self.path.read_bytes(), concurrent_content)
+        self.assertEqual(temporary.read_bytes(), edited_content)
+
+    def test_editor_publish_fsyncs_owned_exact_copy_before_replace(self):
+        _original, expected_content = load_config_snapshot(self.path)
+        edited_content = b"# exact editor output\n" + expected_content
+        temporary = self.root / ".config.editor.tmp"
+        temporary.write_bytes(edited_content)
+        temporary.chmod(0o600)
+        events = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def recording_fsync(descriptor):
+            kind = "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+            events.append(("fsync", kind))
+            return real_fsync(descriptor)
+
+        def recording_replace(source, destination):
+            events.append(("replace", Path(source), Path(destination)))
+            return real_replace(source, destination)
+
+        with (
+            mock.patch("tmuxgate.settings.os.fsync", side_effect=recording_fsync),
+            mock.patch("tmuxgate.settings.os.replace", side_effect=recording_replace),
+        ):
+            edited = publish_edited_config(
+                self.path,
+                temporary,
+                expected_content=expected_content,
+            )
+
+        self.assertEqual(edited, load_config(self.path))
+        self.assertEqual(self.path.read_bytes(), edited_content)
+        file_fsync_index = events.index(("fsync", "file"))
+        replace_index = next(
+            index for index, event in enumerate(events) if event[0] == "replace"
+        )
+        directory_fsync_index = events.index(("fsync", "directory"))
+        self.assertLess(file_fsync_index, replace_index)
+        self.assertLess(replace_index, directory_fsync_index)
 
     def test_home_enrollment_refuses_missing_direct_lan_evidence(self):
         before = self.path.read_bytes()

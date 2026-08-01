@@ -58,7 +58,7 @@ class PlannerHarness:
         self.approval_calls.append((request_id, spec, plan))
         return self.decision
 
-    def planner(self):
+    def planner(self, **kwargs):
         return BoundRequestPlanner(
             self.config,
             snapshot_collector=self.collect,
@@ -66,10 +66,38 @@ class PlannerHarness:
             connection_builder=self.connect,
             endpoint_resolver=self.resolver,
             approver=self.approve,
+            **kwargs,
         )
 
 
 class BoundRequestPlannerTests(unittest.TestCase):
+    def test_runtime_disable_discards_an_already_approved_queued_context(self):
+        enabled = {"app-server": True}
+        harness = PlannerHarness()
+        planner = harness.planner(machine_enabled=enabled.__getitem__)
+        spec = request(("true",))
+        self.assertEqual(planner(REQUEST_ID, spec), ApprovalDecision.APPROVED)
+
+        enabled["app-server"] = False
+
+        with self.assertRaisesRegex(PlanningError, "disabled"):
+            planner.take(REQUEST_ID, spec)
+        self.assertEqual(planner.pending_request_ids, ())
+
+    def test_disabled_machine_fails_before_network_collection_or_approval(self):
+        data = valid_config()
+        data["machines"]["app-server"]["enabled"] = False
+        harness = PlannerHarness()
+        harness.config = parse_config(data)
+
+        with self.assertRaisesRegex(PlanningError, "machine is disabled"):
+            harness.planner()(REQUEST_ID, request())
+
+        self.assertEqual(harness.snapshot_calls, [])
+        self.assertEqual(harness.route_calls, [])
+        self.assertEqual(harness.connection_calls, [])
+        self.assertEqual(harness.approval_calls, [])
+
     def test_machine_name_builds_and_approves_complete_plan_without_remote_action(self):
         harness = PlannerHarness()
         planner = harness.planner()

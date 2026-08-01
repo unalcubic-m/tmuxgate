@@ -551,6 +551,24 @@ class BrokerIntegrationTests(unittest.TestCase):
         self.assertEqual(approver.calls, [])
         self.assertEqual(executor.calls, [])
 
+    def test_runtime_disabled_machine_is_rejected_before_queue_or_approval(self):
+        approver = ScriptedApprover([ApprovalDecision.APPROVED])
+        executor = ScriptedFakeExecutor([FakeExecution()])
+        enabled = {"machine-a": False}
+        server = self.start_server(
+            approver,
+            executor,
+            machine_enabled=enabled.__getitem__,
+        )
+
+        result = submit_request(request("disabled"), socket_path=self.socket_path)
+
+        self.assertEqual(result.transport_status, TransportStatus.INVALID_REQUEST)
+        self.assertIn("configured machine is disabled", result.detail)
+        self.assertEqual(approver.calls, [])
+        self.assertEqual(executor.calls, [])
+        self.assertIn(("disabled-machine", result.request_id), server.audit_log)
+
     def test_pending_queue_is_bounded_while_one_command_runs(self):
         approver = ScriptedApprover(
             [ApprovalDecision.APPROVED, ApprovalDecision.APPROVED]

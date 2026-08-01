@@ -28,6 +28,7 @@ remote_cidrs = ["198.51.100.128/25"]
 
 [machines.app-server]
 description = "Example application server"
+enabled = true
 ssh_profile = "app-server"
 user = "operator"
 host_key_alias = "tmuxgate-app-server"

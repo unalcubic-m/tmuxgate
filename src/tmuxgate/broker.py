@@ -290,6 +290,7 @@ class BrokerServer:
         listener: socket.socket,
         *,
         allowed_machines: Iterable[str],
+        machine_enabled: Callable[[str], bool] | None = None,
         approver: Approver,
         executor: Executor,
         max_pending_requests: int = 16,
@@ -359,6 +360,13 @@ class BrokerServer:
 
         self._listener = listener
         self._allowed_machines = machines
+        self._machine_enabled = (
+            (lambda _machine_name: True)
+            if machine_enabled is None
+            else machine_enabled
+        )
+        if not callable(self._machine_enabled):
+            raise TypeError("machine_enabled must be callable")
         self._approver = approver
         self._executor = executor
         self._peer_validator = peer_validator
@@ -792,6 +800,26 @@ class BrokerServer:
                     detail=f"unknown configured machine: {event.request.machine_alias}",
                 ),
                 "unknown-machine",
+            )
+            return
+        try:
+            enabled = self._machine_enabled(event.request.machine_alias)
+        except BaseException:
+            enabled = None
+        if type(enabled) is not bool or not enabled:
+            detail = (
+                f"configured machine is disabled: {event.request.machine_alias}"
+                if enabled is False
+                else "machine availability could not be verified"
+            )
+            self._deliver_unscheduled(
+                event.session,
+                ExecutionResult(
+                    request_id,
+                    TransportStatus.INVALID_REQUEST,
+                    detail=detail,
+                ),
+                "disabled-machine",
             )
             return
 

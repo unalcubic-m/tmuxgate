@@ -26,6 +26,7 @@ SnapshotCollector = Callable[..., NetworkSnapshot]
 RouteBuilder = Callable[..., RoutePlan]
 ConnectionBuilder = Callable[..., ConnectionPlan]
 BoundApprover = Callable[..., ApprovalDecision]
+MachineEnabled = Callable[[str], bool]
 
 
 def _candidate_retry_semantics(plan: ConnectionPlan) -> tuple[tuple[object, ...], ...]:
@@ -90,6 +91,7 @@ class BoundRequestPlanner:
         connection_builder: ConnectionBuilder = build_connection_plan,
         endpoint_resolver: Callable[..., object] = resolve_ssh_endpoint,
         approver: BoundApprover = request_bound_approval,
+        machine_enabled: MachineEnabled | None = None,
     ) -> None:
         if not isinstance(config, AppConfig):
             raise TypeError("config must be an AppConfig")
@@ -108,6 +110,13 @@ class BoundRequestPlanner:
         self.connection_builder = connection_builder
         self.endpoint_resolver = endpoint_resolver
         self.approver = approver
+        self.machine_enabled = (
+            (lambda alias: config.machines[alias].enabled)
+            if machine_enabled is None
+            else machine_enabled
+        )
+        if not callable(self.machine_enabled):
+            raise TypeError("machine_enabled must be callable")
         self._approved: dict[str, ApprovedRequestContext] = {}
         self._planning_request_id: str | None = None
         self._lock = threading.Lock()
@@ -126,6 +135,7 @@ class BoundRequestPlanner:
             raise PlanningError(
                 f"unknown configured machine: {request.machine_alias}"
             ) from exc
+        self._require_machine_enabled(request.machine_alias, machine.enabled)
         destinations = tuple(endpoint.address for endpoint in machine.endpoints)
         snapshot = self.snapshot_collector(
             destinations,
@@ -152,6 +162,20 @@ class BoundRequestPlanner:
             raise PlanningError("connection builder returned an invalid object")
         return connection_plan
 
+    def _require_machine_enabled(
+        self,
+        machine_name: str,
+        configured_enabled: bool = True,
+    ) -> None:
+        try:
+            runtime_enabled = self.machine_enabled(machine_name)
+        except BaseException as exc:
+            raise PlanningError("machine availability could not be verified") from exc
+        if type(runtime_enabled) is not bool:
+            raise PlanningError("machine availability callback returned invalid state")
+        if not configured_enabled or not runtime_enabled:
+            raise PlanningError(f"configured machine is disabled: {machine_name}")
+
     def _begin_planning(self, request_id: str) -> None:
         with self._lock:
             if self._planning_request_id is not None:
@@ -177,6 +201,7 @@ class BoundRequestPlanner:
                 return decision
             if decision is not ApprovalDecision.APPROVED:
                 raise PlanningError("approval callback returned an invalid decision")
+            self._require_machine_enabled(request.machine_alias)
             context = ApprovedRequestContext(
                 request_id,
                 request.client_request_sha256(),
@@ -252,6 +277,11 @@ class BoundRequestPlanner:
                 raise PlanningError("approved plan belongs to different request bytes")
             if context.connection_plan.machine_name != request.machine_alias:
                 raise PlanningError("approved plan belongs to a different machine")
+            try:
+                self._require_machine_enabled(request.machine_alias)
+            except BaseException:
+                del self._approved[request_id]
+                raise
             del self._approved[request_id]
         return context
 

@@ -195,6 +195,7 @@ def _positive_finite_duration(value: object, *, label: str) -> float:
 class MachineInfo:
     alias: str
     description: str | None
+    enabled: bool
 
 
 @dataclass(frozen=True)
@@ -411,6 +412,7 @@ def create_mcp_server(
                     MachineInfo(
                         alias=item.alias,
                         description=item.description,
+                        enabled=item.enabled,
                     )
                     for item in records
                 ]
