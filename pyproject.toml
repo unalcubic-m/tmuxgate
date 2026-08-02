@@ -26,6 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "mcp==2.0.0",
+    "textual==8.2.8",
     "uvicorn==0.52.0",
 ]
 

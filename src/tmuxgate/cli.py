@@ -37,6 +37,7 @@ from tmuxgate.models import (
     validate_alias,
 )
 from tmuxgate.mcp_server import McpServerError
+from tmuxgate.operator_interface import OperatorInterfaceError
 from tmuxgate.network_collect import collect_network_snapshot
 from tmuxgate.protocol import ProtocolError
 from tmuxgate.result import ExecutionResult, relay_transparent
@@ -92,6 +93,29 @@ def _add_local_paths(
         )
 
 
+def _add_interface_selection(
+    parser: argparse.ArgumentParser, *, inherit: bool = False
+) -> None:
+    group = parser.add_mutually_exclusive_group()
+    default: object = argparse.SUPPRESS if inherit else "plain"
+    group.add_argument(
+        "--plain",
+        action="store_const",
+        const="plain",
+        dest="interface_mode",
+        default=default,
+        help="use the established line-oriented production interface",
+    )
+    group.add_argument(
+        "--tui",
+        action="store_const",
+        const="tui",
+        dest="interface_mode",
+        default=default,
+        help="use the read-only Textual preview (approval_mode=always only)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tmuxgate",
@@ -99,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     _add_local_paths(parser, config=True)
+    _add_interface_selection(parser)
     parser.add_argument("--state-dir", default=None)
     parser.add_argument(
         "--fake",
@@ -180,6 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="deprecated alias for the unified foreground application",
     )
     _add_local_paths(broker_parser, config=True, inherit=True)
+    _add_interface_selection(broker_parser, inherit=True)
     broker_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
     broker_parser.add_argument(
         "--fake",
@@ -194,6 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the unified foreground application and terminal dashboard",
     )
     _add_local_paths(dashboard_parser, config=True, inherit=True)
+    _add_interface_selection(dashboard_parser, inherit=True)
     dashboard_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
     dashboard_parser.add_argument(
         "--fake", action="store_true", default=argparse.SUPPRESS
@@ -1039,17 +1066,23 @@ def _running_dashboard(
 def _unified_command(args: argparse.Namespace) -> int:
     config_path = str(args.config)
     state_dir = None if args.state_dir is None else str(args.state_dir)
+    textual = args.interface_mode == "tui"
     application = UnifiedApplication(
         config_path=config_path,
         socket_path=args.socket,
         state_dir=args.state_dir,
         fake=args.fake,
-        dashboard=lambda stop, terminal, config: _running_dashboard(
-            stop,
-            terminal,
-            config_path,
-            state_dir,
+        dashboard=(
+            None
+            if textual
+            else lambda stop, terminal, config: _running_dashboard(
+                stop,
+                terminal,
+                config_path,
+                state_dir,
+            )
         ),
+        textual=textual,
     )
     return application.run()
 
@@ -1086,6 +1119,7 @@ def main(argv: list[str] | None = None) -> int:
         BrokerError,
         BrokerConnectionError,
         McpServerError,
+        OperatorInterfaceError,
         ProtocolError,
         StateError,
         SpoolError,
