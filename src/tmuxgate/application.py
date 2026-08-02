@@ -277,9 +277,10 @@ class UnifiedApplication:
                 resources.callback(close_pool)
                 prompt_presenter = SecretPromptPresenter(
                     terminal_lock=self._terminal,
+                    authorizer=operator.request_secret_input_authorization,
                     reporter=lambda message: operator.publish_activity(
                         OperationalActivity.create(
-                            ActivityKind.ERROR,
+                            ActivityKind.SSH_PROMPT,
                             f"tmuxgate: {message}",
                         )
                     ),
@@ -322,9 +323,10 @@ class UnifiedApplication:
                     state=store,
                     spool=spool,
                     operator_interface=operator,
-                    backend_factory=lambda transport: RealRemoteJobBackend(
+                    backend_factory=lambda transport, recipient: RealRemoteJobBackend(
                         transport,
                         channels=channels,
+                        secret_input_recipient=recipient,
                         viewer_dir=paths.viewer_dir,
                         collection_dir=collection_dir,
                         limits=config.limits,

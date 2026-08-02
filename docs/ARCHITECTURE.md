@@ -391,9 +391,10 @@ arguments:
 - `MachineDisablePrompt` binds the local mutation decision to the originating
   request, approved plan, failure, machine, and proven pre-remote state.
 - `SecretInputAuthorizationPrompt` binds the exact request, machine/endpoint,
-  command or script, approved plan, and isolated viewer-session recipient. It
-  is a model and protocol method only in phase 1: the plain implementation
-  denies it, and the existing secret-input handoff is not redesigned here.
+  command or script, approved plan, and isolated viewer-session recipient.
+  `SecretInputRecipient` retains that request and route identity while the
+  viewer is live and creates a fresh one-shot prompt for each new prompt
+  episode.
 - `OperationalActivity` carries a typed activity kind and optional canonical
   request, machine, endpoint, and detail identities. Broker audit transitions
   enter the interface's bounded history; startup and error events use the same
@@ -434,11 +435,11 @@ slots. Closing cannot interrupt a kernel-blocked `/dev/tty` read, so
 the decision slots are already denied and application shutdown is reported
 unclean rather than approving or closing dependencies underneath it.
 
-OpenSSH first-master authentication and the current `SecretPromptPresenter`
-still use direct, arbiter-serialized external terminal ownership. The latter's
-request-bound authorization redesign belongs to #4 and the later terminal
-handoff phase; defining the fail-closed authorization model here does not make
-prompt-like remote output trusted or silently enable secret forwarding.
+OpenSSH first-master authentication still uses direct, arbiter-serialized
+external terminal ownership. `SecretPromptPresenter` may detect and report
+prompt-like remote output, but detection is not authority: before it can
+attach a viewer, it submits a fresh `SecretInputAuthorizationPrompt` through
+the same one-shot operator interface.
 
 ## Bounded command leases and retained transports
 
@@ -455,9 +456,10 @@ Detaching while a command runs does not release that request's lease. An
 uncertain job holds its own lease in recovery-required state; other configured
 slots continue independently.
 
-`approval_mode = "disabled"` is the default and performs no confirmation
-prompt after authentication and broker validation. `approval_mode = "always"`
-enables the terminal approval UI. Its compact decision card contains advisory
+`approval_mode = "disabled"` is the default and performs no execution
+confirmation prompt after authentication and broker validation. It does not
+disable secret-input authorization. `approval_mode = "always"` enables the
+execution approval UI. Its compact decision card contains advisory
 purpose, logical machine, selected route and resolved identity, host-key status,
 working directory, a JSON-quoted shell-escaped argv view or script identity/source,
 environment, timeout, and human-readable advisories. Enter/`y` approves, `n`
@@ -473,8 +475,18 @@ process stdin, and client-supplied purpose text cannot answer it.
 Each SSH viewer runs in a separate owner-only local tmux server below the
 runtime directory. A broker-owned monitor checks only the visible cursor row of
 each viewer for a password or passphrase prompt; this deliberately ignores the
-nested remote tmux status row below it. Matching viewers enter one shared
-FIFO presenter and attach to the broker's `/dev/tty` one at a time. The prompt
+nested remote tmux status row below it. A match publishes a notification and
+enters one shared FIFO, but never attaches the broker terminal by itself. The
+presenter first asks the operator to authorize the exact request, logical
+machine, approved argv or script identity, connection plan, endpoint, and
+isolated viewer session. The trusted display states that typed bytes will be
+sent to the remote process. Authorization requires typing the full
+`forward <32-character request ID>` phrase on the broker's `/dev/tty`; Enter or
+an explicit denial denies. Socket/MCP data, request bytes, remote pane content,
+and process stdin are not input sources for this prompt. A stale prompt ID,
+binding, request, command, endpoint, or viewer cannot resolve a replacement
+prompt. Only after an Approved decision does the presenter revalidate the
+still-live viewer and still-visible prompt and attach to `/dev/tty`. The prompt
 matcher accepts at most 256 literal ASCII sudo `pwfeedback` stars after an
 otherwise valid cursor-row prompt, including fewer stars after backspacing; it
 does not accept arbitrary suffix text or alternate mask characters.
@@ -494,7 +506,10 @@ history is scanned only for the cooperative marker. The marker is viewer-UX
 signaling, not authentication security or durable completion evidence;
 canonical job state and captured results remain authoritative. Job completion
 and operator `Ctrl-b d` remain the fallback for commands without the marker.
-A deliberate detach is not automatically reversed while the same prompt
+A denial leaves the remote command running and detached. The same continuously
+visible prompt is not offered again; clearing it and later displaying a new
+prompt creates a fresh independently bound decision. A deliberate detach is
+not automatically reversed while the same prompt
 remains continuously visible; a cleared prompt followed by a new prompt begins
 a new episode. This avoids both premature time-based detachment and
 interception of password bytes. Prompt or marker probe failure attempts a
@@ -502,11 +517,12 @@ targeted detach fail-closed. If targeted tmux detach fails, the presenter
 terminates and reaps the exact local attach process before releasing the
 terminal lock, then reports the presenter error.
 
-Before displaying its operator notice, the presenter revalidates the opened
-PTY and discards only input bytes that were already queued on the broker
-terminal. It then writes the notice and starts attachment without a second
-input flush. This prevents an earlier dashboard keystroke from becoming a
-password submission while preserving input typed in response to the notice.
+After authorization and before displaying its attachment notice, the presenter
+revalidates the opened PTY and discards only input bytes that were already
+queued on the broker terminal. It then writes the notice and starts attachment
+without a second input flush. This prevents the authorization line or an
+earlier dashboard keystroke from becoming a password submission while
+preserving input typed in response to the notice.
 Output is not flushed, and input continues directly to the viewer. Detection
 does not inspect canonical stdout/stderr or store input.
 `tmuxgate attach REQUEST_ID` remains available for arbitrary interaction,
@@ -515,8 +531,9 @@ Normal completion closes the remote pane and local viewer automatically;
 canonical capture does not depend on pane history.
 
 One process-local `TerminalArbiter` serializes dashboard transactions, the
-optional approval UI, fallback approval, interactive first-master SSH
-authentication, and the automatic prompt presenter. The dashboard polls for a
+optional execution approval UI, mandatory secret-input authorization,
+fallback approval, interactive first-master SSH authentication, and approved
+viewer attachments. The dashboard polls for a
 complete canonical `/dev/tty` line in bounded slices without retaining a lease
 while idle. It acquires the lowest-priority lease only immediately before
 reading. Any intervening non-dashboard handoff increments a generation and

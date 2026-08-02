@@ -17,6 +17,13 @@ import threading
 import time
 from typing import BinaryIO
 
+from tmuxgate.approval import ApprovalDecision
+from tmuxgate.operator_interface import (
+    OperatorDecision,
+    SecretInputAuthorizationPrompt,
+    SecretInputRecipient,
+    require_operator_decision,
+)
 from tmuxgate.transport import SshInvocation, SshMasterStartError, TransportError
 
 
@@ -417,6 +424,7 @@ class SshChannelRunner:
         *,
         socket_path: Path,
         session_name: str,
+        secret_input_recipient: SecretInputRecipient | None = None,
     ) -> "DetachedTmuxViewerProcess":
         """Launch one SSH viewer in its own private local tmux server."""
 
@@ -424,6 +432,19 @@ class SshChannelRunner:
             raise TransportError("detached viewer invocation is invalid")
         if _VIEWER_SESSION_RE.fullmatch(session_name) is None:
             raise TransportError("detached viewer session name is invalid")
+        if self.prompt_presenter is not None:
+            if not isinstance(secret_input_recipient, SecretInputRecipient):
+                raise TransportError(
+                    "automatic prompt detection requires an exact secret-input recipient"
+                )
+            if session_name != f"tmuxgate-{secret_input_recipient.request_id[:12]}":
+                raise TransportError(
+                    "detached viewer session does not match its exact request"
+                )
+        elif secret_input_recipient is not None:
+            raise TransportError(
+                "secret-input recipient requires an automatic prompt presenter"
+            )
         if socket_path.exists() or socket_path.is_symlink():
             raise TransportError("refusing a pre-existing detached viewer socket")
         completed = _run_completed(
@@ -455,7 +476,8 @@ class SshChannelRunner:
             self.runner, socket_path, session_name
         )
         if self.prompt_presenter is not None:
-            self.prompt_presenter.watch(viewer)
+            assert secret_input_recipient is not None
+            self.prompt_presenter.watch(viewer, secret_input_recipient)
         return viewer
 
 
@@ -611,7 +633,7 @@ class DetachedTmuxViewerProcess:
 
 
 class SecretPromptPresenter:
-    """Detect and serially present private viewers that need secret input."""
+    """Notify on prompt detection and attach only after exact authorization."""
 
     def __init__(
         self,
@@ -623,19 +645,27 @@ class SecretPromptPresenter:
         terminal_input_flusher: Callable[[BinaryIO, str], None] = (
             _discard_pending_terminal_input
         ),
+        authorizer: Callable[
+            [SecretInputAuthorizationPrompt], OperatorDecision
+        ],
         reporter: Callable[[str], object] = lambda message: None,
         poll_seconds: float = 0.10,
     ) -> None:
         if poll_seconds <= 0:
             raise ValueError("prompt presenter timing is invalid")
+        if not callable(authorizer):
+            raise TypeError("prompt presenter authorizer must be callable")
         self.terminal_lock = threading.RLock() if terminal_lock is None else terminal_lock
         self.terminal_opener = terminal_opener
         self.popen = popen
         self.terminal_path_resolver = terminal_path_resolver
         self.terminal_input_flusher = terminal_input_flusher
+        self.authorizer = authorizer
         self.reporter = reporter
         self.poll_seconds = float(poll_seconds)
-        self._queue: queue.Queue[DetachedTmuxViewerProcess | None] = queue.Queue()
+        self._queue: queue.Queue[
+            tuple[DetachedTmuxViewerProcess, SecretInputRecipient] | None
+        ] = queue.Queue()
         self._stop = threading.Event()
         self._watched: set[tuple[str, str]] = set()
         self._watched_lock = threading.Lock()
@@ -648,9 +678,17 @@ class SecretPromptPresenter:
         )
         self._thread.start()
 
-    def watch(self, viewer: DetachedTmuxViewerProcess) -> None:
+    def watch(
+        self,
+        viewer: DetachedTmuxViewerProcess,
+        recipient: SecretInputRecipient,
+    ) -> None:
         if not isinstance(viewer, DetachedTmuxViewerProcess):
             raise TypeError("prompt presenter requires a detached tmux viewer")
+        if not isinstance(recipient, SecretInputRecipient):
+            raise TypeError("prompt presenter requires an exact secret-input recipient")
+        if viewer.session_name != f"tmuxgate-{recipient.request_id[:12]}":
+            raise TransportError("viewer session does not match its exact request")
         key = (os.fspath(viewer.socket_path), viewer.session_name)
         with self._watched_lock:
             if key in self._watched:
@@ -658,7 +696,7 @@ class SecretPromptPresenter:
             self._watched.add(key)
         threading.Thread(
             target=self._monitor,
-            args=(viewer, key),
+            args=(viewer, recipient, key),
             name=f"tmuxgate-prompt-watch-{viewer.session_name[-12:]}",
             daemon=True,
         ).start()
@@ -666,6 +704,7 @@ class SecretPromptPresenter:
     def _monitor(
         self,
         viewer: DetachedTmuxViewerProcess,
+        recipient: SecretInputRecipient,
         key: tuple[str, str],
     ) -> None:
         prompt_episode = False
@@ -685,9 +724,11 @@ class SecretPromptPresenter:
                         )
                     if active_viewer is not viewer:
                         self.reporter(
-                            f"input required for {viewer.session_name}; queued"
+                            "secret input requested by remote pane for request "
+                            f"{recipient.request_id} on {recipient.request.machine_alias}; "
+                            "awaiting independent operator authorization"
                         )
-                        self._queue.put(viewer)
+                        self._queue.put((viewer, recipient))
                 elif signature is None:
                     prompt_episode = False
                 self._stop.wait(self.poll_seconds)
@@ -697,11 +738,12 @@ class SecretPromptPresenter:
 
     def _present_loop(self) -> None:
         while not self._stop.is_set():
-            viewer = self._queue.get()
-            if viewer is None:
+            queued = self._queue.get()
+            if queued is None:
                 return
+            viewer, recipient = queued
             try:
-                self._present(viewer)
+                self._present(viewer, recipient)
             except (OSError, subprocess.SubprocessError, TransportError) as exc:
                 # The viewer may have completed or been manually attached.
                 self.reporter(
@@ -710,10 +752,25 @@ class SecretPromptPresenter:
                 )
                 continue
 
-    def _present(self, viewer: DetachedTmuxViewerProcess) -> None:
+    def _present(
+        self,
+        viewer: DetachedTmuxViewerProcess,
+        recipient: SecretInputRecipient,
+    ) -> None:
         if not viewer.attached:
             return
         if viewer.prompt_signature() is None:
+            return
+        prompt = recipient.create_prompt(viewer.session_name)
+        try:
+            decision = require_operator_decision(prompt, self.authorizer(prompt))
+        except BaseException as exc:
+            raise TransportError("secret-input authorization failed closed") from exc
+        if decision is not ApprovalDecision.APPROVED:
+            self.reporter(
+                f"secret input denied for request {recipient.request_id}; "
+                "remote command remains detached"
+            )
             return
         with self.terminal_lock:
             if self._stop.is_set() or not viewer.attached:

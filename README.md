@@ -35,8 +35,10 @@ being given a reusable interactive SSH shell. tmuxgate narrows that workflow:
   viewer. Existing remote sessions are not reused or modified.
 - stdout, stderr, exit status, job state, and checksums are collected through a
   durable, fail-closed lifecycle.
-- Password and passphrase prompts can be presented in the application's
-  controlling terminal without tmuxgate reading or storing the entered bytes.
+- Password and passphrase prompt detection produces an operator notification;
+  forwarding controlling-terminal input requires a separate exact
+  request-bound authorization, and tmuxgate does not read or store entered
+  secret bytes.
 
 ```text
 Codex -> bearer-authenticated loopback HTTP -> embedded MCP server
@@ -347,8 +349,8 @@ controlling terminal. Enter `y`/`yes`/`approve` (or press Enter) to approve,
 `n`/`no`/`deny` to deny, `c` to inspect the exact code, or `d` to inspect the
 complete technical evidence. Dashboard input, MCP data, Unix-socket data, and
 process stdin cannot answer the prompt. The dashboard does not hold the
-terminal while idle, allowing approvals, SSH authentication, and automatic
-secret-prompt attachments to use the same terminal safely.
+terminal while idle, allowing approvals, SSH authentication, and separately
+authorized secret-input attachments to use the same terminal safely.
 
 The plain screen is implemented behind a presentation-independent operator
 interface. Execution, SSH-retry, fallback, and machine-disable prompts carry
@@ -358,6 +360,15 @@ Closing or failing the interface denies all unresolved prompts. This is an
 internal architecture migration only: the visible line-oriented interface and
 `/dev/tty` trust boundary remain the defaults, and no Textual/full-screen TUI
 is included yet.
+
+Remote password-like pane text is notification only. Before tmuxgate attaches
+the broker terminal to a detached viewer, a separate card identifies the full
+request ID, logical machine, endpoint, approved argv or script digest, and the
+remote-input action. The operator must type `forward <full-request-id>` on the
+trusted terminal. This authorization remains mandatory when
+`approval_mode = "disabled"`; denial leaves the command detached, while
+`tmuxgate attach REQUEST_ID` remains available for deliberate manual
+interaction.
 
 If initial OpenSSH master setup exits, tmuxgate leaves OpenSSH's diagnostic in
 that controlling terminal, reports its exit status without copying terminal

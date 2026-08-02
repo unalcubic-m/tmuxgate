@@ -163,6 +163,21 @@ def _canonical_sha256(document: dict[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _domain_sha256(domain: str, document: dict[str, object]) -> str:
+    encoded = json.dumps(
+        document,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    digest = hashlib.sha256()
+    digest.update(domain.encode("ascii"))
+    digest.update(b"\x00")
+    digest.update(encoded)
+    return digest.hexdigest()
+
+
 def approval_binding_sha256(
     request_id: str,
     request: RequestSpec,
@@ -1123,6 +1138,195 @@ def request_ssh_retry(
         pager_threshold_bytes=DEFAULT_PAGER_THRESHOLD_BYTES,
     )
     return _read_ssh_retry_decision(terminal, request_id[:8], endpoint_id)
+
+
+def render_secret_input_authorization_document(
+    request_id: str,
+    request: RequestSpec,
+    connection_plan: ConnectionPlan,
+    *,
+    prompt_id: str,
+    endpoint_id: str,
+    viewer_session_id: str,
+    command_identity_sha256: str,
+    secret_input_binding_sha256: str,
+) -> str:
+    """Render the exact recipient of a proposed broker-terminal handoff."""
+
+    request_id = validate_request_id(request_id)
+    approval_binding_sha256(request_id, request, connection_plan)
+    endpoint = next(
+        (
+            item
+            for item in connection_plan.endpoints
+            if item.resolved.endpoint_id == endpoint_id
+        ),
+        None,
+    )
+    if endpoint is None:
+        raise ApprovalError(
+            "secret-input endpoint is not in the approved connection plan"
+        )
+    if (
+        not isinstance(viewer_session_id, str)
+        or not viewer_session_id.startswith("tmuxgate-")
+    ):
+        raise ApprovalError("secret-input viewer session is invalid")
+    for name, value, length in (
+        ("prompt", prompt_id, 32),
+        ("command identity", command_identity_sha256, 64),
+        ("secret-input binding", secret_input_binding_sha256, 64),
+    ):
+        if (
+            not isinstance(value, str)
+            or len(value) != length
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ApprovalError(f"{name} digest is invalid")
+    expected_command_identity = (
+        hashlib.sha256(request.script).hexdigest()
+        if request.mode.value == "script"
+        else _domain_sha256(
+            "tmuxgate-argv-identity-v1", {"argv": list(request.argv)}
+        )
+    )
+    if command_identity_sha256 != expected_command_identity:
+        raise ApprovalError("command identity does not match the approved request")
+    expected_binding = _domain_sha256(
+        "tmuxgate-secret-input-prompt-v1",
+        {
+            "client_request_sha256": request.client_request_sha256(),
+            "command_identity_sha256": command_identity_sha256,
+            "connection_plan_sha256": connection_plan.plan_sha256,
+            "endpoint_id": endpoint_id,
+            "prompt_id": prompt_id,
+            "request_id": request_id,
+            "viewer_session_id": viewer_session_id,
+        },
+    )
+    if secret_input_binding_sha256 != expected_binding:
+        raise ApprovalError("secret-input binding does not match the exact recipient")
+
+    lines = [
+        "=== tmuxgate secret-input authorization ===",
+        f"prompt_id: {prompt_id}",
+        f"request_id: {request_id}",
+        f"machine: {_quoted_text(request.machine_alias)}",
+        f"endpoint_id: {_quoted_text(endpoint_id)}",
+        f"viewer_session_id: {_quoted_text(viewer_session_id)}",
+        f"mode: {request.mode.value}",
+    ]
+    if request.argv:
+        lines.append("approved_argv:")
+        lines.extend(
+            f"  [{index}] {_quoted_text(argument)}"
+            for index, argument in enumerate(request.argv)
+        )
+    else:
+        lines.extend(
+            [
+                f"approved_script_bytes: {len(request.script)}",
+                f"approved_script_sha256: {hashlib.sha256(request.script).hexdigest()}",
+            ]
+        )
+    lines.extend(
+        [
+            f"client_request_sha256: {request.client_request_sha256()}",
+            f"command_identity_sha256: {command_identity_sha256}",
+            f"connection_plan_sha256: {connection_plan.plan_sha256}",
+            f"secret_input_binding_sha256: {secret_input_binding_sha256}",
+            "action: attach the broker-owned terminal to this remote process",
+            "warning: every byte typed while attached is sent to the remote process",
+            "prompt detection is notification only and does not authorize this action",
+            "=== end secret-input authorization ===",
+            "",
+        ]
+    )
+    return _terminal_safe_document(lines)
+
+
+def _read_secret_input_authorization_decision(
+    terminal: ApprovalTerminal,
+    request_id: str,
+) -> ApprovalDecision:
+    expected = f"forward {request_id}"
+    instruction = (
+        "Type " + _quoted_text(expected) + " to forward terminal input, "
+        "or press Enter to deny: "
+    )
+    while True:
+        _write_all(terminal.writer, instruction)
+        try:
+            raw_line = terminal.reader.readline()
+        except Exception as exc:
+            raise ApprovalInputError(
+                "unable to read secret-input authorization from the broker terminal"
+            ) from exc
+        if raw_line == "":
+            raise ApprovalInputError(
+                "broker terminal reached EOF before a secret-input decision"
+            )
+        if not isinstance(raw_line, str):
+            raise ApprovalInputError(
+                "broker terminal returned non-text secret-input authorization"
+            )
+        response = _line_without_terminal_ending(raw_line)
+        raw_line = ""
+        if response == expected:
+            response = ""
+            return ApprovalDecision.APPROVED
+        if response.casefold() in {"", "n", "no", "deny"}:
+            response = ""
+            return ApprovalDecision.DENIED
+        response = ""
+        _write_all(
+            terminal.writer,
+            "Secret input was not authorized; enter the exact displayed phrase or deny.\n",
+        )
+
+
+def request_secret_input_authorization(
+    request_id: str,
+    request: RequestSpec,
+    connection_plan: ConnectionPlan,
+    *,
+    prompt_id: str,
+    endpoint_id: str,
+    viewer_session_id: str,
+    command_identity_sha256: str,
+    secret_input_binding_sha256: str,
+    terminal: ApprovalTerminal | None = None,
+) -> ApprovalDecision:
+    """Ask only the broker terminal to forward input to one exact recipient."""
+
+    document = render_secret_input_authorization_document(
+        request_id,
+        request,
+        connection_plan,
+        prompt_id=prompt_id,
+        endpoint_id=endpoint_id,
+        viewer_session_id=viewer_session_id,
+        command_identity_sha256=command_identity_sha256,
+        secret_input_binding_sha256=secret_input_binding_sha256,
+    )
+    if terminal is None:
+        with open_approval_terminal() as opened_terminal:
+            _display_document(
+                opened_terminal,
+                document,
+                pager=None,
+                pager_threshold_bytes=DEFAULT_PAGER_THRESHOLD_BYTES,
+            )
+            return _read_secret_input_authorization_decision(
+                opened_terminal, request_id
+            )
+    _display_document(
+        terminal,
+        document,
+        pager=None,
+        pager_threshold_bytes=DEFAULT_PAGER_THRESHOLD_BYTES,
+    )
+    return _read_secret_input_authorization_decision(terminal, request_id)
 
 
 def render_machine_disable_document(

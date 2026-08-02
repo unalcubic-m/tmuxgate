@@ -141,7 +141,7 @@ class RealExecutorTests(unittest.TestCase):
             transports=self.pool,
             state=self.state,
             spool=self.spool,
-            backend_factory=lambda transport: backend,
+            backend_factory=lambda transport, recipient: backend,
             operator_interface=operator,
             poll_interval_seconds=0.001,
             detached_wait_seconds=0.001,
