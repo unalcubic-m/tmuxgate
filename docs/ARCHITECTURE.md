@@ -799,6 +799,16 @@ submitted process but cannot replace or configure tmuxgate's gate, FIFO,
 capture, state-publication, hashing, or cleanup tools. Runner control-plane
 utilities use fixed absolute paths where practical.
 
+The primary argv process or script shell starts as the leader of a dedicated
+session and process group; configured `/usr/bin/timeout` supervision runs
+inside that same boundary. After the primary process exits, the runner sends
+`TERM` to every remaining member, allows one second for orderly shutdown, and
+then sends `KILL` to the group. Timeout, capture-quota termination, viewer
+Ctrl-C, and unexpected runner exit use the same descendant boundary. This is a
+command lifecycle, not a service supervisor: a descendant can deliberately
+escape by creating another session, but it cannot make retained output
+descriptors look like successful completion.
+
 stdout and stderr are drained through separate bounded FIFO pipelines to raw
 result files while remaining visible in the pane. Each pipeline admits at most
 its configured stream limit plus one sentinel byte, and a concurrent monitor
@@ -807,6 +817,21 @@ runs. Any independent or combined overrun publishes
 `capture-limit-exceeded`, omits the exit-status file, and cannot become proven
 completion. This bounds each raw file and actively monitors combined remote
 disk growth. `capture-pane` is not a canonical result source.
+
+The two capture pipelines also run in dedicated process groups. Once the
+submitted process group has been terminated, the runner allows at most two
+seconds for buffered stdout and stderr to reach their canonical files. If both
+collectors do not finish, including when a detached or double-forked process
+retains a FIFO writer, the runner terminates the complete collector groups,
+unlinks both FIFOs, atomically publishes `capture-incomplete`, and omits the
+exit-status file. The coordinator therefore enters recovery-required state and
+cannot collect, verify, spool, or clean the job as a successful result. A
+descendant that escapes only after closing both streams may continue outside
+tmuxgate's command boundary, but it has no descriptor that can append to the
+canonical streams. `complete` and its exit status are published only after the
+submitted group is gone and both collectors have finished, so no descendant
+can append canonical output after result publication. The policy and ordering
+are identical for argv and script modes.
 
 The real backend implements this lifecycle; fake and real-local-tmux tests
 exercise the same scripts. A durable start permit is required before staging. The coordinator
@@ -842,9 +867,12 @@ captured bytes, and aggregate local collection bytes. Limits are inclusive:
 exactly at the boundary succeeds and one byte over fails closed. The packaged
 Bash runner retains pane stdin, uses separate mode-`0600` FIFOs and bounded
 capture pipelines, writes the exit status only after both collectors finish,
-and cleans up failed-gate FIFOs without manufacturing completion. Tests also execute the
-exact staging shell and lifecycle in a private real local tmux server. The first
-approved remote job completed successfully on July 19, 2026.
+terminates inherited-descriptor holders at the process-group boundary, seals an
+ambiguous drain as incomplete, and cleans up failed-gate FIFOs without
+manufacturing completion. Tests also execute the exact staging shell and
+lifecycle in a private real local tmux server, including a background child
+that retains stdout. The first approved remote job completed successfully on
+July 19, 2026.
 
 Broker/SSH failure does not rerun the command. State is reported as incomplete
 unless completion and exit status can be proven. Cleanup validates the exact

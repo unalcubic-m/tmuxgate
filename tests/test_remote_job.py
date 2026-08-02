@@ -3,6 +3,7 @@ import hashlib
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 from tmuxgate.models import ExecutionMode, RequestSpec
@@ -219,6 +220,161 @@ class RemoteJobCoordinatorTests(unittest.TestCase):
 
 
 class RemoteRunnerTests(unittest.TestCase):
+    def _run_descendant_case(
+        self,
+        directory,
+        *,
+        mode,
+        command,
+        timeout=b"",
+        run_timeout=8,
+    ):
+        root = Path(directory)
+        home = root / "home"
+        job = home / ".cache/tmuxgate/jobs" / REQUEST_ID
+        job.mkdir(parents=True, mode=0o700)
+        marker = root / "descendant-terminated"
+        files = {
+            "mode": f"{mode}\n".encode("ascii"),
+            "cwd.bin": os.fsencode(str(job)) + b"\0",
+            "environment.bin": b"MARKER\0" + os.fsencode(marker) + b"\0",
+            "timeout": timeout,
+            "result-limits": b"1048576\n1048576\n2097152\n",
+        }
+        if mode == "exec":
+            files["argv.bin"] = (
+                b"/bin/bash\0--noprofile\0--norc\0-c\0" + command + b"\0"
+            )
+        else:
+            files["payload.sh"] = command + b"\n"
+        for name, content in files.items():
+            path = job / name
+            path.write_bytes(content)
+            path.chmod(0o600)
+        fake_tmux = root / "fake-tmux"
+        fake_tmux.write_text(
+            "#!/bin/sh\n[ \"$1\" = wait-for ] || exit 99\nexit 0\n",
+            encoding="ascii",
+        )
+        fake_tmux.chmod(0o700)
+        runner = Path(__file__).parents[1] / "src/tmuxgate/assets/remote_runner.sh"
+        started = time.monotonic()
+        completed = subprocess.run(
+            [
+                "/bin/bash",
+                str(runner),
+                str(job),
+                f"tmuxgate-start-{REQUEST_ID}",
+                str(fake_tmux),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+            timeout=run_timeout,
+            check=False,
+        )
+        return completed, job, marker, time.monotonic() - started
+
+    def test_background_child_retaining_each_stream_is_terminated_for_both_modes(self):
+        cases = (
+            (
+                "stdout",
+                b"(trap 'printf terminated > \"$MARKER\"; exit 0' TERM; "
+                b"sleep 4) 2>/dev/null & printf primary",
+                b"primary",
+                b"",
+            ),
+            (
+                "stderr",
+                b"(trap 'printf terminated > \"$MARKER\"; exit 0' TERM; "
+                b"sleep 4) >/dev/null & printf primary >&2",
+                b"",
+                b"primary",
+            ),
+        )
+        for mode in ("exec", "script"):
+            for stream, command, stdout, stderr in cases:
+                with self.subTest(mode=mode, stream=stream), tempfile.TemporaryDirectory() as directory:
+                    completed, job, marker, elapsed = self._run_descendant_case(
+                        directory,
+                        mode=mode,
+                        command=command,
+                    )
+                    self.assertLess(elapsed, 3)
+                    self.assertEqual(completed.returncode, 0)
+                    self.assertEqual(completed.stdout, stdout)
+                    if stream == "stdout":
+                        self.assertEqual(completed.stderr, stderr)
+                    else:
+                        # Bash may report termination of its background job on
+                        # the retained stderr before that descriptor closes.
+                        self.assertTrue(completed.stderr.startswith(stderr))
+                    self.assertEqual((job / "state").read_bytes(), b"complete\n")
+                    self.assertEqual((job / "exit-code").read_bytes(), b"0\n")
+                    self.assertEqual((job / "stdout.raw").read_bytes(), stdout)
+                    self.assertEqual(
+                        (job / "stderr.raw").read_bytes(), completed.stderr
+                    )
+                    self.assertTrue(marker.exists())
+
+    def test_background_child_that_closes_both_streams_preserves_success(self):
+        for mode in ("exec", "script"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                completed, job, _marker, elapsed = self._run_descendant_case(
+                    directory,
+                    mode=mode,
+                    command=(
+                        b"(exec >/dev/null 2>&1; sleep 4) & printf primary"
+                    ),
+                )
+                self.assertLess(elapsed, 3)
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(completed.stdout, b"primary")
+                self.assertEqual(completed.stderr, b"")
+                self.assertEqual((job / "state").read_bytes(), b"complete\n")
+                self.assertEqual((job / "exit-code").read_bytes(), b"0\n")
+
+    def test_detached_descriptor_holder_is_bounded_and_cannot_publish_or_append(self):
+        command = (
+            b"/usr/bin/setsid --fork /bin/bash --noprofile --norc -c "
+            b"'trap \"\" PIPE; sleep 4; printf late || :' 2>/dev/null & "
+            b"printf primary"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            completed, job, _marker, elapsed = self._run_descendant_case(
+                directory,
+                mode="exec",
+                command=command,
+            )
+            self.assertLess(elapsed, 3.5)
+            self.assertEqual(completed.returncode, 125)
+            self.assertEqual(completed.stderr, b"")
+            self.assertEqual((job / "state").read_bytes(), b"capture-incomplete\n")
+            self.assertFalse((job / "exit-code").exists())
+            self.assertFalse((job / "stdout.fifo").exists())
+            self.assertFalse((job / "stderr.fifo").exists())
+            sealed_stdout = (job / "stdout.raw").read_bytes()
+            self.assertEqual(completed.stdout, sealed_stdout)
+            time.sleep(max(0, 4.5 - elapsed))
+            self.assertEqual((job / "stdout.raw").read_bytes(), sealed_stdout)
+
+    def test_timeout_terminates_descendants_that_outlive_the_primary_shell(self):
+        command = b"sleep 30 & wait"
+        with tempfile.TemporaryDirectory() as directory:
+            completed, job, _marker, elapsed = self._run_descendant_case(
+                directory,
+                mode="script",
+                command=command,
+                timeout=b"1\n",
+            )
+            self.assertLess(elapsed, 4)
+            self.assertEqual(completed.returncode, 124)
+            self.assertEqual((job / "state").read_bytes(), b"complete\n")
+            self.assertEqual((job / "exit-code").read_bytes(), b"124\n")
+            self.assertFalse((job / "stdout.fifo").exists())
+            self.assertFalse((job / "stderr.fifo").exists())
+
     def test_runner_enforces_stream_and_total_capture_limits(self):
         runner = Path(__file__).parents[1] / "src/tmuxgate/assets/remote_runner.sh"
         cases = (
