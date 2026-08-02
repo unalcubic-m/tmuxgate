@@ -9,6 +9,7 @@ from tmuxgate.scheduler import RequestState
 from tmuxgate.spool import ResultSpool
 from tmuxgate.state import DurableStateStore
 from tmuxgate.approval import ApprovalDecision
+from tmuxgate.operator_interface import OperatorDecision
 from tmuxgate.transport import MasterTransportPool, SshMasterStartError
 from test_planning import PlannerHarness, request
 from test_remote_job import FakeRemoteBackend
@@ -43,6 +44,56 @@ class RetryMasterBackend(FakeMasterBackend):
         super().start_master(invocation, control_path)
 
 
+class CallbackOperatorInterface:
+    """Translate structured prompts to the focused legacy-style test callbacks."""
+
+    def __init__(
+        self,
+        *,
+        fallback_approver=lambda *args, **kwargs: ApprovalDecision.DENIED,
+        ssh_retry_approver=lambda *args, **kwargs: ApprovalDecision.DENIED,
+        machine_disable_approver=lambda *args, **kwargs: ApprovalDecision.DENIED,
+    ):
+        self.fallback_approver = fallback_approver
+        self.ssh_retry_approver = ssh_retry_approver
+        self.machine_disable_approver = machine_disable_approver
+
+    def request_fallback(self, prompt):
+        decision = self.fallback_approver(
+            prompt.request_id,
+            prompt.request,
+            prompt.connection_plan,
+            failed_endpoint_id=prompt.failed_endpoint_id,
+            fallback_endpoint_id=prompt.fallback_endpoint_id,
+            failure_detail=prompt.failure_detail,
+            remote_mutation_started=False,
+        )
+        return OperatorDecision.for_prompt(prompt, decision)
+
+    def request_ssh_retry(self, prompt):
+        decision = self.ssh_retry_approver(
+            prompt.request_id,
+            prompt.request,
+            prompt.connection_plan,
+            endpoint_id=prompt.endpoint_id,
+            failure_detail=prompt.failure_detail,
+            remote_mutation_started=False,
+        )
+        return OperatorDecision.for_prompt(prompt, decision)
+
+    def request_machine_disable(self, prompt):
+        decision = self.machine_disable_approver(
+            prompt.request_id,
+            prompt.request.machine_alias,
+            failure_detail=prompt.failure_detail,
+            remote_mutation_started=False,
+        )
+        return OperatorDecision.for_prompt(prompt, decision)
+
+    def publish_activity(self, event):
+        del event
+
+
 class RealExecutorTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -71,12 +122,27 @@ class RealExecutorTests(unittest.TestCase):
         self.planner(REQUEST_ID, spec)
 
     def executor(self, backend, **kwargs):
+        operator = CallbackOperatorInterface(
+            fallback_approver=kwargs.pop(
+                "fallback_approver",
+                lambda *args, **keywords: ApprovalDecision.DENIED,
+            ),
+            ssh_retry_approver=kwargs.pop(
+                "ssh_retry_approver",
+                lambda *args, **keywords: ApprovalDecision.DENIED,
+            ),
+            machine_disable_approver=kwargs.pop(
+                "machine_disable_approver",
+                lambda *args, **keywords: ApprovalDecision.DENIED,
+            ),
+        )
         return RealExecutor(
             planner=self.planner,
             transports=self.pool,
             state=self.state,
             spool=self.spool,
             backend_factory=lambda transport: backend,
+            operator_interface=operator,
             poll_interval_seconds=0.001,
             detached_wait_seconds=0.001,
             **kwargs,

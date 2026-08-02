@@ -64,7 +64,9 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
         self.state_dir = self.root / "state"
         _write_config(self.config_path)
 
-    def _application(self, dashboard=None) -> UnifiedApplication:
+    def _application(
+        self, dashboard=None, operator_interface=None
+    ) -> UnifiedApplication:
         terminal = mock.Mock()
         terminal.claim.return_value = nullcontext()
         return UnifiedApplication(
@@ -74,7 +76,33 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
             fake=True,
             dashboard=dashboard,
             terminal=terminal,
+            operator_interface=operator_interface,
         )
+
+    def test_shutdown_closes_operator_after_admission_stop_before_broker_join(self):
+        events = []
+        broker = mock.Mock()
+        broker.start.return_value = None
+        broker.stop.side_effect = lambda: events.append("broker.stop") or True
+        mcp_http = mock.Mock()
+        mcp_http.start.return_value = None
+        mcp_http.request_stop.side_effect = lambda: events.append("mcp.request_stop")
+        mcp_http.stop.return_value = True
+        operator = mock.Mock()
+        operator.close.side_effect = lambda: events.append("operator.close") or True
+        operator.run_dashboard.side_effect = lambda stop, config: None
+
+        app = self._application(operator_interface=operator)
+        with (
+            mock.patch.object(application, "BrokerServer", return_value=broker),
+            mock.patch.object(application, "create_mcp_server", return_value=object()),
+            mock.patch.object(application, "EmbeddedMcpServer", return_value=mcp_http),
+        ):
+            self.assertEqual(app.run(), 0)
+
+        self.assertLess(events.index("mcp.request_stop"), events.index("operator.close"))
+        self.assertLess(events.index("operator.close"), events.index("broker.stop"))
+        operator.close.assert_called_once_with()
 
     def test_fake_mode_starts_broker_then_mcp_and_stops_in_reverse_order(self):
         events: list[str] = []

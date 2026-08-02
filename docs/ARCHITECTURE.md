@@ -347,6 +347,83 @@ bound terminal approval without opening SSH. An authorized context contains
 only the request digest and immutable plan, is consumed once, and multiple
 request-bound contexts may await parallel executor workers.
 
+## Operator-interface boundary
+
+`OperatorInterface` is the presentation-independent boundary between broker or
+executor work and operator interaction. `PlainTerminalInterface` is the only
+implementation in this phase. It preserves the line-oriented dashboard and
+the existing exact approval, SSH-retry, fallback, and machine-disable
+renderers. It continues to obtain decision bytes only from the controlling
+`/dev/tty` under `TerminalArbiter`; stdin, MCP/Unix-socket frames, request
+content, remote output, viewer pane content, rendered diagnostics, and pager
+return values are never input sources. No Textual dependency, alternate-screen
+mode, widget, or full-screen behavior exists in this phase.
+
+Workers submit immutable structured objects rather than presentation
+arguments:
+
+- `ExecutionApprovalPrompt` binds a fresh prompt ID, canonical request ID,
+  complete `RequestSpec`, command/script identity digest, client-request
+  digest, and the complete approved `ConnectionPlan` plus its digest. The
+  plan-less form is restricted to the nonremote `--fake` test backend.
+- `SshRetryPrompt` additionally binds the exact endpoint, failure detail,
+  truthful remote-mutation state, and retry digest.
+- `RouteFallbackPrompt` binds the failed endpoint, the immediately adjacent
+  approved fallback, failure detail, mutation state, and separate fallback
+  digest. Construction rejects a nonadjacent route or any state in which
+  remote mutation may have started.
+- `MachineDisablePrompt` binds the local mutation decision to the originating
+  request, approved plan, failure, machine, and proven pre-remote state.
+- `SecretInputAuthorizationPrompt` binds the exact request, machine/endpoint,
+  command or script, approved plan, and isolated viewer-session recipient. It
+  is a model and protocol method only in phase 1: the plain implementation
+  denies it, and the existing secret-input handoff is not redesigned here.
+- `OperationalActivity` carries a typed activity kind and optional canonical
+  request, machine, endpoint, and detail identities. Broker audit transitions
+  enter the interface's bounded history; startup and error events use the same
+  boundary for plain-terminal reporting.
+
+Every prompt constructor recalculates the established connection-plan digest
+and the exact client request/command identity. Missing, malformed, mismatched,
+or internally inconsistent fields are rejected before queuing. A prompt gets a
+cryptographically random process-local ID which may be submitted only once for
+the interface lifetime. Human-readable labels and rendered terminal text are
+never parsed to reconstruct these identities.
+
+### Queue and decision ownership
+
+`PromptQueue` is a mutex-protected FIFO. Submission receives a monotonically
+increasing sequence number while holding that mutex, so concurrent worker
+requests have one deterministic presentation order. Each queued item owns its
+own `PendingDecision` condition variable. The plain interface has one daemon
+presenter thread and is the sole queue consumer; workers wait only on the slot
+created for their exact prompt.
+
+An immutable `OperatorDecision` repeats the prompt ID and canonical binding
+digest in addition to Approved or Denied. `PendingDecision.resolve()` checks
+both values atomically and accepts only its first matching result. A second
+resolution, a decision for another request, a late decision for an earlier
+prompt, or reuse of any prior prompt ID is rejected without affecting the
+current prompt. Thus screen labels, queue position, short request IDs, or
+stale terminal actions cannot select a decision target.
+
+The foreground application owns the interface for the same lifetime as the
+broker and MCP listener. Shutdown first stops new MCP admissions, then closes
+the interface before joining broker workers. Queue close atomically resolves
+every active and queued slot as Denied and makes later submissions immediately
+Denied. Cancellation and worker abandonment use the same one-shot denial;
+presenter/render/input exceptions close the queue and deny all unresolved
+slots. Closing cannot interrupt a kernel-blocked `/dev/tty` read, so
+`PlainTerminalInterface.close()` may report an unjoined presenter thread, but
+the decision slots are already denied and application shutdown is reported
+unclean rather than approving or closing dependencies underneath it.
+
+OpenSSH first-master authentication and the current `SecretPromptPresenter`
+still use direct, arbiter-serialized external terminal ownership. The latter's
+request-bound authorization redesign belongs to #4 and the later terminal
+handoff phase; defining the fail-closed authorization model here does not make
+prompt-like remote output trusted or silently enable secret forwarding.
+
 ## Bounded command leases and retained transports
 
 `max_active_remote_commands` defaults to three and may be configured from one

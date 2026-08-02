@@ -17,6 +17,7 @@ from tmuxgate.broker import BrokerError, BrokerServer, _ClientSession
 from tmuxgate.client import BrokerConnectionError, submit_request
 from tmuxgate.fake import FakeExecution, ScriptedApprover, ScriptedFakeExecutor
 from tmuxgate.models import ExecutionMode, RequestSpec
+from tmuxgate.operator_interface import ActivityKind, OperationalActivity
 from tmuxgate.protocol import receive_frame, send_frame
 from tmuxgate.result import TransportStatus
 from tmuxgate.runtime import PeerCredentialError, create_broker_socket
@@ -145,7 +146,12 @@ class BrokerIntegrationTests(unittest.TestCase):
     def test_denial_returns_local_status_and_never_calls_executor(self):
         approver = ScriptedApprover([ApprovalDecision.DENIED])
         executor = ScriptedFakeExecutor([FakeExecution(stdout=b"must-not-run")])
-        server = self.start_server(approver, executor)
+        activity: list[OperationalActivity] = []
+        server = self.start_server(
+            approver,
+            executor,
+            activity_publisher=activity.append,
+        )
 
         result = submit_request(request("deny-me"), socket_path=self.socket_path)
 
@@ -156,6 +162,19 @@ class BrokerIntegrationTests(unittest.TestCase):
         self.assertLess(
             events.index("preapproval-status-written"),
             events.index("approval-begun"),
+        )
+        self.assertEqual(
+            [event.message for event in activity],
+            events,
+        )
+        self.assertTrue(
+            all(event.kind is ActivityKind.BROKER_AUDIT for event in activity)
+        )
+        self.assertTrue(
+            all(
+                event.request_id is None or len(event.request_id) == 32
+                for event in activity
+            )
         )
 
     def test_two_executions_progress_in_parallel_when_configured(self):
