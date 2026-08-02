@@ -116,9 +116,12 @@ def resolved(machine, endpoint, *, fingerprint="SHA256:synthetic"):
         host_key_evidence=evidence,
         proxy_jump=None,
         proxy_command=None,
-        identity_agent=None,
-        identity_files=("~/.ssh/id_ed25519",),
-        enabled_authentication_methods=("publickey", "password"),
+        identity_agent="none",
+        identity_files=("/home/example/.ssh/tmuxgate/app-server.ed25519",),
+        enabled_authentication_methods=(
+            "publickey", "password", "keyboard-interactive"
+        ),
+        post_enrollment_authentication_methods=("publickey",),
         ssh_g_output_sha256=(endpoint.id[0] * 64),
         ssh_policy_sha256=(endpoint.id[-1] * 64),
         ssh_g_argv=("/usr/bin/ssh", "-G", "--", machine.ssh_profile),
@@ -162,6 +165,29 @@ class ConnectionPlanTests(unittest.TestCase):
 
         changed = build_plan(resolver_override=changed_resolver)
         self.assertNotEqual(ordinary.plan_sha256, changed.plan_sha256)
+
+    def test_authentication_policy_change_invalidates_plan_and_approval(self):
+        ordinary = build_plan()
+        request = RequestSpec(
+            "app-server", ExecutionMode.ARGV, "/", argv=("true",)
+        )
+        replacements = (
+            {"identity_agent": "/tmp/unrelated-agent.sock"},
+            {"identity_files": ("/home/example/.ssh/id_other",)},
+            {"post_enrollment_authentication_methods": ("publickey", "password")},
+        )
+        for changes in replacements:
+            with self.subTest(changes=changes):
+                changed = build_plan(
+                    resolver_override=lambda machine, endpoint: replace(
+                        resolved(machine, endpoint), **changes
+                    )
+                )
+                self.assertNotEqual(ordinary.plan_sha256, changed.plan_sha256)
+                self.assertNotEqual(
+                    approval_binding_sha256(REQUEST_ID, request, ordinary),
+                    approval_binding_sha256(REQUEST_ID, request, changed),
+                )
 
     def test_any_eligible_fallback_resolution_failure_fails_whole_plan(self):
         def failing(machine, endpoint):
@@ -207,6 +233,16 @@ class BoundApprovalTests(unittest.TestCase):
         self.assertIn("route[0].endpoint_id: \"home-lan\"", document)
         self.assertIn("route[1].endpoint_id: \"wireguard\"", document)
         self.assertIn("SHA256:synthetic", document)
+        self.assertIn('route[0].identity_agent: "none"', document)
+        self.assertIn(
+            'route[0].post_enrollment_authentication_methods: "publickey"',
+            document,
+        )
+        self.assertIn(
+            'route[0].identity_file: '
+            '"/home/example/.ssh/tmuxgate/app-server.ed25519"',
+            document,
+        )
         self.assertIn("fallback_requires_new_terminal_confirmation: true", document)
         self.assertIn(approval_binding_sha256(REQUEST_ID, self.request, self.plan), document)
 

@@ -536,11 +536,12 @@ Separately, up to three authenticated `ssh -N` ControlMaster transports may
 remain idle. Reusing a transport never reuses request identity. Queued requests
 do not cause connection attempts, health probes, or reconnections.
 
-Before a machine's first master is authenticated, the broker creates a
+Before a machine's enrollment master is authenticated, the broker creates a
 dedicated per-machine Ed25519 key below the owner-only `~/.ssh/tmuxgate`
-directory. The first master may fall back to interactive password
-authentication. Over that verified master, the broker idempotently installs
-only the public key into the remote account's mode-`0600` `authorized_keys`.
+directory. This enrollment-only master may fall back to interactive password
+or keyboard-interactive authentication. It cannot run a requested command;
+over that verified master, the broker idempotently installs only the public key
+into the remote account's mode-`0600` `authorized_keys`.
 If the remote account deliberately exposes `authorized_keys` as a symlink,
 tmuxgate never writes through it. Enrollment succeeds only when the exact
 dedicated public key was already installed through a separately trusted
@@ -558,27 +559,41 @@ verification prevents same-endpoint retry and route fallback. The result uses
 `remote_setup_failure`, not `pre_remote_failure` or `incomplete`, and releases
 the in-memory command slot because no requested job was started; the durable
 audit record remains available.
-Subsequent masters explicitly select that key. Passwords and sudo credentials
-are never stored. Automatic viewer presentation forwards terminal input
-directly through tmux and SSH; tmuxgate does not read or retain those bytes.
+After the exact key is verified, the enrollment master is closed and its
+control socket is removed. A separate post-enrollment master must then
+authenticate with the dedicated public key alone before the request receives a
+transport lease. A missing or rejected key therefore fails closed instead of
+falling back to another workstation identity or password. Passwords and sudo
+credentials are never stored. Automatic viewer presentation forwards terminal
+input directly through tmux and SSH; tmuxgate does not read or retain those
+bytes.
 
 The transport implementation enforces the retention policy and
-exact broker-owned OpenSSH invocation plans. Initial master authentication is
-marked as broker-terminal interactive with `BatchMode=no`; health checks,
-control operations, and future machine-control channel prefixes force
-`BatchMode=yes`. Every path also sets `IdentitiesOnly=yes` with the dedicated
-per-machine key. Resolution requires that key to be the sole effective
-`IdentityFile` and rejects profile-added `CertificateFile` entries, preventing
-unrelated agent, default, or profile keys from exhausting a server's
-authentication-attempt limit. All of them explicitly override
-`RemoteCommand=none`, `RequestTTY=no`, `-T`, configured hostname/user/port,
-host-key alias, strict host-key policy, and known-host files. The pool
+exact broker-owned OpenSSH invocation plans. Enrollment authentication is
+broker-terminal interactive with `BatchMode=no` and an explicit preference for
+public-key, keyboard-interactive, then password authentication. The
+post-enrollment master, health checks, control operations, and machine-control
+channel prefixes force `BatchMode=yes`, `PreferredAuthentications=publickey`,
+and disable password and keyboard-interactive authentication. Every path sets
+`IdentityAgent=none`, `IdentitiesOnly=yes`, `PubkeyAuthentication=yes`, and
+disables GSSAPI and host-based authentication with the dedicated per-machine
+key. SSH resolution and execution environments omit `SSH_AUTH_SOCK`.
+Resolution requires the dedicated key to be the sole effective `IdentityFile`
+and rejects profile-added `CertificateFile` entries, preventing unrelated
+agent, default, or profile keys from broadening authentication. The versioned
+policy document binds both enrollment and post-enrollment method sets into
+`ssh_policy_sha256`; the resolved agent, identity file, enabled enrollment
+methods, policy digest, and exact `ssh -G` arguments are also part of the
+approval-bound resolved-identity digest. All invocation categories explicitly
+override `RemoteCommand=none`, `RequestTTY=no`, `-T`, configured
+hostname/user/port, host-key alias, strict host-key policy, and known-host files. The pool
 revalidates the complete resolved identity digest immediately before use. It
 retains at most three
 mode-`0600` sockets in the private control directory, multiplexes separately
 identified job leases on a machine transport, evicts only the least-recent
-idle transport, and reconnects expired masters
-through the interactive path. The subprocess backend is enabled only inside
+idle transport, and reconnects expired command masters through the same
+enrollment verification followed by public-key-only replacement. The
+subprocess backend is enabled only inside
 the broker process.
 
 OpenSSH owns its normal password/passphrase attempts and writes its diagnostic

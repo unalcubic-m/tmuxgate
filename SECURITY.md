@@ -79,6 +79,13 @@ The installer does not start, stop, or kill tmuxgate: all approval,
 authentication, recovery, attachment, and cleanup interaction remains owned by
 the foreground application and its controlling terminal.
 
+Normal command transports never inherit an SSH agent or permit password,
+keyboard-interactive, GSSAPI, or host-based fallback. The prompt-capable
+connection is limited to the dedicated-key enrollment protocol and is replaced
+by a public-key-only master before any requested command starts. Reports that
+show another identity or authentication method can influence a post-enrollment
+connection are security-boundary reports.
+
 Installation does not change `approval_mode`. When it is `disabled`, anyone
 who obtains the MCP token can submit commands without a per-request terminal
 approval. The installer refuses Codex integration in this condition unless the

@@ -183,7 +183,7 @@ def _ssh_executable(path: os.PathLike[str] | str) -> str:
 def _identity_options(
     resolved: ResolvedSshEndpoint,
     *,
-    batch_mode: bool,
+    enrollment: bool,
 ) -> tuple[str, ...]:
     user_known_hosts = " ".join(resolved.user_known_hosts_files)
     global_known_hosts = (
@@ -191,17 +191,37 @@ def _identity_options(
         if resolved.global_known_hosts_files
         else "none"
     )
+    authentication_options = (
+        (
+            "-o", "BatchMode=no",
+            "-o", "KbdInteractiveAuthentication=yes",
+            "-o", "PasswordAuthentication=yes",
+            "-o",
+            "PreferredAuthentications=publickey,keyboard-interactive,password",
+        )
+        if enrollment
+        else (
+            "-o", "BatchMode=yes",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "PasswordAuthentication=no",
+            "-o", "PreferredAuthentications=publickey",
+        )
+    )
     return (
-        "-o", f"BatchMode={'yes' if batch_mode else 'no'}",
+        *authentication_options,
         "-o", "CanonicalizeHostname=no",
         "-o", f"ConnectTimeout={resolved.connect_timeout_seconds}",
+        "-o", "GSSAPIAuthentication=no",
         "-o", f"GlobalKnownHostsFile={global_known_hosts}",
+        "-o", "HostbasedAuthentication=no",
         "-o", f"HostKeyAlias={resolved.host_key_alias}",
         "-o", f"HostName={resolved.resolved_hostname}",
+        "-o", "IdentityAgent=none",
         "-o", f"IdentityFile={default_tmuxgate_identity_file(resolved.machine_name)}",
         "-o", "IdentitiesOnly=yes",
         "-o", "PermitLocalCommand=no",
         "-o", f"Port={resolved.resolved_port}",
+        "-o", "PubkeyAuthentication=yes",
         "-o", "RemoteCommand=none",
         "-o", "RequestTTY=no",
         "-o", f"StrictHostKeyChecking={resolved.strict_host_key_checking}",
@@ -217,6 +237,36 @@ def build_master_start_invocation(
     control_persist_seconds: int,
     ssh_path: os.PathLike[str] | str = DEFAULT_SSH_PATH,
 ) -> SshInvocation:
+    if (
+        type(control_persist_seconds) is not int
+        or not 1 <= control_persist_seconds <= 86400
+    ):
+        raise ValueError("ControlPersist must be from 1 to 86400 seconds")
+    path = Path(control_path)
+    if not path.is_absolute():
+        raise TransportError("control path must be absolute")
+    argv = (
+        _ssh_executable(ssh_path),
+        "-M", "-N", "-f",
+        *_identity_options(resolved, enrollment=False),
+        "-o", "ClearAllForwardings=yes",
+        "-o", "ControlMaster=yes",
+        "-o", f"ControlPath={path}",
+        "-o", f"ControlPersist={control_persist_seconds}",
+        "-T", "--", resolved.ssh_profile,
+    )
+    return SshInvocation("start-master", argv, False)
+
+
+def build_enrollment_master_start_invocation(
+    resolved: ResolvedSshEndpoint,
+    control_path: os.PathLike[str] | str,
+    *,
+    control_persist_seconds: int,
+    ssh_path: os.PathLike[str] | str = DEFAULT_SSH_PATH,
+) -> SshInvocation:
+    """Build the prompt-capable master used only to verify or enroll the key."""
+
     if type(control_persist_seconds) is not int or not 1 <= control_persist_seconds <= 86400:
         raise ValueError("ControlPersist must be from 1 to 86400 seconds")
     path = Path(control_path)
@@ -225,14 +275,14 @@ def build_master_start_invocation(
     argv = (
         _ssh_executable(ssh_path),
         "-M", "-N", "-f",
-        *_identity_options(resolved, batch_mode=False),
+        *_identity_options(resolved, enrollment=True),
         "-o", "ClearAllForwardings=yes",
         "-o", "ControlMaster=yes",
         "-o", f"ControlPath={path}",
         "-o", f"ControlPersist={control_persist_seconds}",
         "-T", "--", resolved.ssh_profile,
     )
-    return SshInvocation("start-master", argv, True)
+    return SshInvocation("start-enrollment-master", argv, True)
 
 
 def build_master_control_invocation(
@@ -251,7 +301,7 @@ def build_master_control_invocation(
         _ssh_executable(ssh_path),
         "-S", os.fspath(path),
         "-O", operation,
-        *_identity_options(resolved, batch_mode=True),
+        *_identity_options(resolved, enrollment=False),
         "-T", "--", resolved.ssh_profile,
     )
     return SshInvocation(f"master-{operation}", argv, False)
@@ -271,7 +321,7 @@ def build_batch_channel_prefix(
     argv = (
         _ssh_executable(ssh_path),
         "-S", os.fspath(path),
-        *_identity_options(resolved, batch_mode=True),
+        *_identity_options(resolved, enrollment=False),
         "-o", "ControlMaster=no",
         "-T", "--", resolved.ssh_profile,
     )
@@ -292,7 +342,7 @@ def build_viewer_channel_prefix(
     argv = (
         _ssh_executable(ssh_path),
         "-S", os.fspath(path),
-        *_identity_options(resolved, batch_mode=True),
+        *_identity_options(resolved, enrollment=False),
         "-o", "ControlMaster=no",
         "-o", "RemoteCommand=none",
         "-tt", "--", resolved.ssh_profile,
@@ -543,9 +593,13 @@ class MasterTransportPool:
                 path = self._control_path(authorization.machine_name, identity_digest)
                 if path.exists() or path.is_symlink():
                     raise TransportError("refusing a pre-existing master control path")
-                start = build_master_start_invocation(
-                    current,
-                    path,
+                start_builder = (
+                    build_enrollment_master_start_invocation
+                    if self.key_manager is not None
+                    else build_master_start_invocation
+                )
+                start = start_builder(
+                    current, path,
                     control_persist_seconds=self.idle_timeout_seconds,
                 )
                 master_started = False
@@ -590,6 +644,31 @@ class MasterTransportPool:
                         elif outcome is not KeyEnrollmentOutcome.ALREADY_PRESENT:
                             raise TransportError(
                                 "key manager returned an invalid enrollment outcome"
+                            )
+                        stop = build_master_control_invocation(
+                            current, path, "exit"
+                        )
+                        self.backend.stop_master(stop, path)
+                        master_started = False
+                        self._remove_socket_if_safe(path)
+
+                        strict_start = build_master_start_invocation(
+                            current,
+                            path,
+                            control_persist_seconds=self.idle_timeout_seconds,
+                        )
+                        self.backend.start_master(strict_start, path)
+                        master_started = True
+                        if not self._control_socket_present(path):
+                            raise TransportError(
+                                "post-enrollment master did not create its control socket"
+                            )
+                        strict_check = build_master_control_invocation(
+                            current, path, "check"
+                        )
+                        if not self.backend.check_master(strict_check, path):
+                            raise TransportError(
+                                "post-enrollment SSH master failed its control check"
                             )
                 except BaseException as exc:
                     should_stop = master_started
