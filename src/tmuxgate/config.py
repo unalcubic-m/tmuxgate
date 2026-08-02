@@ -21,6 +21,10 @@ _MAC_RE = re.compile(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\Z", re.ASCII)
 _USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}\Z", re.ASCII)
 MCP_LOOPBACK_HOST = "127.0.0.1"
 MCP_DEFAULT_PORT = 8765
+DEFAULT_RESULT_STREAM_BYTES = 256 * 1024 * 1024
+DEFAULT_TOTAL_RESULT_BYTES = 2 * DEFAULT_RESULT_STREAM_BYTES
+DEFAULT_AGGREGATE_COLLECTION_BYTES = 3 * DEFAULT_TOTAL_RESULT_BYTES
+MAX_CONFIGURED_RESULT_BYTES = 1024 * 1024 * 1024 * 1024
 
 
 class ConfigError(ValueError):
@@ -69,6 +73,41 @@ class McpConfig:
             )
         if type(self.port) is not int or not 1 <= self.port <= 65535:
             raise ConfigError("mcp.port must be between 1 and 65535")
+
+
+@dataclass(frozen=True, slots=True)
+class ResultLimits:
+    """Resource ceilings applied before and during remote result collection."""
+
+    max_stdout_bytes: int = DEFAULT_RESULT_STREAM_BYTES
+    max_stderr_bytes: int = DEFAULT_RESULT_STREAM_BYTES
+    max_total_result_bytes: int = DEFAULT_TOTAL_RESULT_BYTES
+    max_local_collection_bytes: int = DEFAULT_TOTAL_RESULT_BYTES
+    max_remote_capture_bytes: int = DEFAULT_TOTAL_RESULT_BYTES
+    max_aggregate_collection_bytes: int = DEFAULT_AGGREGATE_COLLECTION_BYTES
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_stdout_bytes", self.max_stdout_bytes),
+            ("max_stderr_bytes", self.max_stderr_bytes),
+            ("max_total_result_bytes", self.max_total_result_bytes),
+            ("max_local_collection_bytes", self.max_local_collection_bytes),
+            ("max_remote_capture_bytes", self.max_remote_capture_bytes),
+            ("max_aggregate_collection_bytes", self.max_aggregate_collection_bytes),
+        ):
+            maximum = (
+                DEFAULT_RESULT_STREAM_BYTES
+                if name in {"max_stdout_bytes", "max_stderr_bytes"}
+                else MAX_CONFIGURED_RESULT_BYTES
+            )
+            if (
+                type(value) is not int
+                or not 1 <= value <= maximum
+            ):
+                raise ConfigError(
+                    f"limits.{name} must be between 1 and "
+                    f"{maximum}"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +165,7 @@ class AppConfig:
     wireguard: WireGuardContext | None
     machines: Mapping[str, Machine]
     mcp: McpConfig = McpConfig()
+    limits: ResultLimits = ResultLimits()
 
 
 def default_config_path() -> Path:
@@ -250,6 +290,34 @@ def _parse_mcp(raw: object) -> McpConfig:
         )
     port = _integer(table.get("port", MCP_DEFAULT_PORT), "mcp.port", 1, 65535)
     return McpConfig(host=host, port=port)
+
+
+def _parse_result_limits(raw: object) -> ResultLimits:
+    table = _table(raw, "limits")
+    fields = {
+        "max_stdout_bytes",
+        "max_stderr_bytes",
+        "max_total_result_bytes",
+        "max_local_collection_bytes",
+        "max_remote_capture_bytes",
+        "max_aggregate_collection_bytes",
+    }
+    _only(table, fields, "limits")
+    defaults = ResultLimits()
+    values = {}
+    for name in fields:
+        maximum = (
+            DEFAULT_RESULT_STREAM_BYTES
+            if name in {"max_stdout_bytes", "max_stderr_bytes"}
+            else MAX_CONFIGURED_RESULT_BYTES
+        )
+        values[name] = _integer(
+            table.get(name, getattr(defaults, name)),
+            f"limits.{name}",
+            1,
+            maximum,
+        )
+    return ResultLimits(**values)
 
 
 def _parse_home(raw: object) -> HomeContext:
@@ -425,10 +493,11 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
         raise ConfigError("configuration version must equal 1 or 2")
     allowed = {"version", "broker", "contexts", "machines"}
     if version == 2:
-        allowed.add("mcp")
+        allowed.update({"mcp", "limits"})
     _only(table, allowed, "configuration")
     broker = _parse_broker(table.get("broker", {}))
     mcp = _parse_mcp(table.get("mcp", {}))
+    limits = _parse_result_limits(table.get("limits", {}))
     contexts = _table(table.get("contexts", {}), "contexts")
     _only(contexts, {"home", "wireguard"}, "contexts")
     home = _parse_home(contexts["home"]) if "home" in contexts else None
@@ -443,7 +512,7 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
     # Version 1 is accepted as an input compatibility format.  The in-memory
     # model is normalized to the current schema so subsequent managed writes
     # publish version 2 rather than preserving the legacy format.
-    return AppConfig(2, broker, home, wireguard, machines, mcp)
+    return AppConfig(2, broker, home, wireguard, machines, mcp, limits)
 
 
 def _open_secure_config(path: Path):

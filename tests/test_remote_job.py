@@ -219,6 +219,71 @@ class RemoteJobCoordinatorTests(unittest.TestCase):
 
 
 class RemoteRunnerTests(unittest.TestCase):
+    def test_runner_enforces_stream_and_total_capture_limits(self):
+        runner = Path(__file__).parents[1] / "src/tmuxgate/assets/remote_runner.sh"
+        cases = (
+            ("below", 2, 2, 3, 3, 5, True),
+            ("exact", 3, 3, 3, 3, 6, True),
+            ("stdout-over", 4, 0, 3, 3, 6, False),
+            ("stderr-over", 0, 4, 3, 3, 6, False),
+            ("total-over", 3, 4, 4, 4, 6, False),
+        )
+        for name, stdout_size, stderr_size, stdout_limit, stderr_limit, total, succeeds in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory) / "home"
+                job = home / ".cache/tmuxgate/jobs" / REQUEST_ID
+                job.mkdir(parents=True, mode=0o700)
+                command = (
+                    f"head -c {stdout_size} /dev/zero; "
+                    f"head -c {stderr_size} /dev/zero >&2"
+                ).encode("ascii")
+                files = {
+                    "mode": b"exec\n",
+                    "cwd.bin": os.fsencode(str(job)) + b"\0",
+                    "environment.bin": b"",
+                    "timeout": b"5\n",
+                    "result-limits": (
+                        f"{stdout_limit}\n{stderr_limit}\n{total}\n"
+                    ).encode("ascii"),
+                    "argv.bin": b"/bin/bash\0-c\0" + command + b"\0",
+                }
+                for filename, content in files.items():
+                    path = job / filename
+                    path.write_bytes(content)
+                    path.chmod(0o600)
+                fake_tmux = Path(directory) / "fake-tmux"
+                fake_tmux.write_text(
+                    "#!/bin/sh\n[ \"$1\" = wait-for ] || exit 99\nexit 0\n",
+                    encoding="ascii",
+                )
+                fake_tmux.chmod(0o700)
+                completed = subprocess.run(
+                    [
+                        "/bin/bash",
+                        str(runner),
+                        str(job),
+                        f"tmuxgate-start-{REQUEST_ID}",
+                        str(fake_tmux),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                    timeout=5,
+                    check=False,
+                )
+                if succeeds:
+                    self.assertEqual(completed.returncode, 0)
+                    self.assertEqual((job / "state").read_bytes(), b"complete\n")
+                    self.assertTrue((job / "exit-code").exists())
+                else:
+                    self.assertEqual(completed.returncode, 125)
+                    self.assertEqual(
+                        (job / "state").read_bytes(),
+                        b"capture-limit-exceeded\n",
+                    )
+                    self.assertFalse((job / "exit-code").exists())
+
     def test_runner_captures_streams_separately_and_preserves_exit_status(self):
         runner = Path(__file__).parents[1] / "src/tmuxgate/assets/remote_runner.sh"
         with tempfile.TemporaryDirectory() as directory:
@@ -229,6 +294,7 @@ class RemoteRunnerTests(unittest.TestCase):
             (job / "cwd.bin").write_bytes(os.fsencode(str(job)) + b"\0")
             (job / "environment.bin").write_bytes(b"TMUXGATE_TEST\0value\0")
             (job / "timeout").write_bytes(b"")
+            (job / "result-limits").write_bytes(b"1048576\n1048576\n2097152\n")
             argv = (
                 b"/bin/bash",
                 b"-c",
@@ -240,6 +306,7 @@ class RemoteRunnerTests(unittest.TestCase):
                 job / "cwd.bin",
                 job / "environment.bin",
                 job / "timeout",
+                job / "result-limits",
                 job / "argv.bin",
             ):
                 path.chmod(0o600)
@@ -288,6 +355,7 @@ class RemoteRunnerTests(unittest.TestCase):
                 "cwd.bin": os.fsencode(str(requested_cwd)) + b"\0",
                 "environment.bin": b"",
                 "timeout": b"5\n",
+                "result-limits": b"1048576\n1048576\n2097152\n",
                 "payload.sh": b"printf 'cwd=%s\\n' \"$PWD\"\nexit 7\n",
             }
             for name, content in files.items():
@@ -332,6 +400,7 @@ class RemoteRunnerTests(unittest.TestCase):
                 "cwd.bin": os.fsencode(str(job)) + b"\0",
                 "environment.bin": b"",
                 "timeout": b"",
+                "result-limits": b"1048576\n1048576\n2097152\n",
                 "argv.bin": b"/bin/true\0",
             }
             for name, content in files.items():
@@ -396,6 +465,7 @@ class RemoteRunnerTests(unittest.TestCase):
                 "cwd.bin": os.fsencode(str(job)) + b"\0",
                 "environment.bin": environment_bytes,
                 "timeout": b"5\n",
+                "result-limits": b"1048576\n1048576\n2097152\n",
                 "argv.bin": b"/usr/bin/env\0-0\0",
             }
             for name, content in files.items():
@@ -465,6 +535,7 @@ class RemoteRunnerTests(unittest.TestCase):
                     "cwd.bin": os.fsencode(str(job)) + b"\0",
                     "environment.bin": environment_bytes,
                     "timeout": b"5\n",
+                    "result-limits": b"1048576\n1048576\n2097152\n",
                 }
                 if mode == "exec":
                     files["argv.bin"] = b"/usr/bin/env\0-0\0"

@@ -180,6 +180,28 @@ source bytes from one secure open, rejects any concurrent byte-level change,
 and fsyncs an owned private copy of the validated editor output before atomic
 publication. It does not itself upgrade the schema version.
 
+Version 2 also accepts optional exact byte ceilings for result capture and
+collection. The defaults preserve the existing 256 MiB per-stream protocol
+ceiling while adding explicit total, local-temporary, remote-capture, and
+aggregate-concurrency bounds:
+
+```toml
+[limits]
+max_stdout_bytes = 268435456
+max_stderr_bytes = 268435456
+max_total_result_bytes = 536870912
+max_local_collection_bytes = 536870912
+max_remote_capture_bytes = 536870912
+max_aggregate_collection_bytes = 1610612736
+```
+
+A stream or total exactly at its limit is accepted. One byte over fails closed:
+the remote runner does not publish completion, the local collector does not
+publish a verified spool, and the durable request remains recovery-required.
+Lower limits are useful on constrained hosts. Managed configuration writes
+preserve the configured values and materialize defaults when the table was
+previously omitted.
+
 Structured configuration commands remain available:
 
 ```bash

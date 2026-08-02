@@ -32,7 +32,11 @@ from tmuxgate.operator_interface import (
     require_operator_decision,
 )
 from tmuxgate.planning import BoundRequestPlanner
-from tmuxgate.real_remote import RealRemoteJobBackend
+from tmuxgate.real_remote import (
+    LocalCollectionBudget,
+    RealRemoteJobBackend,
+    prepare_collection_directory,
+)
 from tmuxgate.real_ssh import (
     SecretPromptPresenter,
     SshChannelRunner,
@@ -294,6 +298,12 @@ class UnifiedApplication:
 
                 resources.callback(close_prompt_presenter)
                 channels = SshChannelRunner(prompt_presenter=prompt_presenter)
+                collection_dir = prepare_collection_directory(
+                    paths.state_dir / "collections"
+                )
+                collection_budget = LocalCollectionBudget(
+                    config.limits.max_aggregate_collection_bytes
+                )
 
                 def machine_disabler(machine_name: str) -> None:
                     def persist(name: str, expected_machine: Machine) -> None:
@@ -316,6 +326,9 @@ class UnifiedApplication:
                         transport,
                         channels=channels,
                         viewer_dir=paths.viewer_dir,
+                        collection_dir=collection_dir,
+                        limits=config.limits,
+                        collection_budget=collection_budget,
                     ),
                     machine_disabler=machine_disabler,
                     machine_enabled=availability.is_enabled,

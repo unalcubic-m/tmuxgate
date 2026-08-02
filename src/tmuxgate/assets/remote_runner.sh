@@ -26,7 +26,7 @@ if [ "$(/usr/bin/stat -c '%a:%u' "$job_dir")" != "700:$(/usr/bin/id -u)" ]; then
 fi
 cd "$job_dir" || exit 125
 
-for required in mode cwd.bin environment.bin timeout; do
+for required in mode cwd.bin environment.bin timeout result-limits; do
     if [ ! -f "$required" ] || [ -L "$required" ]; then
         echo "tmuxgate runner missing $required" >&2
         exit 125
@@ -75,6 +75,22 @@ if [ -n "$timeout_seconds" ] && [[ ! $timeout_seconds =~ ^[1-9][0-9]*$ ]]; then
     exit 125
 fi
 
+mapfile -t result_limits < result-limits
+if [ "${#result_limits[@]}" -ne 3 ]; then
+    echo 'tmuxgate runner refused result limits' >&2
+    exit 125
+fi
+stdout_limit=${result_limits[0]}
+stderr_limit=${result_limits[1]}
+remote_capture_limit=${result_limits[2]}
+for limit in "$stdout_limit" "$stderr_limit" "$remote_capture_limit"; do
+    if [[ ! $limit =~ ^[1-9][0-9]*$ ]]; then
+        echo 'tmuxgate runner refused result limits' >&2
+        exit 125
+    fi
+done
+unset result_limits limit
+
 /usr/bin/rm -f -- stdout.fifo stderr.fifo
 /usr/bin/mkfifo -m 600 stdout.fifo stderr.fifo || exit 125
 : > stdout.raw
@@ -83,6 +99,7 @@ printf '%s\n' gated > state
 runner_complete=0
 cleanup_runner() {
     set +e
+    if [ -n "${quota_monitor:-}" ]; then kill "$quota_monitor" 2>/dev/null; wait "$quota_monitor" 2>/dev/null; fi
     if [ -n "${stdout_tee:-}" ]; then kill "$stdout_tee" 2>/dev/null; wait "$stdout_tee" 2>/dev/null; fi
     if [ -n "${stderr_tee:-}" ]; then kill "$stderr_tee" 2>/dev/null; wait "$stderr_tee" 2>/dev/null; fi
     /usr/bin/rm -f -- stdout.fifo stderr.fifo
@@ -94,10 +111,30 @@ cleanup_runner() {
 }
 trap cleanup_runner EXIT
 trap 'exit 125' HUP INT TERM
-/usr/bin/tee stdout.raw < stdout.fifo &
+capture_stream() {
+    set -o pipefail
+    /usr/bin/head -c "$(( $1 + 1 ))" | /usr/bin/tee "$2"
+}
+capture_stream "$stdout_limit" stdout.raw < stdout.fifo &
 stdout_tee=$!
-/usr/bin/tee stderr.raw < stderr.fifo >&2 &
+capture_stream "$stderr_limit" stderr.raw < stderr.fifo >&2 &
 stderr_tee=$!
+
+monitor_capture_limit() {
+    monitored_pid=$1
+    while /bin/kill -0 "$monitored_pid" 2>/dev/null; do
+        stdout_size=$(/usr/bin/stat -c '%s' stdout.raw 2>/dev/null) || stdout_size=0
+        stderr_size=$(/usr/bin/stat -c '%s' stderr.raw 2>/dev/null) || stderr_size=0
+        if [ "$stdout_size" -gt "$stdout_limit" ] || \
+           [ "$stderr_size" -gt "$stderr_limit" ] || \
+           [ "$((stdout_size + stderr_size))" -gt "$remote_capture_limit" ]; then
+            : > capture-limit-exceeded
+            /bin/kill "$monitored_pid" "$stdout_tee" "$stderr_tee" 2>/dev/null || true
+            return 0
+        fi
+        /usr/bin/sleep 0.05
+    done
+}
 
 "$tmux_bin" wait-for "$wait_channel" || exit 125
 printf '%s\n' running > state
@@ -115,12 +152,17 @@ if [ "$mode" = exec ]; then
         if [ -n "$timeout_seconds" ]; then
             (cd "$cwd" && /usr/bin/timeout --foreground --kill-after=5s \
                 "$timeout_seconds" "${submitted_command[@]}") \
-                > stdout.fifo 2> stderr.fifo
+                > stdout.fifo 2> stderr.fifo &
         else
             (cd "$cwd" && "${submitted_command[@]}") \
-                > stdout.fifo 2> stderr.fifo
+                > stdout.fifo 2> stderr.fifo &
         fi
+        command_pid=$!
+        monitor_capture_limit "$command_pid" & quota_monitor=$!
+        wait "$command_pid"
         command_rc=$?
+        kill "$quota_monitor" 2>/dev/null; wait "$quota_monitor" 2>/dev/null
+        quota_monitor=''
     fi
 else
     submitted_command=(
@@ -131,16 +173,33 @@ else
     if [ -n "$timeout_seconds" ]; then
         (cd "$cwd" && /usr/bin/timeout --foreground --kill-after=5s \
             "$timeout_seconds" "${submitted_command[@]}") \
-            > stdout.fifo 2> stderr.fifo
+            > stdout.fifo 2> stderr.fifo &
     else
         (cd "$cwd" && "${submitted_command[@]}") \
-            > stdout.fifo 2> stderr.fifo
+            > stdout.fifo 2> stderr.fifo &
     fi
+    command_pid=$!
+    monitor_capture_limit "$command_pid" & quota_monitor=$!
+    wait "$command_pid"
     command_rc=$?
+    kill "$quota_monitor" 2>/dev/null; wait "$quota_monitor" 2>/dev/null
+    quota_monitor=''
 fi
 wait "$stdout_tee"; stdout_tee_rc=$?; stdout_tee=''
 wait "$stderr_tee"; stderr_tee_rc=$?; stderr_tee=''
 /usr/bin/rm -f -- stdout.fifo stderr.fifo
+stdout_size=$(/usr/bin/stat -c '%s' stdout.raw) || exit 125
+stderr_size=$(/usr/bin/stat -c '%s' stderr.raw) || exit 125
+if [ -f capture-limit-exceeded ] || \
+   [ "$stdout_size" -gt "$stdout_limit" ] || \
+   [ "$stderr_size" -gt "$stderr_limit" ] || \
+   [ "$((stdout_size + stderr_size))" -gt "$remote_capture_limit" ]; then
+    /usr/bin/rm -f -- capture-limit-exceeded
+    printf '%s\n' capture-limit-exceeded > state.tmp
+    /usr/bin/mv -f -- state.tmp state
+    runner_complete=1
+    exit 125
+fi
 if [ "$stdout_tee_rc" -ne 0 ] || [ "$stderr_tee_rc" -ne 0 ]; then
     printf '%s\n' capture-incomplete > state
     exit 125

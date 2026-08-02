@@ -8,6 +8,7 @@ from tmuxgate.config import (
     BrokerConfig,
     ConfigError,
     McpConfig,
+    ResultLimits,
     load_config,
     parse_config,
 )
@@ -77,6 +78,33 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.version, 2)
         self.assertEqual(config.mcp.port, 9876)
 
+    def test_result_limits_default_and_validate_exact_byte_ceilings(self):
+        self.assertEqual(parse_config(valid_config()).limits, ResultLimits())
+        data = valid_config()
+        data["version"] = 2
+        data["limits"] = {
+            "max_stdout_bytes": 10,
+            "max_stderr_bytes": 11,
+            "max_total_result_bytes": 20,
+            "max_local_collection_bytes": 19,
+            "max_remote_capture_bytes": 18,
+            "max_aggregate_collection_bytes": 40,
+        }
+        limits = parse_config(data).limits
+        self.assertEqual(limits.max_stdout_bytes, 10)
+        self.assertEqual(limits.max_aggregate_collection_bytes, 40)
+
+        for invalid in (True, 0, -1, "10"):
+            with self.subTest(invalid=invalid):
+                data["limits"]["max_stdout_bytes"] = invalid
+                with self.assertRaisesRegex(ConfigError, "limits.max_stdout_bytes"):
+                    parse_config(data)
+        with self.assertRaisesRegex(ConfigError, "unknown.*limits"):
+            invalid_data = valid_config()
+            invalid_data["version"] = 2
+            invalid_data["limits"] = {"unknown": 1}
+            parse_config(invalid_data)
+
     def test_mcp_listener_is_restricted_to_literal_ipv4_loopback(self):
         for host in ("localhost", "::1", "0.0.0.0", "127.0.0.2"):
             with self.subTest(host=host):
@@ -106,6 +134,10 @@ class ConfigTests(unittest.TestCase):
         data = valid_config()
         data["mcp"] = {"host": "127.0.0.1", "port": 8765}
         with self.assertRaisesRegex(ConfigError, "mcp"):
+            parse_config(data)
+        data = valid_config()
+        data["limits"] = {"max_stdout_bytes": 1}
+        with self.assertRaisesRegex(ConfigError, "limits"):
             parse_config(data)
 
     def test_valid_config_supports_three_commands_and_three_masters(self):

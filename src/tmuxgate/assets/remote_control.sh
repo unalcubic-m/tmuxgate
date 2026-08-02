@@ -53,7 +53,7 @@ fi
 
 case "$operation" in
     validate)
-        for required in mode cwd.bin environment.bin timeout remote_runner.sh remote_control.sh; do
+        for required in mode cwd.bin environment.bin timeout result-limits remote_runner.sh remote_control.sh; do
             safe_file "$required" || {
                 echo "tmuxgate control refused unsafe $required" >&2
                 exit 125
@@ -99,7 +99,8 @@ case "$operation" in
         stdout_sha256=
         stderr_sha256=
         if [ "$gate_released" -eq 1 ] &&
-           [ "$state" != complete ] && [ "$state" != capture-incomplete ]; then
+           [ "$state" != complete ] && [ "$state" != capture-incomplete ] &&
+           [ "$state" != capture-limit-exceeded ]; then
             command_running=1
         fi
         if [ "$state" = complete ] && safe_file exit-code &&
@@ -144,13 +145,16 @@ case "$operation" in
         }
         exec "$tmux_bin" attach-session -t "$session"
         ;;
-    collect)
+    collect-stdout|collect-stderr)
         [ "$(read_state)" = complete ] && [ "$attached" -eq 0 ] ||
             { echo 'tmuxgate collection requires complete detached job' >&2; exit 125; }
         for required in stdout.raw stderr.raw exit-code state; do
             safe_file "$required" || exit 125
         done
-        exec tar -cf - -C "$job_dir" stdout.raw stderr.raw exit-code state
+        case "$operation" in
+            collect-stdout) exec /bin/cat -- "$job_dir/stdout.raw" ;;
+            collect-stderr) exec /bin/cat -- "$job_dir/stderr.raw" ;;
+        esac
         ;;
     cleanup)
         [ "$(read_state)" = complete ] && [ "$attached" -eq 0 ] ||
@@ -162,7 +166,7 @@ case "$operation" in
             [ -e "$entry" ] || continue
             name=${entry##*/}
             case "$name" in
-                mode|cwd.bin|environment.bin|timeout|argv.bin|payload.sh|remote_runner.sh|remote_control.sh|stdout.raw|stderr.raw|state|exit-code|gate-released)
+                mode|cwd.bin|environment.bin|timeout|result-limits|argv.bin|payload.sh|remote_runner.sh|remote_control.sh|stdout.raw|stderr.raw|state|exit-code|gate-released)
                     [ -f "$entry" ] && [ ! -L "$entry" ] || exit 125
                     ;;
                 *)
@@ -173,7 +177,8 @@ case "$operation" in
         done
         rm -f -- \
             "$job_dir/mode" "$job_dir/cwd.bin" "$job_dir/environment.bin" \
-            "$job_dir/timeout" "$job_dir/argv.bin" "$job_dir/payload.sh" \
+            "$job_dir/timeout" "$job_dir/result-limits" \
+            "$job_dir/argv.bin" "$job_dir/payload.sh" \
             "$job_dir/remote_runner.sh" "$job_dir/remote_control.sh" \
             "$job_dir/stdout.raw" "$job_dir/stderr.raw" "$job_dir/state" \
             "$job_dir/exit-code" "$job_dir/gate-released"

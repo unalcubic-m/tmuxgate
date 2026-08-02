@@ -14,6 +14,15 @@ approval_mode = "always"
 host = "127.0.0.1"
 port = 8765
 
+[limits]
+# Exact byte ceilings. Output at a limit is accepted; one byte over fails closed.
+max_stdout_bytes = 268435456
+max_stderr_bytes = 268435456
+max_total_result_bytes = 536870912
+max_local_collection_bytes = 536870912
+max_remote_capture_bytes = 536870912
+max_aggregate_collection_bytes = 1610612736
+
 [contexts.home]
 gateway = "192.0.2.1"
 source_cidr = "192.0.2.0/24"

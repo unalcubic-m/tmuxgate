@@ -19,6 +19,7 @@ from tmuxgate.operator_interface import (
 )
 from tmuxgate.planning import BoundRequestPlanner
 from tmuxgate.remote_job import (
+    CollectedRemoteFiles,
     RemoteJob,
     RemoteJobCoordinator,
     RemoteJobError,
@@ -520,12 +521,27 @@ class RealExecutor:
                     pass
             armed = self.state.mark_terminal_restored(armed)
             collected = coordinator.collect(job)
-            spooled = self.spool.store(
-                request_id,
-                collected.stdout,
-                collected.stderr,
-                collected.exit_status,
-            )
+            if isinstance(collected, CollectedRemoteFiles):
+                try:
+                    spooled = self.spool.store_files(
+                        request_id,
+                        collected.stdout_path,
+                        collected.stderr_path,
+                        stdout_size=collected.stdout_size,
+                        stdout_sha256=collected.stdout_sha256,
+                        stderr_size=collected.stderr_size,
+                        stderr_sha256=collected.stderr_sha256,
+                        exit_status=collected.exit_status,
+                    )
+                finally:
+                    collected.close()
+            else:
+                spooled = self.spool.store(
+                    request_id,
+                    collected.stdout,
+                    collected.stderr,
+                    collected.exit_status,
+                )
             armed = self.state.mark_local_spool_verified(
                 armed,
                 manifest_sha256=spooled.manifest_payload_sha256,

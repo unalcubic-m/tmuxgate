@@ -9,7 +9,7 @@ import time
 import unittest
 
 from tmuxgate.models import ExecutionMode, RequestSpec
-from tmuxgate.real_remote import RealRemoteJobBackend, build_stage_archive
+from tmuxgate.real_remote import build_stage_archive
 
 
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
@@ -121,15 +121,24 @@ class LocalRealTmuxIntegrationTests(unittest.TestCase):
                     stderr=subprocess.DEVNULL,
                 )
                 self.assertNotEqual(ended.returncode, 0)
-                collected = run("collect")
-                self.assertEqual(collected.returncode, 0, collected.stderr)
-                result = RealRemoteJobBackend._parse_collection(collected.stdout)
+                collected_stdout = run("collect-stdout")
+                collected_stderr = run("collect-stderr")
                 self.assertEqual(
-                    (result.stdout, result.stderr, result.exit_status),
+                    collected_stdout.returncode, 0, collected_stdout.stderr
+                )
+                self.assertEqual(
+                    collected_stderr.returncode, 0, collected_stderr.stderr
+                )
+                self.assertEqual(
+                    (
+                        collected_stdout.stdout,
+                        collected_stderr.stdout,
+                        b"exit_status=7\n" in observed.stdout,
+                    ),
                     (
                         b"stdout-path=/request-controlled-path\n",
                         b"stderr-line\n",
-                        7,
+                        True,
                     ),
                 )
                 self.assertEqual(run("cleanup").returncode, 0)

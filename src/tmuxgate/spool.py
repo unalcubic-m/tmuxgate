@@ -222,6 +222,71 @@ class ResultSpool:
         finally:
             os.close(descriptor)
 
+    def _copy_private_file(
+        self,
+        directory_fd: int,
+        name: str,
+        source_path: Path,
+        *,
+        expected_size: int,
+        expected_sha256: str,
+    ) -> None:
+        source_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            source = os.open(source_path, source_flags)
+        except OSError as exc:
+            raise SpoolError(f"cannot safely open collected {name}") from exc
+        destination_flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        destination = -1
+        try:
+            metadata = os.fstat(source)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != self.expected_uid
+                or stat.S_IMODE(metadata.st_mode) != SPOOL_FILE_MODE
+                or metadata.st_size != expected_size
+            ):
+                raise SpoolError(f"collected {name} metadata is unsafe or changed")
+            destination = os.open(
+                name,
+                destination_flags,
+                SPOOL_FILE_MODE,
+                dir_fd=directory_fd,
+            )
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                block = os.read(source, SPOOL_STREAM_READ_BYTES)
+                if not block:
+                    break
+                if size + len(block) > expected_size:
+                    raise SpoolError(f"collected {name} changed while publishing")
+                offset = 0
+                while offset < len(block):
+                    written = os.write(destination, block[offset:])
+                    if written <= 0:
+                        raise SpoolError("result spool write made no progress")
+                    offset += written
+                digest.update(block)
+                size += len(block)
+            if size != expected_size or digest.hexdigest() != expected_sha256:
+                raise SpoolError(f"collected {name} does not match receive evidence")
+            os.fsync(destination)
+        finally:
+            if destination >= 0:
+                os.close(destination)
+            os.close(source)
+
     def _read_file(self, directory_fd: int, name: str, maximum: int) -> bytes:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -433,6 +498,28 @@ class ResultSpool:
         envelope = {"payload": payload, "sha256": digest}
         return _canonical_json(envelope) + b"\n", digest
 
+    @staticmethod
+    def _manifest_from_metadata(
+        request_id: str,
+        *,
+        stdout_size: int,
+        stdout_sha256: str,
+        stderr_size: int,
+        stderr_sha256: str,
+        exit_status: int,
+    ) -> tuple[bytes, str]:
+        payload = {
+            "exit_status": exit_status,
+            "request_id": request_id,
+            "spool_version": SPOOL_FORMAT_VERSION,
+            "stderr_sha256": stderr_sha256,
+            "stderr_size": stderr_size,
+            "stdout_sha256": stdout_sha256,
+            "stdout_size": stdout_size,
+        }
+        digest = _payload_sha256(payload)
+        return _canonical_json({"payload": payload, "sha256": digest}) + b"\n", digest
+
     def _cleanup_private_temp(self, name: str) -> None:
         if _TEMP_RE.fullmatch(name) is None:
             return
@@ -527,6 +614,102 @@ class ResultSpool:
                 if not published:
                     self._cleanup_private_temp(temporary)
         return result
+
+    def store_files(
+        self,
+        request_id: str,
+        stdout_path: Path,
+        stderr_path: Path,
+        *,
+        stdout_size: int,
+        stdout_sha256: str,
+        stderr_size: int,
+        stderr_sha256: str,
+        exit_status: int,
+    ) -> SpoolResult:
+        """Atomically publish private streamed files without buffering inputs."""
+
+        request_id = validate_request_id(request_id)
+        for name, path, size, digest in (
+            ("stdout", stdout_path, stdout_size, stdout_sha256),
+            ("stderr", stderr_path, stderr_size, stderr_sha256),
+        ):
+            if not isinstance(path, Path) or not path.is_absolute():
+                raise ValueError(f"collected {name} path must be absolute")
+            if type(size) is not int or not 0 <= size <= MAX_RESULT_STREAM_BYTES:
+                raise ValueError(f"collected {name} size exceeds the configured limit")
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError(f"collected {name} digest is invalid")
+        if type(exit_status) is not int or not 0 <= exit_status <= 255:
+            raise ValueError("exit status must be from 0 to 255")
+        manifest, manifest_digest = self._manifest_from_metadata(
+            request_id,
+            stdout_size=stdout_size,
+            stdout_sha256=stdout_sha256,
+            stderr_size=stderr_size,
+            stderr_sha256=stderr_sha256,
+            exit_status=exit_status,
+        )
+
+        with self._lock:
+            try:
+                existing = self.load(request_id)
+            except FileNotFoundError:
+                pass
+            else:
+                if (
+                    len(existing.stdout) == stdout_size
+                    and hashlib.sha256(existing.stdout).hexdigest() == stdout_sha256
+                    and len(existing.stderr) == stderr_size
+                    and hashlib.sha256(existing.stderr).hexdigest() == stderr_sha256
+                    and existing.exit_status == exit_status
+                    and existing.manifest_payload_sha256 == manifest_digest
+                ):
+                    return existing
+                raise SpoolConflictError("a different canonical result already exists")
+
+            temporary = f".{request_id}.{secrets.token_hex(16)}.tmp"
+            os.mkdir(temporary, PRIVATE_DIRECTORY_MODE, dir_fd=self._root_fd)
+            directory_fd = -1
+            published = False
+            try:
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                directory_fd = os.open(temporary, flags, dir_fd=self._root_fd)
+                self._validate_directory_fd(directory_fd, "temporary result directory")
+                self._copy_private_file(
+                    directory_fd,
+                    STDOUT_NAME,
+                    stdout_path,
+                    expected_size=stdout_size,
+                    expected_sha256=stdout_sha256,
+                )
+                self._copy_private_file(
+                    directory_fd,
+                    STDERR_NAME,
+                    stderr_path,
+                    expected_size=stderr_size,
+                    expected_sha256=stderr_sha256,
+                )
+                self._write_file(directory_fd, MANIFEST_NAME, manifest)
+                os.fsync(directory_fd)
+                os.rename(
+                    temporary,
+                    request_id,
+                    src_dir_fd=self._root_fd,
+                    dst_dir_fd=self._root_fd,
+                )
+                published = True
+                os.fsync(self._root_fd)
+            finally:
+                if directory_fd >= 0:
+                    os.close(directory_fd)
+                if not published:
+                    self._cleanup_private_temp(temporary)
+        return self.load(request_id)
 
     def read_verified_range(
         self,
