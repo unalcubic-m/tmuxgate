@@ -2,7 +2,6 @@ from contextlib import nullcontext
 from dataclasses import FrozenInstanceError, replace
 import io
 import threading
-import time
 import unittest
 
 from tmuxgate.approval import ApprovalDecision, ApprovalTerminal

@@ -15,7 +15,7 @@ jobs:
   tests:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -23,37 +23,148 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Check required test tools
+      - name: Check required integration tools
         run: |
           command -v ssh
           command -v ssh-keygen
           command -v tmux
           command -v script
 
-      - name: Install runtime dependencies
+      - name: Install test dependencies
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: "1"
-        run: python -m pip install .
+        run: python -m pip install ".[dev]"
 
-      - name: Run test suite
+      - name: Isolate SSH and user configuration
+        run: |
+          isolated_home="$RUNNER_TEMP/tmuxgate-ci-home-${{ matrix.python-version }}"
+          contact_marker="$RUNNER_TEMP/tmuxgate-configured-host-contact-${{ matrix.python-version }}"
+          mkdir -p "$isolated_home/.ssh" "$isolated_home/config" "$isolated_home/state" "$isolated_home/cache"
+          chmod 700 "$isolated_home" "$isolated_home/.ssh"
+          printf 'Host *\n    ProxyCommand /usr/bin/touch %s\n' "$contact_marker" > "$isolated_home/.ssh/config"
+          chmod 600 "$isolated_home/.ssh/config"
+          printf 'HOME=%s\n' "$isolated_home" >> "$GITHUB_ENV"
+          printf 'XDG_CONFIG_HOME=%s/config\n' "$isolated_home" >> "$GITHUB_ENV"
+          printf 'XDG_STATE_HOME=%s/state\n' "$isolated_home" >> "$GITHUB_ENV"
+          printf 'XDG_CACHE_HOME=%s/cache\n' "$isolated_home" >> "$GITHUB_ENV"
+          printf 'SSH_AUTH_SOCK=%s/no-agent\n' "$isolated_home" >> "$GITHUB_ENV"
+          printf 'GIT_CONFIG_GLOBAL=/dev/null\n' >> "$GITHUB_ENV"
+          printf 'TMUXGATE_CI_SSH_CONTACT_MARKER=%s\n' "$contact_marker" >> "$GITHUB_ENV"
+
+      - name: Run isolated test suite
         env:
-          PYTHONPATH: src
-        run: python -m unittest discover -s tests -v
+          PYTHONPATH: src:tests
+        run: |
+          python -m unittest discover -s tests -v
+          test ! -e "$TMUXGATE_CI_SSH_CONTACT_MARKER"
 
-      - name: Validate shell launchers
+      - name: Validate shell syntax
         run: |
           sh -n install.sh
           sh -n bin/tmuxgate
+          bash -n src/tmuxgate/assets/remote_control.sh
+          bash -n src/tmuxgate/assets/remote_runner.sh
 
-      - name: Compile Python sources and installer
-        run: python -m compileall -q src scripts
+      - name: Compile Python sources, tests, and installer
+        run: python -m compileall -q src scripts tests
+
+  quality:
+    name: Quality and supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install development checks
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install ".[dev]"
+
+      - name: Demonstrate checks reject controlled violations
+        run: |
+          printf 'import os\n' > "$RUNNER_TEMP/ruff-violation.py"
+          if ruff check "$RUNNER_TEMP/ruff-violation.py" >/dev/null 2>&1; then
+            echo 'Ruff accepted its controlled violation' >&2
+            exit 1
+          fi
+          printf 'value: int = "not an integer"\n' > "$RUNNER_TEMP/pyright-violation.py"
+          if pyright "$RUNNER_TEMP/pyright-violation.py" >/dev/null 2>&1; then
+            echo 'Pyright accepted its controlled violation' >&2
+            exit 1
+          fi
+          printf '#!/bin/sh\nfor item in $(ls); do echo "$item"; done\n' > "$RUNNER_TEMP/shellcheck-violation.sh"
+          if shellcheck "$RUNNER_TEMP/shellcheck-violation.sh" >/dev/null 2>&1; then
+            echo 'ShellCheck accepted its controlled violation' >&2
+            exit 1
+          fi
+
+      - name: Lint Python
+        run: ruff check src tests scripts
+
+      - name: Type-check staged trust boundaries
+        run: pyright
+
+      - name: Check shell assets
+        run: |
+          command -v shellcheck
+          shellcheck install.sh bin/tmuxgate src/tmuxgate/assets/remote_control.sh src/tmuxgate/assets/remote_runner.sh
+
+      - name: Enforce immutable Action references
+        env:
+          PYTHONPATH: src:tests
+        run: python -m unittest test_ci_policy -v
+
+  adversarial:
+    name: Adversarial coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install coverage and adversarial dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install ".[dev]"
+
+      - name: Run branch coverage, fuzzing, and failure injection
+        env:
+          HOME: ${{ runner.temp }}/tmuxgate-adversarial-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/tmuxgate-adversarial-home/config
+          XDG_STATE_HOME: ${{ runner.temp }}/tmuxgate-adversarial-home/state
+          XDG_CACHE_HOME: ${{ runner.temp }}/tmuxgate-adversarial-home/cache
+          SSH_AUTH_SOCK: ${{ runner.temp }}/tmuxgate-adversarial-home/no-agent
+          GIT_CONFIG_GLOBAL: /dev/null
+          PYTHONPATH: src:tests
+        run: |
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+          chmod 700 "$HOME"
+          coverage run -m unittest discover -s tests -v
+          if coverage report --fail-under=101 >/dev/null 2>&1; then
+            echo 'Coverage accepted an impossible controlled threshold' >&2
+            exit 1
+          fi
+          coverage report
 
   package:
     name: Package smoke test
@@ -62,19 +173,20 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
 
-      - name: Install package
+      - name: Install package without development extras
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: "1"
         run: python -m pip install .
 
-      - name: Exercise installed CLI
+      - name: Exercise installed CLI outside the source checkout
+        working-directory: ${{ runner.temp }}
         run: |
           tmuxgate --version
           tmuxgate --help

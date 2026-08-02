@@ -15,13 +15,17 @@ git clone https://github.com/unalcubic-m/tmuxgate.git
 cd tmuxgate
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e .
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+python -m pip install -e ".[dev]"
+PYTHONPATH=src:tests python3 -m unittest discover -s tests -v
 ```
 
 Some tests require local Unix sockets, PTYs, OpenSSH tools, and tmux. The test
 suite must not contact real remote machines or depend on a developer's SSH
 configuration, credentials, network, or tmux sessions.
+
+See [docs/CI.md](docs/CI.md) for the exact required pull-request checks,
+coverage threshold, pinned tooling, isolation contract, intentional platform
+prerequisites, and commands for reproducing each gate.
 
 ## Making a change
 
@@ -33,7 +37,8 @@ configuration, credentials, network, or tmux sessions.
 4. Update `docs/ARCHITECTURE.md` when changing approval binding, route
    evidence, SSH policy, durable state, remote execution, collection, cleanup,
    or recovery.
-5. Run the complete test suite before opening a pull request.
+5. Run the complete test suite and applicable quality gates before opening a
+   pull request.
 
 Follow the existing Python style: four-space indentation, type annotations,
 standard-library solutions, explicit validation at trust boundaries, and

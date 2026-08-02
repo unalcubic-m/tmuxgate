@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import base64
 import binascii
@@ -15,7 +15,6 @@ import re
 import shlex
 import stat
 import subprocess
-from typing import Any
 
 from tmuxgate.config import Endpoint, Machine
 from tmuxgate.models import validate_alias

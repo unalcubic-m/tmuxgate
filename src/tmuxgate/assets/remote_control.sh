@@ -128,8 +128,10 @@ case "$operation" in
         printf 'stderr_sha256=%s\n' "$stderr_sha256"
         ;;
     release)
-        [ "$session_exists" -eq 1 ] && [ "$attached" -ge 1 ] ||
-            { echo 'tmuxgate release requires attached viewer' >&2; exit 125; }
+        if [ "$session_exists" -ne 1 ] || [ "$attached" -lt 1 ]; then
+            echo 'tmuxgate release requires attached viewer' >&2
+            exit 125
+        fi
         [ "$(read_state)" = gated ] || {
             echo 'tmuxgate release requires gated runner' >&2
             exit 125
@@ -146,8 +148,10 @@ case "$operation" in
         exec "$tmux_bin" attach-session -t "$session"
         ;;
     collect-stdout|collect-stderr)
-        [ "$(read_state)" = complete ] && [ "$attached" -eq 0 ] ||
-            { echo 'tmuxgate collection requires complete detached job' >&2; exit 125; }
+        if [ "$(read_state)" != complete ] || [ "$attached" -ne 0 ]; then
+            echo 'tmuxgate collection requires complete detached job' >&2
+            exit 125
+        fi
         for required in stdout.raw stderr.raw exit-code state; do
             safe_file "$required" || exit 125
         done
@@ -157,8 +161,10 @@ case "$operation" in
         esac
         ;;
     cleanup)
-        [ "$(read_state)" = complete ] && [ "$attached" -eq 0 ] ||
-            { echo 'tmuxgate cleanup refused active or incomplete job' >&2; exit 125; }
+        if [ "$(read_state)" != complete ] || [ "$attached" -ne 0 ]; then
+            echo 'tmuxgate cleanup refused active or incomplete job' >&2
+            exit 125
+        fi
         if [ "$session_exists" -eq 1 ]; then
             "$tmux_bin" kill-session -t "$session" || exit 125
         fi

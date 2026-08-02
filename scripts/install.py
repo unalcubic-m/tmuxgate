@@ -7,7 +7,6 @@ import argparse
 from dataclasses import dataclass
 import datetime as dt
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path

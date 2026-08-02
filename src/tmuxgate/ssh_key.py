@@ -131,9 +131,7 @@ class AutoSshKeyManager:
 
     def prepare_local_key(self, resolved: ResolvedSshEndpoint) -> None:
         private, public = self._paths(resolved)
-        ssh_dir = ensure_private_directory(
-            private.parent.parent, expected_uid=self.expected_uid
-        )
+        ensure_private_directory(private.parent.parent, expected_uid=self.expected_uid)
         ensure_private_directory(private.parent, expected_uid=self.expected_uid)
         private_exists = private.exists() or private.is_symlink()
         public_exists = public.exists() or public.is_symlink()

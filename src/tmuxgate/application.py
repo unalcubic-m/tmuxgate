@@ -209,8 +209,11 @@ class UnifiedApplication:
                 else:
                     approver = _approve_without_prompt
                 selected_executor = _ZeroFakeExecutor()
-                approval_discarder = lambda request_id: None
-                delivery_observer = lambda request_id, delivered: None
+                def approval_discarder(request_id: str) -> None:
+                    return None
+
+                def delivery_observer(request_id: str, delivered: bool) -> None:
+                    return None
             else:
                 if config.broker.approval_mode == "always":
                     def bound_approver(

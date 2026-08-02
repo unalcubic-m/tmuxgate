@@ -5,7 +5,6 @@ import pty
 import select
 import signal
 import subprocess
-import termios
 import tempfile
 import threading
 import time
