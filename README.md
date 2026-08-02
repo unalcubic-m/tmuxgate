@@ -325,6 +325,12 @@ candidate eligibility, eligible endpoint order, and complete resolved SSH
 identities are unchanged. Volatile observation bytes may produce a new
 snapshot digest without invalidating those semantics. The retry is never
 automatic; a semantic change requires a fresh request and approval.
+Before installing a missing dedicated public key, tmuxgate durably records the
+exact request, approved endpoint, and possible `authorized_keys` mutation. If
+enrollment or its verification then fails, the request ends with
+`remote_setup_failure`; it is never retried or offered a fallback route. An
+already-present exact key is detected with a read-only check and does not cross
+that mutation boundary.
 The dedicated per-machine key is the only effective identity file permitted,
 and it is used with `IdentitiesOnly=yes`, so unrelated agent/default keys
 cannot consume the server's authentication-attempt limit. Profile-added

@@ -341,6 +341,18 @@ and fsynced; the verified spool flag is inseparable from its exact manifest
 digest. The real executor uses this store directly; there is no second state
 path.
 
+SSH public-key setup has its own durable sub-lifecycle in the same record. A
+read-only remote check first proves whether the exact dedicated key is already
+present. If it is missing, tmuxgate fsyncs
+`KEY_ENROLLMENT_MAY_HAVE_STARTED`, bound to the request, approved plan, and
+exact endpoint, before it may create `.ssh`, create `authorized_keys`, or
+append the key. Successful append plus a final exact-key check is fsynced as
+`KEY_ENROLLMENT_VERIFIED_PRE_REMOTE` before command setup continues. A channel,
+script, verification, or later setup failure after that first boundary becomes
+`FAILED_REMOTE_SETUP`: it truthfully retains `remote_mutation_started = true`
+without claiming the requested command ran or inventing command output. Startup
+conservatively terminalizes an interrupted enrollment in the same state.
+
 The complete approval document binds the exact client request to the ordered
 route plan, canonical network-snapshot digest, strict `ssh -G` identity, SSH
 policy digest, host-key alias/evidence, proxy configuration, and fallback order.
@@ -533,6 +545,19 @@ If the remote account deliberately exposes `authorized_keys` as a symlink,
 tmuxgate never writes through it. Enrollment succeeds only when the exact
 dedicated public key was already installed through a separately trusted
 administrative path; otherwise it fails closed.
+Enrollment remains part of request execution instead of a separate key-setup
+command. This keeps first use bound to the already approved machine, route, and
+resolved SSH identity without adding a second administrative surface. The
+lifecycle distinguishes local key preparation, authenticated-master readiness,
+read-only enrollment inspection, durable enrollment start, verified enrollment,
+and transport readiness. A key already present is proven read-only and
+introduces no mutation uncertainty. When the key is absent, no remote write is
+attempted unless the durable enrollment boundary succeeds. After that boundary,
+any nonzero command, lost channel, failed final check, or failed durable
+verification prevents same-endpoint retry and route fallback. The result uses
+`remote_setup_failure`, not `pre_remote_failure` or `incomplete`, and releases
+the in-memory command slot because no requested job was started; the durable
+audit record remains available.
 Subsequent masters explicitly select that key. Passwords and sudo credentials
 are never stored. Automatic viewer presentation forwards terminal input
 directly through tmux and SSH; tmuxgate does not read or retain those bytes.
@@ -580,6 +605,13 @@ command and cannot create durable remote-job state. No local transport,
 identity-validation, or control-path error is retried; a typed nonzero OpenSSH
 start exit remains opaque except for the terminal diagnostic and numeric
 status.
+
+Fallback is offered only while enrollment is proven not to have started.
+Local key preparation, master authentication, and the read-only key inspection
+can fail before that boundary and retain the normal separately approved
+fallback flow. Once `authorized_keys` may have changed, tmuxgate does not
+render a fallback prompt claiming `remote_mutation_started = false`, does not
+try another endpoint, and does not conceal the first endpoint's mutation.
 
 Only when every eligible endpoint's initial OpenSSH master start and its
 broker-terminal-approved retry have failed does the broker offer to disable the

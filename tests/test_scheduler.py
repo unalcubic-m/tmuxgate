@@ -103,6 +103,27 @@ class SequentialSchedulerTests(unittest.TestCase):
             failed.lease_release_reason, LeaseReleaseReason.PRE_REMOTE_FAILURE
         )
 
+    def test_remote_setup_failure_is_distinct_and_releases_command_slot(self):
+        scheduler = SequentialScheduler()
+        active_id = request_id(1)
+        scheduler.submit(active_id)
+        scheduler.begin_next_approval()
+        scheduler.approve(active_id)
+
+        failed = scheduler.mark_remote_setup_failure(
+            active_id,
+            detail="authorized_keys may have changed; command not started",
+        )
+
+        self.assertEqual(failed.state, RequestState.FAILED_REMOTE_SETUP)
+        self.assertEqual(
+            failed.lease_release_reason,
+            LeaseReleaseReason.REMOTE_SETUP_FAILURE,
+        )
+        self.assertIsNone(scheduler.lease_owner)
+        delivering = scheduler.begin_result_delivery(active_id)
+        self.assertEqual(delivering.state, RequestState.RESULT_DELIVERING)
+
     def test_approved_client_disconnect_does_not_release_or_cancel(self):
         scheduler = SequentialScheduler()
         active_id = request_id(1)

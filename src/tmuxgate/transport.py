@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 import hashlib
 import json
 import os
@@ -45,6 +46,17 @@ class TransportBusyError(TransportError):
 
 class TransportIdentityError(TransportError):
     """The current SSH identity differs from the approved plan."""
+
+
+class KeyEnrollmentMutationError(TransportError):
+    """Remote key enrollment may have mutated ``authorized_keys``."""
+
+
+class KeyEnrollmentOutcome(StrEnum):
+    """Proven outcome of the idempotent remote-key enrollment protocol."""
+
+    ALREADY_PRESENT = "already-present"
+    ENROLLED_AND_VERIFIED = "enrolled-and-verified"
 
 
 class SshMasterStartError(TransportError):
@@ -299,8 +311,19 @@ class MasterBackend(Protocol):
 class SshKeyManager(Protocol):
     def prepare_local_key(self, resolved: ResolvedSshEndpoint) -> None: ...
     def enroll_remote_key(
-        self, resolved: ResolvedSshEndpoint, control_path: Path
-    ) -> None: ...
+        self,
+        resolved: ResolvedSshEndpoint,
+        control_path: Path,
+        *,
+        before_remote_mutation: Callable[[], None],
+    ) -> KeyEnrollmentOutcome: ...
+
+
+class KeyEnrollmentLifecycle(Protocol):
+    """Durable callbacks around the remote enrollment mutation boundary."""
+
+    def before_remote_mutation(self, resolved: ResolvedSshEndpoint) -> None: ...
+    def remote_mutation_verified(self, resolved: ResolvedSshEndpoint) -> None: ...
 
 
 IdentityRevalidator = Callable[[ResolvedSshEndpoint], ResolvedSshEndpoint]
@@ -476,6 +499,8 @@ class MasterTransportPool:
         self,
         authorization: TransportAuthorization,
         resolved: ResolvedSshEndpoint,
+        *,
+        key_enrollment_lifecycle: KeyEnrollmentLifecycle | None = None,
     ) -> TransportLease:
         """Reuse or authenticate a master, then pin it to this one request."""
 
@@ -524,6 +549,7 @@ class MasterTransportPool:
                     control_persist_seconds=self.idle_timeout_seconds,
                 )
                 master_started = False
+                key_enrollment_started = False
                 try:
                     self.backend.start_master(start, path)
                     master_started = True
@@ -539,51 +565,104 @@ class MasterTransportPool:
                             "new authenticated SSH master failed its control check"
                         )
                     if self.key_manager is not None:
-                        self.key_manager.enroll_remote_key(current, path)
-                except BaseException:
+                        def before_remote_mutation() -> None:
+                            nonlocal key_enrollment_started
+                            if key_enrollment_lifecycle is None:
+                                raise TransportError(
+                                    "remote key enrollment lacks a durable lifecycle"
+                                )
+                            key_enrollment_lifecycle.before_remote_mutation(current)
+                            key_enrollment_started = True
+
+                        outcome = self.key_manager.enroll_remote_key(
+                            current,
+                            path,
+                            before_remote_mutation=before_remote_mutation,
+                        )
+                        if outcome is KeyEnrollmentOutcome.ENROLLED_AND_VERIFIED:
+                            if not key_enrollment_started:
+                                raise TransportError(
+                                    "key manager reported enrollment without crossing "
+                                    "the durable mutation boundary"
+                                )
+                            assert key_enrollment_lifecycle is not None
+                            key_enrollment_lifecycle.remote_mutation_verified(current)
+                        elif outcome is not KeyEnrollmentOutcome.ALREADY_PRESENT:
+                            raise TransportError(
+                                "key manager returned an invalid enrollment outcome"
+                            )
+                except BaseException as exc:
                     should_stop = master_started
                     if not should_stop:
                         try:
                             should_stop = self._control_socket_present(path)
                         except BaseException:
                             should_stop = False
-                    if should_stop:
-                        try:
+                    try:
+                        if should_stop:
                             stop = build_master_control_invocation(
                                 current, path, "exit"
                             )
                             self.backend.stop_master(stop, path)
-                        except BaseException as stop_exc:
-                            try:
-                                socket_retained = self._control_socket_present(path)
-                            except BaseException as path_exc:
-                                raise TransportError(
-                                    "partial SSH master shutdown was not confirmed "
-                                    "and its control path is unsafe; the path was not removed"
+                    except BaseException as stop_exc:
+                        try:
+                            socket_retained = self._control_socket_present(path)
+                        except BaseException as path_exc:
+                            cleanup_error = TransportError(
+                                "partial SSH master shutdown was not confirmed "
+                                "and its control path is unsafe; the path was not removed"
+                            )
+                            if key_enrollment_started:
+                                raise KeyEnrollmentMutationError(
+                                    "remote key enrollment may have mutated authorized_keys; "
+                                    "SSH master cleanup also could not be confirmed"
                                 ) from path_exc
-                            if socket_retained:
-                                self._transports[authorization.machine_name] = (
-                                    MasterTransport(
-                                        machine_name=authorization.machine_name,
-                                        endpoint=current,
-                                        control_path=path,
-                                        connection_plan_sha256=(
-                                            authorization.connection_plan_sha256
-                                        ),
-                                        identity_sha256=identity_digest,
-                                        last_used=self.clock(),
-                                        cleanup_pending=True,
-                                    )
+                            raise cleanup_error from path_exc
+                        if socket_retained:
+                            self._transports[authorization.machine_name] = (
+                                MasterTransport(
+                                    machine_name=authorization.machine_name,
+                                    endpoint=current,
+                                    control_path=path,
+                                    connection_plan_sha256=(
+                                        authorization.connection_plan_sha256
+                                    ),
+                                    identity_sha256=identity_digest,
+                                    last_used=self.clock(),
+                                    cleanup_pending=True,
                                 )
-                                raise TransportError(
-                                    "partial SSH master shutdown was not confirmed; "
-                                    "its owned control socket was retained for "
-                                    "broker lifecycle cleanup"
-                                ) from stop_exc
-                            raise TransportError(
+                            )
+                            cleanup_error = TransportError(
+                                "partial SSH master shutdown was not confirmed; "
+                                "its owned control socket was retained for "
+                                "broker lifecycle cleanup"
+                            )
+                        else:
+                            cleanup_error = TransportError(
                                 "partial SSH master shutdown was not confirmed"
+                            )
+                        if key_enrollment_started:
+                            raise KeyEnrollmentMutationError(
+                                "remote key enrollment may have mutated authorized_keys; "
+                                "SSH master cleanup also could not be confirmed"
                             ) from stop_exc
-                    self._remove_socket_if_safe(path)
+                        raise cleanup_error from stop_exc
+                    try:
+                        self._remove_socket_if_safe(path)
+                    except BaseException as cleanup_exc:
+                        if key_enrollment_started:
+                            raise KeyEnrollmentMutationError(
+                                "remote key enrollment may have mutated authorized_keys; "
+                                "its SSH control path also could not be cleaned safely"
+                            ) from cleanup_exc
+                        raise
+                    if key_enrollment_started:
+                        if isinstance(exc, KeyEnrollmentMutationError):
+                            raise
+                        raise KeyEnrollmentMutationError(
+                            "remote key enrollment may have mutated authorized_keys; "
+                            "the requested command was not started"
+                        ) from exc
                     raise
                 existing = MasterTransport(
                     machine_name=authorization.machine_name,

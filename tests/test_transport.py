@@ -9,6 +9,8 @@ import unittest
 from tmuxgate.approval import ApprovalDecision
 from tmuxgate.models import ExecutionMode, RequestSpec
 from tmuxgate.transport import (
+    KeyEnrollmentMutationError,
+    KeyEnrollmentOutcome,
     MasterTransportPool,
     SshInvocation,
     SshMasterStartError,
@@ -95,6 +97,45 @@ class PartialStartMasterBackend(FakeMasterBackend):
     def start_master(self, invocation, control_path):
         super().start_master(invocation, control_path)
         raise SshMasterStartError(255)
+
+
+class FakeKeyManager:
+    def __init__(self, outcome="enrolled"):
+        self.outcome = outcome
+        self.events = []
+
+    def prepare_local_key(self, resolved):
+        self.events.append(("local-key-prepared", resolved.endpoint_id))
+
+    def enroll_remote_key(
+        self, resolved, control_path, *, before_remote_mutation
+    ):
+        outcome = (
+            self.outcome.pop(0)
+            if isinstance(self.outcome, list)
+            else self.outcome
+        )
+        self.events.append(("remote-key-inspected", resolved.endpoint_id))
+        if outcome == "present":
+            return KeyEnrollmentOutcome.ALREADY_PRESENT
+        if outcome == "pre-failure":
+            raise TransportError("read-only enrollment inspection failed")
+        before_remote_mutation()
+        self.events.append(("remote-enrollment-started", resolved.endpoint_id))
+        if outcome == "post-failure":
+            raise TransportError("append succeeded before verification failed")
+        return KeyEnrollmentOutcome.ENROLLED_AND_VERIFIED
+
+
+class FakeKeyEnrollmentLifecycle:
+    def __init__(self):
+        self.events = []
+
+    def before_remote_mutation(self, resolved):
+        self.events.append(("durable-boundary", resolved.endpoint_id))
+
+    def remote_mutation_verified(self, resolved):
+        self.events.append(("enrollment-verified", resolved.endpoint_id))
 
 
 def authorization(machine_name, endpoint, request_id=REQUEST_ID, plan_digest="b" * 64):
@@ -369,6 +410,89 @@ class MasterPoolTests(unittest.TestCase):
             self.acquire(0)
         self.assertEqual(self.pool.retained_machine_names, ())
         self.assertEqual(list(self.pool.control_dir.iterdir()), [])
+
+    def test_key_enrollment_crosses_durable_boundary_before_remote_write(self):
+        manager = FakeKeyManager()
+        lifecycle = FakeKeyEnrollmentLifecycle()
+        self.pool.key_manager = manager
+        endpoint = self.endpoints[0]
+
+        lease = self.pool.acquire(
+            authorization(endpoint.ssh_profile, endpoint),
+            endpoint,
+            key_enrollment_lifecycle=lifecycle,
+        )
+
+        self.assertEqual(
+            manager.events,
+            [
+                ("local-key-prepared", "home-lan"),
+                ("remote-key-inspected", "home-lan"),
+                ("remote-enrollment-started", "home-lan"),
+            ],
+        )
+        self.assertEqual(
+            lifecycle.events,
+            [
+                ("durable-boundary", "home-lan"),
+                ("enrollment-verified", "home-lan"),
+            ],
+        )
+        lease.release()
+
+    def test_preinstalled_key_needs_no_mutation_boundary(self):
+        manager = FakeKeyManager("present")
+        lifecycle = FakeKeyEnrollmentLifecycle()
+        self.pool.key_manager = manager
+        endpoint = self.endpoints[0]
+
+        lease = self.pool.acquire(
+            authorization(endpoint.ssh_profile, endpoint),
+            endpoint,
+            key_enrollment_lifecycle=lifecycle,
+        )
+
+        self.assertEqual(lifecycle.events, [])
+        lease.release()
+
+    def test_post_boundary_enrollment_failure_is_never_downgraded(self):
+        manager = FakeKeyManager("post-failure")
+        lifecycle = FakeKeyEnrollmentLifecycle()
+        self.pool.key_manager = manager
+        endpoint = self.endpoints[0]
+
+        with self.assertRaisesRegex(
+            KeyEnrollmentMutationError,
+            "may have mutated authorized_keys",
+        ):
+            self.pool.acquire(
+                authorization(endpoint.ssh_profile, endpoint),
+                endpoint,
+                key_enrollment_lifecycle=lifecycle,
+            )
+
+        self.assertEqual(
+            lifecycle.events,
+            [("durable-boundary", "home-lan")],
+        )
+        self.assertEqual(self.pool.retained_machine_names, ())
+        self.assertEqual(list(self.pool.control_dir.iterdir()), [])
+
+    def test_missing_lifecycle_refuses_enrollment_before_remote_write(self):
+        manager = FakeKeyManager()
+        self.pool.key_manager = manager
+        endpoint = self.endpoints[0]
+
+        with self.assertRaisesRegex(TransportError, "durable lifecycle"):
+            self.pool.acquire(
+                authorization(endpoint.ssh_profile, endpoint),
+                endpoint,
+            )
+
+        self.assertNotIn(
+            ("remote-enrollment-started", "home-lan"),
+            manager.events,
+        )
 
         self.backend.fail_next_check = True
         with self.assertRaisesRegex(TransportError, "control check"):

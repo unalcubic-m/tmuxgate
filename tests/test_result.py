@@ -93,6 +93,16 @@ class ResultProtocolTests(unittest.TestCase):
             b"partial-err\ntmuxgate: completion could not be proven\n",
         )
 
+    def test_remote_setup_failure_is_distinct_from_pre_remote_and_incomplete(self):
+        result = ExecutionResult(
+            REQUEST_ID,
+            TransportStatus.REMOTE_SETUP_FAILURE,
+            detail="authorized_keys may have changed; command was not started",
+        )
+        self.assertEqual(result.transparent_exit_code(), 70)
+        self.assertIsNone(result.remote_exit_status)
+        self.assertIn(b'"transport_status":"remote_setup_failure"', result.structured_json())
+
     def test_result_write_timeout_rejects_nonfinite_values(self):
         result = ExecutionResult(
             REQUEST_ID,

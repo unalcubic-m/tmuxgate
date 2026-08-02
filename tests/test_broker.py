@@ -19,7 +19,7 @@ from tmuxgate.fake import FakeExecution, ScriptedApprover, ScriptedFakeExecutor
 from tmuxgate.models import ExecutionMode, RequestSpec
 from tmuxgate.operator_interface import ActivityKind, OperationalActivity
 from tmuxgate.protocol import receive_frame, send_frame
-from tmuxgate.result import TransportStatus
+from tmuxgate.result import ExecutionResult, TransportStatus
 from tmuxgate.runtime import PeerCredentialError, create_broker_socket
 
 
@@ -89,6 +89,19 @@ class FailingFakeExecutor:
     def __call__(self, request_id: str, spec: RequestSpec) -> FakeExecution:
         self.calls.append((request_id, spec))
         raise RuntimeError("injected post-running-boundary failure")
+
+
+class RemoteSetupFailingExecutor:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(self, request_id: str, spec: RequestSpec) -> ExecutionResult:
+        self.calls.append((request_id, spec))
+        return ExecutionResult(
+            request_id,
+            TransportStatus.REMOTE_SETUP_FAILURE,
+            detail="authorized_keys may have changed; command was not started",
+        )
 
 
 class BrokerIntegrationTests(unittest.TestCase):
@@ -382,6 +395,25 @@ class BrokerIntegrationTests(unittest.TestCase):
         self.assertEqual(server._scheduler.lease_owner, request_id)
         self.assertIn(request_id, server._jobs)
         self.assertIn(request_id, server._active_request_ids)
+
+    def test_remote_setup_failure_releases_slot_without_claiming_command_start(self):
+        approver = ScriptedApprover([ApprovalDecision.APPROVED])
+        executor = RemoteSetupFailingExecutor()
+        server = self.start_server(approver, executor)
+
+        result = submit_request(
+            request("uncertain-enrollment"),
+            socket_path=self.socket_path,
+        )
+
+        self.assertEqual(
+            result.transport_status,
+            TransportStatus.REMOTE_SETUP_FAILURE,
+        )
+        self.assertIn("command was not started", result.detail)
+        self.assertTrue(server.wait_for_audit("remote-setup-failure"))
+        self.assertIsNone(server._scheduler.lease_owner)
+        self.assertFalse(any(name == "recovery-required" for name, _ in server.audit_log))
 
     def test_approved_malicious_argv_is_not_executed_and_exit_seven_is_exact(self):
         marker = Path(self.temporary.name) / "client-command-was-run"

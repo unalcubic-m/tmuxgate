@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import os
 from pathlib import Path
 import shlex
@@ -11,7 +12,39 @@ import subprocess
 from tmuxgate.real_ssh import SshChannelRunner
 from tmuxgate.runtime import ensure_private_directory
 from tmuxgate.ssh import ResolvedSshEndpoint, default_tmuxgate_identity_file
-from tmuxgate.transport import TransportError, build_batch_channel_prefix
+from tmuxgate.transport import (
+    KeyEnrollmentOutcome,
+    TransportError,
+    build_batch_channel_prefix,
+)
+
+
+_REMOTE_KEY_STATUS_SCRIPT = r"""
+set -eu
+key=$(cat)
+case "$key" in
+  'ssh-ed25519 '*) ;;
+  *) exit 125 ;;
+esac
+case "$key" in
+  *'\r'*|*'\n'*) exit 125 ;;
+esac
+owner=$(id -u)
+ssh_dir=$HOME/.ssh
+[ -e "$ssh_dir" ] || [ -L "$ssh_dir" ] || exit 3
+[ -d "$ssh_dir" ] && [ ! -L "$ssh_dir" ] || exit 125
+[ "$(stat -c '%a:%u' "$ssh_dir")" = "700:$owner" ] || exit 125
+authorized=$ssh_dir/authorized_keys
+[ -e "$authorized" ] || [ -L "$authorized" ] || exit 3
+if [ -L "$authorized" ]; then
+  grep -Fqx -- "$key" "$authorized" && exit 0
+  exit 3
+fi
+[ -f "$authorized" ] || exit 125
+[ "$(stat -c '%a:%u' "$authorized")" = "600:$owner" ] || exit 125
+grep -Fqx -- "$key" "$authorized" && exit 0
+exit 3
+"""
 
 
 _REMOTE_ENROLL_SCRIPT = r"""
@@ -27,14 +60,14 @@ case "$key" in
 esac
 owner=$(id -u)
 ssh_dir=$HOME/.ssh
-if [ -e "$ssh_dir" ]; then
+if [ -e "$ssh_dir" ] || [ -L "$ssh_dir" ]; then
   [ -d "$ssh_dir" ] && [ ! -L "$ssh_dir" ] || exit 125
   [ "$(stat -c '%a:%u' "$ssh_dir")" = "700:$owner" ] || exit 125
 else
   mkdir -m 700 "$ssh_dir"
 fi
 authorized=$ssh_dir/authorized_keys
-if [ -e "$authorized" ]; then
+if [ -e "$authorized" ] || [ -L "$authorized" ]; then
   if [ -L "$authorized" ]; then
     # Some systems, including Proxmox, deliberately manage authorized_keys
     # through a symlink. Never write through it; accept only an exact key that
@@ -51,6 +84,7 @@ fi
 if ! grep -Fqx -- "$key" "$authorized"; then
   printf '%s\n' "$key" >> "$authorized"
 fi
+grep -Fqx -- "$key" "$authorized" || exit 125
 """
 
 
@@ -124,11 +158,31 @@ class AutoSshKeyManager:
         self._validate_pair(private, public)
 
     def enroll_remote_key(
-        self, resolved: ResolvedSshEndpoint, control_path: Path
-    ) -> None:
+        self,
+        resolved: ResolvedSshEndpoint,
+        control_path: Path,
+        *,
+        before_remote_mutation: Callable[[], None],
+    ) -> KeyEnrollmentOutcome:
+        if not callable(before_remote_mutation):
+            raise TypeError("before_remote_mutation must be callable")
         private, public = self._paths(resolved)
         content = self._validate_pair(private, public)
         prefix = build_batch_channel_prefix(resolved, control_path).argv
+        status_command = "/bin/sh -c " + shlex.quote(_REMOTE_KEY_STATUS_SCRIPT)
+        status = self.channels.batch(
+            (*prefix, status_command),
+            input_bytes=content,
+            timeout_seconds=30,
+        )
+        if status.returncode == 0:
+            return KeyEnrollmentOutcome.ALREADY_PRESENT
+        if status.returncode != 3:
+            raise TransportError(
+                "tmuxgate could not safely inspect its SSH public key before enrollment"
+            )
+
+        before_remote_mutation()
         command = "/bin/sh -c " + shlex.quote(_REMOTE_ENROLL_SCRIPT)
         result = self.channels.batch(
             (*prefix, command),
@@ -139,3 +193,4 @@ class AutoSshKeyManager:
             raise TransportError(
                 "tmuxgate could not enroll its SSH public key on the remote machine"
             )
+        return KeyEnrollmentOutcome.ENROLLED_AND_VERIFIED

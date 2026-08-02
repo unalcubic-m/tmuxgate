@@ -1067,6 +1067,14 @@ class BrokerServer:
                 self._record("pre-remote-failure", request_id)
                 self._deliver_scheduled(event.work.session, execution)
                 return
+            if execution.transport_status is TransportStatus.REMOTE_SETUP_FAILURE:
+                self._scheduler.mark_remote_setup_failure(
+                    request_id,
+                    detail=execution.detail or "remote setup failed after mutation",
+                )
+                self._record("remote-setup-failure", request_id)
+                self._deliver_scheduled(event.work.session, execution)
+                return
             if execution.transport_status is not TransportStatus.COMPLETE:
                 self._scheduler.mark_remote_may_be_running(request_id)
                 self._scheduler.mark_recovery_required(
