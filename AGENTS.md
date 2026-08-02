@@ -25,12 +25,37 @@ Tests use `unittest.TestCase`. Name files `test_<module>.py`, classes `<Subject>
 
 Use short, imperative commit subjects such as `Reject stale route evidence`. Keep commits narrowly scoped. Pull requests should explain the behavior change, security implications, and tests run; link relevant issues and include sanitized terminal output or screenshots when CLI/approval UI behavior changes.
 
+## Concurrent Codex Sessions & Worktrees
+
+Never let two active Codex sessions edit the same Git worktree. Every concurrent
+session must have its own sibling worktree and dedicated branch before it edits
+files. The original checkout may be assigned to one session; create sibling
+worktrees for all others with `git worktree add`, outside the repository
+directory.
+
+At the beginning of a session and before any write or Git operation:
+
+- Run `pwd`, `git branch --show-current`, `git status --short`, and
+  `git worktree list`.
+- Treat all pre-existing changes as owned by the session assigned to that
+  worktree. Do not modify, stage, restore, stash, or commit them unless that
+  ownership is explicitly transferred.
+- If another active session is using the same path, stop before editing and
+  move this session to a separate worktree.
+- Record which worktree and branch this session owns, and perform every command
+  from that path. Never edit another session's worktree.
+- Stage only explicit paths owned by this session. Do not use `git add .`,
+  `git add -A`, broad restore/reset/clean operations, or shared stashes.
+- Do not switch branches in a worktree assigned to an active session. Do not
+  remove or prune an active session's worktree.
+- If two branches need the same file, coordinate ownership first and integrate
+  through commits, rebasing, or cherry-picking after one side is complete;
+  never resolve it through simultaneous filesystem edits.
+
+Tests may run concurrently when they use repository-provided isolated temporary
+resources. Any operation that affects shared state outside a worktree must be
+performed by one designated session at a time.
+
 ## Security & Configuration
 
 Preserve fail-closed behavior: clients provide logical machine names, never SSH options or endpoints, and approval remains broker-terminal-owned. Never commit real host addresses, credentials, known-host data, runtime state, or user configuration. Document any change to approval binding, route evidence, durable state, or remote cleanup in `docs/ARCHITECTURE.md`.
-
-### DevWorkstation installation policy
-
-The operator has explicitly chosen `approval_mode = "disabled"` for this development workstation. When running the user-scoped installer on DevWorkstation, preserve that setting and pass `--allow-disabled-approvals`; do not change it to `always`. Treat this as a workstation-specific development decision that must not weaken repository defaults, examples, tests, or behavior on other machines.
-
-After any repository update is merged into `main`, check whether the current machine already has a managed tmuxgate installation. If it does, update that installation from the verified, clean `main` checkout before considering the work complete. On DevWorkstation, run `./install.sh --allow-disabled-approvals`, preserve the existing configuration, token, and durable state, and verify that the active launcher resolves to the newly installed release. If the installer reports a conflicting Codex MCP entry, inspect it first and use `--replace-codex` only when it is the expected existing tmuxgate registration. If the replacement attempt reports any conflict, ambiguity, or other error, stop: do not bypass registration with `--no-codex`, do not edit the Codex configuration manually, and do not update the local tmuxgate installation. Leave the previous managed release active and tell the user what blocked the update. The installer does not restart an already-running tmuxgate or Codex process, so report any restart required for the new release to take effect.
