@@ -422,11 +422,23 @@ class UnifiedApplication:
                     # Live workers can still hold the state store, spool, SSH
                     # pool, or listener.  Closing those dependencies underneath
                     # them creates use-after-close races.  Keep ownership until
-                    # the CLI process terminates and lets the OS reclaim it.
+                    # the CLI process terminates and its workers can no longer
+                    # access process-owned resources.
                     _RETAINED_SHUTDOWN_RESOURCES.append(resources.pop_all())
+                    unfinished = []
+                    if not broker_clean:
+                        unfinished.append("a broker worker or client session")
+                    if not mcp_clean:
+                        unfinished.append("the MCP HTTP server thread")
                     report_error(
-                        "tmuxgate: shutdown incomplete; retaining owned resources "
-                        "until process exit"
+                        "tmuxgate: shutdown incomplete: "
+                        + " and ".join(unfinished)
+                        + " did not stop cleanly. New work is no longer accepted. "
+                        "Internal resources will remain open only for the rest of "
+                        "this process to avoid unsafe cleanup beneath a live worker; "
+                        f"tmuxgate will return status {EXIT_SOFTWARE}. "
+                        "An already-approved durable remote job may continue "
+                        "independently; run 'tmuxgate jobs' after exit to inspect it."
                     )
         clean = owned_components_clean[0] and clean
         return 0 if clean else EXIT_SOFTWARE

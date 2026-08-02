@@ -81,7 +81,11 @@ idle SSH masters, and dedicated MCP broker-call pools, followed by the broker
 listener, spool/state, and both singleton locks. If a bounded network component
 does not stop cleanly, tmuxgate reports a software failure and retains its
 owned resources until process exit rather than closing them underneath live
-workers. Disconnecting or timing out an MCP call is not a cancellation
+workers. That diagnostic names the component that did not stop, states that
+new work is no longer accepted and that the process returns software-error
+status 70, and directs the operator to inspect durable jobs because an already
+approved remote job can continue independently. Disconnecting or timing out an
+MCP call is not a cancellation
 boundary: its internal blocking Unix-socket client may remain connected until
 the broker produces a result. Its bounded execution-worker slot remains
 charged until that synchronous client really returns. The existing

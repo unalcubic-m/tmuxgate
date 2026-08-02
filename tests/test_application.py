@@ -250,13 +250,51 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
             retained_before + 1,
         )
         self.assertTrue(self.socket_path.exists())
-        self.assertIn("retaining owned resources", errors.getvalue())
+        message = errors.getvalue()
+        self.assertIn(
+            "a broker worker or client session did not stop cleanly",
+            message,
+        )
+        self.assertIn("New work is no longer accepted", message)
+        self.assertIn("tmuxgate will return status 70", message)
+        self.assertIn("run 'tmuxgate jobs' after exit", message)
         with self.assertRaisesRegex(RuntimeSecurityError, "another state lifecycle"):
             acquire_state_lock(self.state_dir)
 
         retained = application._RETAINED_SHUTDOWN_RESOURCES.pop()
         retained.close()
         self.assertFalse(self.socket_path.exists())
+
+    def test_incomplete_shutdown_identifies_mcp_http_thread(self):
+        broker = mock.Mock()
+        broker.stop.return_value = True
+        mcp_http = mock.Mock()
+        mcp_http.stop.return_value = False
+        retained_before = len(application._RETAINED_SHUTDOWN_RESOURCES)
+
+        with (
+            mock.patch.object(application, "BrokerServer", return_value=broker),
+            mock.patch.object(application, "create_mcp_server", return_value=object()),
+            mock.patch.object(
+                application,
+                "EmbeddedMcpServer",
+                return_value=mcp_http,
+            ),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()) as errors,
+        ):
+            result = self._application(lambda *args: None).run()
+
+        self.assertEqual(result, application.EXIT_SOFTWARE)
+        self.assertEqual(
+            len(application._RETAINED_SHUTDOWN_RESOURCES),
+            retained_before + 1,
+        )
+        message = errors.getvalue()
+        self.assertIn("the MCP HTTP server thread did not stop cleanly", message)
+        self.assertNotIn("a broker worker or client session", message)
+
+        application._RETAINED_SHUTDOWN_RESOURCES.pop().close()
 
     def test_cleanup_failure_does_not_skip_other_components_or_signal_restore(self):
         events: list[str] = []
