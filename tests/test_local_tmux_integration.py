@@ -32,6 +32,7 @@ class LocalRealTmuxIntegrationTests(unittest.TestCase):
                 argv=(
                     "/bin/bash",
                     "-c",
+                    "(trap 'exit 0' TERM; sleep 30) 2>/dev/null & "
                     "printf 'stdout-path=%s\\n' \"$PATH\"; "
                     "printf 'stderr-line\\n' >&2; exit 7",
                 ),
