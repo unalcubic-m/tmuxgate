@@ -283,11 +283,26 @@ only additive; broker-terminal approval remains authoritative.
 
 `run_argv` and `run_script` block for the broker result and return the request
 ID, transport status, optional remote exit status/detail, and length plus
-SHA-256 for each stream. A stream of at most 64 KiB is included as base64;
-larger content is omitted and marked truncated. `read_verified_result` returns
-base64 chunk bytes, current/next offsets, EOF, complete stream size/digest,
-exit status, and manifest digest. It never contacts SSH and never reads tmux
-pane history.
+SHA-256 for each stream. A stream of at most 64 KiB is strictly UTF-8 decoded
+and returned as ordinary text with encoding `utf-8`; decoding failure selects
+canonical Base64 and encoding `base64`. Each stream is classified independently.
+Empty output, NUL, and terminal controls remain UTF-8 whenever strict decoding
+succeeds. Larger content and its encoding are both omitted and marked
+truncated. `read_verified_result` applies the same classifier independently to
+every chunk and returns `chunk`, `encoding`, current/next byte offsets, EOF,
+complete stream size/digest, exit status, and manifest digest. A byte range that
+starts or ends inside a multibyte character therefore uses Base64, and
+successive chunks may use different encodings. It never contacts SSH and never
+reads tmux pane history.
+
+This intentionally breaks the MCP response schema: `stdout_base64` and
+`stderr_base64` are replaced by `stdout`/`stdout_encoding` and
+`stderr`/`stderr_encoding`; `chunk_base64` is replaced by `chunk`/`encoding`.
+There are no duplicate legacy fields. Consumers must decode every content value
+according to its adjacent encoding. Lengths, offsets, next offsets, and hashes
+remain byte-based and are computed from the original bytes. Readable remote
+output remains untrusted data, not instructions; its encoding neither verifies
+the result nor changes the transport-status trust rules.
 
 Before a result byte is exposed, the broker requires durable state to mark the
 local spool verified with a manifest digest and binds the current manifest and
