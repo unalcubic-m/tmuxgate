@@ -494,6 +494,58 @@ class DurableLifecycleTransitionTests(unittest.TestCase):
         with self.assertRaises(StateConflictError):
             store.mark_abandoned_after_operator_confirmed_reboot(recovery)
 
+    def test_operator_confirmed_reboot_reconciles_uncollectable_completion(self):
+        store = self.make_store()
+        current = self.armed(store)
+        current = store.mark_completion_proven(
+            current,
+            exit_status=0,
+            now=lambda: "2026-08-02T20:55:56.981336Z",
+        )
+        current = store.mark_viewer_detached(current)
+        current = store.mark_terminal_restored(current)
+
+        abandoned = store.mark_abandoned_after_operator_confirmed_reboot(
+            current,
+            now=lambda: "2026-08-03T10:00:00.000000Z",
+        )
+
+        self.assertEqual(
+            abandoned.state,
+            RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
+        )
+        self.assertIn("2026-08-02T20:55:56.981336Z", abandoned.failure_detail)
+        self.assertIn("exit status 0", abandoned.failure_detail)
+        self.assertIn("viewer_detached=true", abandoned.failure_detail)
+        self.assertIn("terminal_restored=true", abandoned.failure_detail)
+        self.assertIn("local result spool were not verified", abandoned.failure_detail)
+        self.assertIsNone(abandoned.completion_time)
+        self.assertIsNone(abandoned.exit_status)
+        self.assertFalse(abandoned.local_spool_verified)
+        self.assertIsNone(abandoned.local_spool_manifest_sha256)
+        self.assertFalse(abandoned.viewer_detached)
+        self.assertFalse(abandoned.terminal_restored)
+        self.assertEqual(store.load(REQUEST_ID), abandoned)
+        report = recover_startup(store)
+        self.assertTrue(report.safe_to_accept_new_approvals)
+        self.assertEqual(report.blocking_request_ids, ())
+
+    def test_operator_confirmed_reboot_refuses_verified_local_result(self):
+        store = self.make_store()
+        current = self.armed(store)
+        current = store.mark_completion_proven(current, exit_status=0)
+        current = store.mark_viewer_detached(current)
+        current = store.mark_local_spool_verified(
+            current,
+            manifest_sha256="d" * 64,
+        )
+
+        with self.assertRaisesRegex(
+            StateConflictError,
+            "recovery or uncollected completion",
+        ):
+            store.mark_abandoned_after_operator_confirmed_reboot(current)
+
     def test_operator_confirmed_dead_pane_abandons_without_inventing_completion(self):
         store = self.make_store()
         current = self.armed(store)

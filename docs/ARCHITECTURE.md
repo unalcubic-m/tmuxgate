@@ -683,18 +683,28 @@ RECEIVED
 ```
 
 `RECOVERY_REQUIRED_POSSIBLY_RUNNING` is deliberately nonterminal and retains
-the lease. If the operator later performs a full reboot of the exact logical
-machine, the broker must be stopped and `tmuxgate recover after-reboot` may
-record `ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT` after an exact controlling-
-terminal confirmation. This terminal audit state preserves the original start,
-identity, job path, and failure detail while explicitly retaining null exit,
-completion, and spool evidence. It performs no SSH or remote cleanup and is
-never presented as a command result. The attestation proves that the old
-process cannot overlap later work; it does not prove rollback or exclude
-partial effects before the reboot, so the interrupted workflow must be
-independently verified before it is repeated. A queued client disconnect cancels its
-unapproved request. A client disconnect after approval never kills or reruns
-the remote job.
+the lease. A whole-host reboot can also strand `COMPLETION_PROVEN` after the
+wrapper status was observed but before canonical output reached the local
+spool; destroying the pinned SSH control socket makes collection impossible.
+For either state, the broker must be stopped and
+`tmuxgate recover after-reboot REQUEST_ID` may record
+`ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT` after an exact controlling-terminal
+confirmation that the entire logical machine rebooted after the recorded start
+time. Stopping the broker retires its process-owned command lease and transport
+pin. On restart, a new transport pool can authenticate a fresh SSH master.
+
+This terminal audit state preserves the original start, identity, and job path.
+For an uncertain request it retains null completion evidence. For a stranded
+completion it copies the prior completion timestamp, exit status, and local
+viewer/terminal gates into the failure detail before clearing the structured
+unverified-result gates. The resulting record remains compatible with existing
+state readers without fabricating canonical output or a verified spool.
+Recovery performs no SSH or remote cleanup and is never presented as a command
+result. The attestation proves that the old process cannot overlap later work;
+it does not prove rollback or exclude partial effects before the reboot, so the
+interrupted workflow must be independently verified before it is repeated. A
+queued client disconnect cancels its unapproved request. A client disconnect
+after approval never kills or reruns the remote job.
 
 `ABANDONED_AFTER_PROVEN_UNSTARTED` is a distinct terminal audit state for a
 remote-mutation-boundary failure whose later canonical evidence proves the

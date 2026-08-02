@@ -213,7 +213,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     after_reboot_parser = recover_subparsers.add_parser(
         "after-reboot",
-        help="record that a full machine reboot abandoned an uncertain request",
+        help=(
+            "record that a full machine reboot abandoned an uncertain or "
+            "uncollectable completed request"
+        ),
     )
     after_reboot_parser.add_argument("request_id")
     after_reboot_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
@@ -748,12 +751,15 @@ def _confirm_reboot_recovery(record: object) -> bool:
             f"machine:    {record.machine_alias}\n"
             f"endpoint:   {record.endpoint_id}\n"
             f"started:    {record.start_time}\n"
+            f"completed:  {getattr(record, 'completion_time', None)}\n"
+            f"exit:       {getattr(record, 'exit_status', None)}\n"
             f"generation: {record.generation}\n"
             f"failure:    {json.dumps(record.failure_detail, ensure_ascii=True)}\n\n"
             "Use this only after the entire named machine was rebooted after the "
-            "start time above. This records an abandoned execution. It does NOT "
-            "claim a remote exit status, completed output, or a verified result "
-            "spool, and it does not contact or clean the remote machine.\n\n"
+            "start time above. This records an abandoned execution. Any prior "
+            "completion evidence shown above is retained in the audit detail, "
+            "but no output or verified result spool is claimed. It does not "
+            "contact or clean the remote machine.\n\n"
             f"Type exactly:\n{phrase}\n> "
         )
         terminal.writer.flush()
@@ -776,9 +782,13 @@ def _recover_after_reboot(args: argparse.Namespace) -> int:
     with acquire_state_lock(paths.state_dir):
         with DurableStateStore(paths.state_dir) as store:
             record = store.load(args.request_id)
-            if record.state is not RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING:
+            if record.state not in {
+                RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+                RequestState.COMPLETION_PROVEN,
+            }:
                 raise StateConflictError(
-                    "after-reboot recovery requires an exact recovery-blocked request"
+                    "after-reboot recovery requires an exact recovery-blocked or "
+                    "uncollected completion-proven request"
                 )
             if not _confirm_reboot_recovery(record):
                 print(

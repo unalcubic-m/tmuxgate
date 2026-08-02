@@ -799,45 +799,74 @@ class DurableStateStore:
         *,
         now: Callable[[], str] = utc_now,
     ) -> DurableJobRecord:
-        """Release an uncertain job only after a full reboot is operator-attested.
+        """Release a stranded job only after a full reboot is operator-attested.
 
-        This transition deliberately records no remote exit status, completion
-        time, canonical output, or verified result spool. The durable record is
-        retained as an auditable terminal failure instead of being relabeled as
-        successful or forgotten.
+        A possibly-running job has no completion evidence to preserve. A
+        completion-proven job can still be stranded when the reboot destroys
+        its SSH master before canonical output is collected. In that case the
+        prior structured completion evidence is copied into the audit detail
+        before the unverified completion gates are cleared. The durable record
+        remains readable by older releases and is never relabeled as a verified
+        result.
         """
 
-        if record.state is not RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING:
+        if record.state not in {
+            RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+            RequestState.COMPLETION_PROVEN,
+        }:
             raise StateConflictError(
-                "operator-confirmed reboot abandonment requires recovery state"
+                "operator-confirmed reboot abandonment requires recovery or "
+                "uncollected completion state"
             )
-        if any(
-            (
-                record.completion_time is not None,
-                record.exit_status is not None,
-                record.local_spool_verified,
-                record.local_spool_manifest_sha256 is not None,
-                record.viewer_detached,
-                record.terminal_restored,
+        if (
+            record.local_spool_verified
+            or record.local_spool_manifest_sha256 is not None
+        ):
+            raise StateConflictError(
+                "operator-confirmed reboot abandonment refuses verified local results"
+            )
+        if (
+            record.state is RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING
+            and any(
+                (
+                    record.completion_time is not None,
+                    record.exit_status is not None,
+                    record.viewer_detached,
+                    record.terminal_restored,
+                )
             )
         ):
             raise StateConflictError(
-                "operator-confirmed reboot abandonment requires every completion "
-                "gate to remain unproven"
+                "operator-confirmed reboot recovery has inconsistent completion gates"
             )
         timestamp = now()
-        prior_detail = record.failure_detail or "remote execution became uncertain"
+        if record.state is RequestState.COMPLETION_PROVEN:
+            prior_detail = (
+                "remote completion was previously proven at "
+                f"{record.completion_time} with exit status {record.exit_status}, "
+                f"viewer_detached={str(record.viewer_detached).lower()}, and "
+                f"terminal_restored={str(record.terminal_restored).lower()}, but "
+                "canonical output and the local result spool were not verified"
+            )
+        else:
+            prior_detail = record.failure_detail or "remote execution became uncertain"
         audit_detail = (
             f"{prior_detail}; controlling-terminal operator confirmed a full reboot "
             f"of logical machine {record.machine_alias} after remote start; remote "
-            "completion, exit status, canonical output, and local spool remain "
-            "unproven"
+            "result publication was abandoned and no SSH action or remote cleanup "
+            "was attempted"
         )
         abandoned = replace(
             record,
             generation=record.generation + 1,
             state=RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
             updated_at=timestamp,
+            completion_time=None,
+            exit_status=None,
+            local_spool_verified=False,
+            local_spool_manifest_sha256=None,
+            viewer_detached=False,
+            terminal_restored=False,
             failure_detail=audit_detail,
         )
         self.write(abandoned)

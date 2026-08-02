@@ -395,6 +395,52 @@ class FailClosedSurfaceTests(unittest.TestCase):
         store.mark_abandoned_after_operator_confirmed_reboot.assert_not_called()
         self.assertIn("no state changed", errors.getvalue())
 
+    def test_after_reboot_reconciles_completion_proven_without_local_spool(self):
+        record = SimpleNamespace(
+            request_id=REQUEST_ID,
+            machine_alias="vps",
+            endpoint_id="wireguard",
+            start_time="2026-08-02T20:55:49.412934Z",
+            completion_time="2026-08-02T20:55:56.981336Z",
+            exit_status=0,
+            generation=5,
+            failure_detail=None,
+            state=RequestState.COMPLETION_PROVEN,
+        )
+        abandoned = SimpleNamespace(request_id=REQUEST_ID, generation=6)
+        terminal = SimpleNamespace(
+            reader=io.StringIO(
+                f"ABANDON {REQUEST_ID} vps GENERATION 5 AFTER FULL REBOOT\n"
+            ),
+            writer=io.StringIO(),
+        )
+        store = mock.MagicMock()
+        store.__enter__.return_value = store
+        store.__exit__.return_value = False
+        store.load.side_effect = (record, record)
+        store.mark_abandoned_after_operator_confirmed_reboot.return_value = abandoned
+        paths = SimpleNamespace(runtime_dir=Path("/runtime"), state_dir=Path("/state"))
+
+        with (
+            mock.patch("tmuxgate.cli.prepare_runtime_layout", return_value=paths),
+            mock.patch("tmuxgate.cli.acquire_state_lock", return_value=nullcontext()),
+            mock.patch("tmuxgate.cli.DurableStateStore", return_value=store),
+            mock.patch(
+                "tmuxgate.cli.open_approval_terminal",
+                return_value=nullcontext(terminal),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            status = cli.main(["recover", "after-reboot", REQUEST_ID])
+
+        self.assertEqual(status, 0)
+        store.mark_abandoned_after_operator_confirmed_reboot.assert_called_once_with(
+            record
+        )
+        prompt = terminal.writer.getvalue()
+        self.assertIn("completed:  2026-08-02T20:55:56.981336Z", prompt)
+        self.assertIn("exit:       0", prompt)
+
     def test_after_dead_pane_recovery_requires_exact_tty_phrase_and_writes_once(self):
         record = SimpleNamespace(
             request_id=REQUEST_ID,
