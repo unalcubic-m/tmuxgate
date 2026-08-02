@@ -197,6 +197,47 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(permit.durable_generation, 2)
         self.assertEqual(len(permit.durable_payload_sha256), 64)
 
+    def test_key_enrollment_has_durable_started_and_verified_boundaries(self):
+        store = self.make_store()
+        approved = store.write(record())
+        enrollment = store.arm_key_enrollment(
+            approved, now=lambda: "2026-07-19T12:01:00.000000Z"
+        )
+        self.assertEqual(
+            enrollment.state,
+            RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
+        )
+        self.assertTrue(enrollment.remote_mutation_started)
+        self.assertEqual(store.load(REQUEST_ID), enrollment)
+
+        verified = store.mark_key_enrollment_verified(
+            enrollment, now=lambda: "2026-07-19T12:02:00.000000Z"
+        )
+        self.assertEqual(
+            verified.state,
+            RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+        )
+        armed, permit = store.arm_remote_start(
+            verified, now=lambda: "2026-07-19T12:03:00.000000Z"
+        )
+        self.assertEqual(armed.state, RequestState.REMOTE_MAY_BE_RUNNING)
+        self.assertEqual(armed.start_time, enrollment.start_time)
+        self.assertEqual(permit.durable_generation, 4)
+
+    def test_uncertain_key_enrollment_is_a_truthful_terminal_setup_failure(self):
+        store = self.make_store()
+        enrollment = store.arm_key_enrollment(store.write(record()))
+        failed = store.fail_remote_setup(
+            enrollment,
+            detail="append completed before verification channel failed",
+        )
+        self.assertEqual(failed.state, RequestState.FAILED_REMOTE_SETUP)
+        self.assertTrue(failed.remote_mutation_started)
+        self.assertIsNone(failed.completion_time)
+        self.assertIsNone(failed.exit_status)
+        self.assertIn("append completed", failed.failure_detail)
+        self.assertEqual(store.load(REQUEST_ID), failed)
+
     def test_bound_approval_plan_creates_predictable_pre_mutation_record(self):
         store = self.make_store()
         request = RequestSpec(
@@ -292,6 +333,26 @@ class StartupRecoveryTests(unittest.TestCase):
         report = recover_startup(store)
         self.assertEqual(report.blocking_request_ids, (REQUEST_ID,))
         self.assertFalse(report.safe_to_accept_new_approvals)
+
+    def test_interrupted_key_enrollment_is_terminalized_without_claiming_command(self):
+        for verified in (False, True):
+            with self.subTest(verified=verified):
+                store = self.make_store()
+                current = store.arm_key_enrollment(store.write(record()))
+                if verified:
+                    current = store.mark_key_enrollment_verified(current)
+                report = recover_startup(
+                    store, now=lambda: "2026-07-19T12:03:00.000000Z"
+                )
+                recovered = store.load(REQUEST_ID)
+                self.assertEqual(recovered.state, RequestState.FAILED_REMOTE_SETUP)
+                self.assertTrue(recovered.remote_mutation_started)
+                self.assertIsNone(recovered.completion_time)
+                self.assertIn(
+                    "verified" if verified else "may have mutated",
+                    recovered.failure_detail,
+                )
+                self.assertTrue(report.safe_to_accept_new_approvals)
 
 
 class DurableLifecycleTransitionTests(unittest.TestCase):

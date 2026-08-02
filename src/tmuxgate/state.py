@@ -49,6 +49,13 @@ _PROVEN_UNSTARTED_STATES = frozenset(
 )
 _ABANDONED_STATES = _OPERATOR_ABANDONED_STATES | _PROVEN_UNSTARTED_STATES
 _REMOTE_STARTED_STATES = _REMOTE_ACTIVE_STATES | _ABANDONED_STATES
+_REMOTE_MUTATION_STATES = _REMOTE_STARTED_STATES | frozenset(
+    {
+        RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
+        RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+        RequestState.FAILED_REMOTE_SETUP,
+    }
+)
 _SAFE_PRE_REMOTE_RESTART_STATES = frozenset(
     {
         RequestState.QUEUED,
@@ -236,10 +243,12 @@ class DurableJobRecord:
             optional=True,
         )
 
-        if state in _REMOTE_STARTED_STATES and not self.remote_mutation_started:
+        if state in _REMOTE_MUTATION_STATES and not self.remote_mutation_started:
             raise StateCorruptionError("remote lifecycle state lacks mutation boundary")
         if state in {
             RequestState.APPROVED_PRE_REMOTE,
+            RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
+            RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
             RequestState.REMOTE_MAY_BE_RUNNING,
             RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
             RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
@@ -248,6 +257,7 @@ class DurableJobRecord:
             RequestState.COMPLETION_PROVEN,
             RequestState.LOCAL_SPOOL_VERIFIED,
             RequestState.LEASE_RELEASED,
+            RequestState.FAILED_REMOTE_SETUP,
         } and self.decision is not ApprovalDecision.APPROVED:
             raise StateCorruptionError("approved lifecycle state lacks approved decision")
         if state is RequestState.DENIED and self.decision is not ApprovalDecision.DENIED:
@@ -256,6 +266,8 @@ class DurableJobRecord:
             raise StateCorruptionError("unapproved state unexpectedly has a decision")
         if state in {
             RequestState.APPROVED_PRE_REMOTE,
+            RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
+            RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
             RequestState.REMOTE_MAY_BE_RUNNING,
             RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
             RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
@@ -264,6 +276,7 @@ class DurableJobRecord:
             RequestState.COMPLETION_PROVEN,
             RequestState.LOCAL_SPOOL_VERIFIED,
             RequestState.LEASE_RELEASED,
+            RequestState.FAILED_REMOTE_SETUP,
         } and any(value is None for value in resolved_fields):
             raise StateCorruptionError("approved lifecycle state lacks resolved identity")
         if state in _REMOTE_STARTED_STATES and self.remote_job_path is None:
@@ -309,6 +322,8 @@ class DurableJobRecord:
             RequestState.FAILED_PRE_REMOTE,
         } and self.remote_mutation_started:
             raise StateCorruptionError("pre-remote terminal state claims remote mutation")
+        if state is RequestState.FAILED_REMOTE_SETUP and self.failure_detail is None:
+            raise StateCorruptionError("remote setup failure lacks audit detail")
         if self.remote_mutation_started and state in {
             RequestState.LEASE_RELEASED,
             RequestState.RESULT_DELIVERING,
@@ -636,8 +651,13 @@ class DurableStateStore:
     ) -> tuple[DurableJobRecord, RemoteStartPermit]:
         """Fsync `REMOTE_MAY_BE_RUNNING` before returning a start permit."""
 
-        if record.state is not RequestState.APPROVED_PRE_REMOTE:
-            raise StateConflictError("remote start can be armed only after approval")
+        if record.state not in {
+            RequestState.APPROVED_PRE_REMOTE,
+            RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+        }:
+            raise StateConflictError(
+                "remote start can be armed only after approval and verified setup"
+            )
         if record.remote_job_path is None or record.connection_plan_sha256 is None:
             raise StateConflictError(
                 "remote start requires a planned guarded job identity and connection plan"
@@ -648,12 +668,83 @@ class DurableStateStore:
             generation=record.generation + 1,
             state=RequestState.REMOTE_MAY_BE_RUNNING,
             remote_mutation_started=True,
-            start_time=timestamp,
+            start_time=record.start_time or timestamp,
             updated_at=timestamp,
         )
         self.write(armed)
         payload_digest = _sha256_document(armed.payload_document())
         return armed, RemoteStartPermit(armed.request_id, armed.generation, payload_digest)
+
+    def arm_key_enrollment(
+        self,
+        record: DurableJobRecord,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Fsync the enrollment boundary before ``authorized_keys`` may change."""
+
+        if record.state is not RequestState.APPROVED_PRE_REMOTE:
+            raise StateConflictError("key enrollment can be armed only after approval")
+        timestamp = now()
+        armed = replace(
+            record,
+            generation=record.generation + 1,
+            state=RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
+            remote_mutation_started=True,
+            start_time=timestamp,
+            updated_at=timestamp,
+        )
+        self.write(armed)
+        return armed
+
+    def mark_key_enrollment_verified(
+        self,
+        record: DurableJobRecord,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Record that enrollment completed and the exact key is present."""
+
+        if record.state is not RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED:
+            raise StateConflictError("key enrollment verification lacks its boundary")
+        timestamp = now()
+        verified = replace(
+            record,
+            generation=record.generation + 1,
+            state=RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+            updated_at=timestamp,
+        )
+        self.write(verified)
+        return verified
+
+    def fail_remote_setup(
+        self,
+        record: DurableJobRecord,
+        *,
+        detail: str,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Terminalize setup after a remote mutation, without claiming a job ran."""
+
+        if record.state not in {
+            RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
+            RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+        }:
+            raise StateConflictError(
+                "remote setup failure requires a key-enrollment mutation state"
+            )
+        if not isinstance(detail, str) or not detail or "\x00" in detail:
+            raise ValueError("failure detail must be non-empty text without NUL")
+        timestamp = now()
+        failed = replace(
+            record,
+            generation=record.generation + 1,
+            state=RequestState.FAILED_REMOTE_SETUP,
+            updated_at=timestamp,
+            failure_detail=detail,
+        )
+        self.write(failed)
+        return failed
 
     def fail_pre_remote(
         self,
@@ -1080,6 +1171,21 @@ def recover_startup(
     records = list(store.load_all())
     interrupted: list[str] = []
     for index, record in enumerate(records):
+        if record.state in {
+            RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
+            RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+        }:
+            detail = (
+                "broker restarted after SSH key enrollment may have mutated "
+                "authorized_keys; the requested command was not started"
+                if record.state is RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED
+                else
+                "broker restarted after SSH key enrollment was verified but before "
+                "the requested command start was armed"
+            )
+            records[index] = store.fail_remote_setup(record, detail=detail, now=now)
+            interrupted.append(record.request_id)
+            continue
         if record.state not in _SAFE_PRE_REMOTE_RESTART_STATES:
             continue
         if record.remote_mutation_started:

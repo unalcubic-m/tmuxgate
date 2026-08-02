@@ -26,6 +26,7 @@ class TransportStatus(StrEnum):
     BROKER_BUSY = "broker_busy"
     INVALID_REQUEST = "invalid_request"
     PRE_REMOTE_FAILURE = "pre_remote_failure"
+    REMOTE_SETUP_FAILURE = "remote_setup_failure"
     INCOMPLETE = "incomplete"
     COMMAND_TIMEOUT = "command_timeout"
     RESULT_COLLECTION_FAILURE = "result_collection_failure"
@@ -37,6 +38,7 @@ LOCAL_EXIT_CODES: dict[TransportStatus, int] = {
     TransportStatus.BROKER_BUSY: 75,
     TransportStatus.INVALID_REQUEST: 64,
     TransportStatus.PRE_REMOTE_FAILURE: 69,
+    TransportStatus.REMOTE_SETUP_FAILURE: 70,
     TransportStatus.INCOMPLETE: 70,
     TransportStatus.COMMAND_TIMEOUT: 124,
     TransportStatus.RESULT_COLLECTION_FAILURE: 74,

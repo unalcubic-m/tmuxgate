@@ -13,7 +13,7 @@ from tmuxgate.operator_interface import OperatorDecision
 from tmuxgate.transport import MasterTransportPool, SshMasterStartError
 from test_planning import PlannerHarness, request
 from test_remote_job import FakeRemoteBackend
-from test_transport import FakeMasterBackend
+from test_transport import FakeKeyManager, FakeMasterBackend
 
 
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
@@ -179,6 +179,78 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
         self.assertEqual(self.state.load_all(), ())
         self.assertIsNone(self.pool.pinned_request_id)
+
+    def test_uncertain_key_enrollment_blocks_retry_and_route_fallback(self):
+        self.pool.key_manager = FakeKeyManager("post-failure")
+        spec = request(("true",))
+        self.approve(spec)
+        fallback_calls = []
+
+        def unexpected_fallback(*args, **kwargs):
+            fallback_calls.append((args, kwargs))
+            return ApprovalDecision.APPROVED
+
+        result = self.executor(
+            AutoCompletingBackend(),
+            fallback_approver=unexpected_fallback,
+            ssh_retry_approver=lambda *args, **kwargs: ApprovalDecision.APPROVED,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(
+            result.transport_status,
+            TransportStatus.REMOTE_SETUP_FAILURE,
+        )
+        self.assertEqual(fallback_calls, [])
+        self.assertEqual(len(self.master_backend.starts), 1)
+        durable = self.state.load(REQUEST_ID)
+        self.assertEqual(durable.state, RequestState.FAILED_REMOTE_SETUP)
+        self.assertTrue(durable.remote_mutation_started)
+        self.assertEqual(durable.endpoint_id, "home-lan")
+        self.assertIn("fallback were not attempted", durable.failure_detail)
+        self.assertIsNone(self.pool.pinned_request_id)
+
+    def test_read_only_enrollment_failure_keeps_normal_approved_fallback(self):
+        self.pool.key_manager = FakeKeyManager(["pre-failure", "present"])
+        spec = request(("true",))
+        self.approve(spec)
+        fallback_calls = []
+
+        def approve_fallback(*args, **kwargs):
+            fallback_calls.append((args, kwargs))
+            return ApprovalDecision.APPROVED
+
+        result = self.executor(
+            AutoCompletingBackend(),
+            fallback_approver=approve_fallback,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
+        self.assertEqual(len(fallback_calls), 1)
+        self.assertFalse(fallback_calls[0][1]["remote_mutation_started"])
+        self.assertEqual(len(self.master_backend.starts), 2)
+        durable = self.state.load(REQUEST_ID)
+        self.assertEqual(durable.endpoint_id, "wireguard")
+
+    def test_verified_key_enrollment_continues_into_normal_command_boundary(self):
+        self.pool.key_manager = FakeKeyManager("enrolled")
+        spec = request(("true",))
+        self.approve(spec)
+
+        result = self.executor(AutoCompletingBackend())(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
+        durable = self.state.load(REQUEST_ID)
+        self.assertEqual(durable.state, RequestState.RESULT_DELIVERING)
+        self.assertTrue(durable.remote_mutation_started)
+        self.assertEqual(durable.endpoint_id, "home-lan")
+        self.assertEqual(
+            self.pool.key_manager.events,
+            [
+                ("local-key-prepared", "home-lan"),
+                ("remote-key-inspected", "home-lan"),
+                ("remote-enrollment-started", "home-lan"),
+            ],
+        )
 
     def test_disabled_after_approval_is_proven_pre_remote_without_recovery_state(self):
         spec = request(("true",))

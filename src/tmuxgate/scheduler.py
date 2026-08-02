@@ -49,6 +49,8 @@ class RequestState(StrEnum):
     AWAITING_APPROVAL = "awaiting-approval"
     DENIED = "denied"
     APPROVED_PRE_REMOTE = "approved-pre-remote"
+    KEY_ENROLLMENT_MAY_HAVE_STARTED = "key-enrollment-may-have-started"
+    KEY_ENROLLMENT_VERIFIED_PRE_REMOTE = "key-enrollment-verified-pre-remote"
     REMOTE_MAY_BE_RUNNING = "remote-may-be-running"
     RECOVERY_REQUIRED_POSSIBLY_RUNNING = "recovery-required-possibly-running"
     ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT = (
@@ -62,6 +64,7 @@ class RequestState(StrEnum):
     LOCAL_SPOOL_VERIFIED = "local-spool-verified"
     LEASE_RELEASED = "lease-released"
     FAILED_PRE_REMOTE = "failed-pre-remote"
+    FAILED_REMOTE_SETUP = "failed-remote-setup"
     RESULT_DELIVERING = "result-delivering"
     DONE = "done"
 
@@ -75,6 +78,7 @@ class LeaseReleaseReason(StrEnum):
     CANCELLED_BEFORE_APPROVAL = "cancelled-before-approval"
     DENIED = "denied"
     PRE_REMOTE_FAILURE = "pre-remote-failure"
+    REMOTE_SETUP_FAILURE = "remote-setup-failure"
     VERIFIED_COMPLETION = "verified-completion"
 
 
@@ -102,6 +106,7 @@ _RESULT_READY_STATES = frozenset(
     {
         RequestState.DENIED,
         RequestState.FAILED_PRE_REMOTE,
+        RequestState.FAILED_REMOTE_SETUP,
         RequestState.LEASE_RELEASED,
     }
 )
@@ -320,6 +325,25 @@ class SequentialScheduler:
             record.request_id,
             state=RequestState.FAILED_PRE_REMOTE,
             lease_release_reason=LeaseReleaseReason.PRE_REMOTE_FAILURE,
+            failure_detail=detail,
+        )
+        self._release_owner(request_id)
+        self._assert_invariants()
+        return record
+
+    def mark_remote_setup_failure(
+        self, request_id: str, *, detail: str
+    ) -> ScheduledRequest:
+        """Release a request whose setup mutated remote state but ran no job."""
+
+        record = self._require_state(request_id, RequestState.APPROVED_PRE_REMOTE)
+        self._require_lease_owner(request_id)
+        if not isinstance(detail, str) or not detail or "\x00" in detail:
+            raise ValueError("failure detail must be a non-empty string without NUL")
+        record = self._replace(
+            record.request_id,
+            state=RequestState.FAILED_REMOTE_SETUP,
+            lease_release_reason=LeaseReleaseReason.REMOTE_SETUP_FAILURE,
             failure_detail=detail,
         )
         self._release_owner(request_id)

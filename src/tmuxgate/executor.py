@@ -7,6 +7,7 @@ import threading
 import time
 
 from tmuxgate.approval import ApprovalDecision
+from tmuxgate.connection_plan import ConnectionPlan, PlannedEndpoint
 from tmuxgate.models import RequestSpec
 from tmuxgate.operator_interface import (
     MachineDisablePrompt,
@@ -24,9 +25,12 @@ from tmuxgate.remote_job import (
     RemoteJobState,
 )
 from tmuxgate.result import ExecutionResult, TransportStatus
+from tmuxgate.scheduler import RequestState
+from tmuxgate.ssh import ResolvedSshEndpoint
 from tmuxgate.spool import ResultSpool
 from tmuxgate.state import DurableJobRecord, DurableStateStore, new_approved_job_record
 from tmuxgate.transport import (
+    KeyEnrollmentMutationError,
     MasterTransport,
     MasterTransportPool,
     SshMasterStartError,
@@ -43,6 +47,96 @@ class ExecutorError(RuntimeError):
 
 class SshEndpointsExhaustedError(TransportError):
     """Every approved endpoint exhausted its bounded SSH master retry."""
+
+
+class KeyEnrollmentBoundaryError(TransportError):
+    """The durable enrollment boundary could not be established safely."""
+
+
+class RemoteSetupFailure(TransportError):
+    """A remote setup mutation occurred, so retry and fallback are forbidden."""
+
+    def __init__(self, detail: str, record: DurableJobRecord) -> None:
+        super().__init__(detail)
+        self.record = record
+
+
+class _DurableKeyEnrollmentLifecycle:
+    """Bind a possible key append to the approved request before it starts."""
+
+    def __init__(
+        self,
+        state: DurableStateStore,
+        request_id: str,
+        request: RequestSpec,
+        plan: ConnectionPlan,
+        endpoint: PlannedEndpoint,
+    ) -> None:
+        self.state = state
+        self.request_id = request_id
+        self.request = request
+        self.plan = plan
+        self.endpoint = endpoint
+        self.record: DurableJobRecord | None = None
+
+    def before_remote_mutation(self, resolved: ResolvedSshEndpoint) -> None:
+        if resolved != self.endpoint.resolved:
+            raise KeyEnrollmentBoundaryError(
+                "key enrollment endpoint differs from the approved route"
+            )
+        if self.record is not None:
+            raise KeyEnrollmentBoundaryError(
+                "key enrollment mutation boundary was requested more than once"
+            )
+        try:
+            approved = new_approved_job_record(
+                self.request_id,
+                self.request,
+                self.plan,
+                planned_endpoint=self.endpoint,
+            )
+            self.record = self.state.write(approved)
+            self.record = self.state.arm_key_enrollment(self.record)
+        except BaseException as exc:
+            if (
+                self.record is not None
+                and self.record.state is RequestState.APPROVED_PRE_REMOTE
+            ):
+                try:
+                    self.record = self.state.fail_pre_remote(
+                        self.record,
+                        detail="durable SSH key-enrollment boundary failed",
+                    )
+                except BaseException:
+                    pass
+            raise KeyEnrollmentBoundaryError(
+                "durable SSH key-enrollment boundary failed before remote mutation"
+            ) from exc
+
+    def remote_mutation_verified(self, resolved: ResolvedSshEndpoint) -> None:
+        if resolved != self.endpoint.resolved or self.record is None:
+            raise KeyEnrollmentMutationError(
+                "key enrollment verification is not bound to the armed endpoint"
+            )
+        self.record = self.state.mark_key_enrollment_verified(self.record)
+
+    def fail_after_remote_mutation(self, detail: str) -> DurableJobRecord:
+        if self.record is None or not self.record.remote_mutation_started:
+            raise ExecutorError("key enrollment failure lacks a durable mutation record")
+        try:
+            if self.record.state in {
+                RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
+                RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+            }:
+                self.record = self.state.fail_remote_setup(
+                    self.record,
+                    detail=detail[:1000],
+                )
+        except BaseException:
+            # The already-fsynced may-have-started record remains truthful and
+            # startup recovery will terminalize it conservatively.
+            pass
+        return self.record
 
 
 RemoteBackendFactory = Callable[[MasterTransport], object]
@@ -120,7 +214,12 @@ class RealExecutor:
         with self._records_lock:
             return tuple(sorted(self._recovery_jobs))
 
-    def _acquire_transport(self, request_id: str, request: RequestSpec, plan):
+    def _acquire_transport(
+        self,
+        request_id: str,
+        request: RequestSpec,
+        plan: ConnectionPlan,
+    ) -> tuple[TransportLease, PlannedEndpoint, DurableJobRecord | None]:
         failure: BaseException | None = None
         all_endpoints_exhausted = True
         for index, endpoint in enumerate(plan.endpoints):
@@ -158,10 +257,29 @@ class RealExecutor:
                 )
             ssh_attempt = 0
             while True:
+                enrollment = _DurableKeyEnrollmentLifecycle(
+                    self.state,
+                    request_id,
+                    request,
+                    plan,
+                    endpoint,
+                )
                 try:
                     lease = self.transports.acquire(
-                        authorization, endpoint.resolved
+                        authorization,
+                        endpoint.resolved,
+                        key_enrollment_lifecycle=enrollment,
                     )
+                except KeyEnrollmentBoundaryError:
+                    raise
+                except KeyEnrollmentMutationError as exc:
+                    detail = (
+                        f"SSH key enrollment on {endpoint.resolved.endpoint_id} "
+                        f"failed after remote mutation may have started: {exc}; "
+                        "retry and route fallback were not attempted"
+                    )
+                    record = enrollment.fail_after_remote_mutation(detail)
+                    raise RemoteSetupFailure(detail, record) from exc
                 except SshMasterStartError as exc:
                     failure = exc
                     if ssh_attempt == 0:
@@ -198,10 +316,21 @@ class RealExecutor:
                         )
                     break
                 except TransportError as exc:
+                    if (
+                        enrollment.record is not None
+                        and enrollment.record.remote_mutation_started
+                    ):
+                        detail = (
+                            f"SSH setup on {endpoint.resolved.endpoint_id} failed "
+                            f"after verified key enrollment: {exc}; retry and route "
+                            "fallback were not attempted"
+                        )
+                        record = enrollment.fail_after_remote_mutation(detail)
+                        raise RemoteSetupFailure(detail, record) from exc
                     all_endpoints_exhausted = False
                     failure = exc
                     break
-                return lease, endpoint
+                return lease, endpoint, enrollment.record
             if index + 1 == len(plan.endpoints):
                 assert failure is not None
                 if all_endpoints_exhausted:
@@ -264,10 +393,16 @@ class RealExecutor:
                 detail=f"approved connection plan was not usable: {exc}",
             )
         try:
-            lease, endpoint = self._acquire_transport(
+            lease, endpoint, approved = self._acquire_transport(
                 request_id,
                 request,
                 context.connection_plan,
+            )
+        except RemoteSetupFailure as exc:
+            return ExecutionResult(
+                request_id,
+                TransportStatus.REMOTE_SETUP_FAILURE,
+                detail=str(exc),
             )
         except SshEndpointsExhaustedError as exc:
             disable_detail = "; machine remains enabled"
@@ -316,20 +451,45 @@ class RealExecutor:
             )
 
         try:
-            approved = new_approved_job_record(
-                request_id,
-                request,
-                context.connection_plan,
-                planned_endpoint=endpoint,
-            )
-            approved = self.state.write(approved)
+            if approved is None:
+                approved = new_approved_job_record(
+                    request_id,
+                    request,
+                    context.connection_plan,
+                    planned_endpoint=endpoint,
+                )
+                approved = self.state.write(approved)
             armed, permit = self.state.arm_remote_start(approved)
         except BaseException as exc:
             try:
-                if "approved" in locals():
+                if (
+                    approved is not None
+                    and approved.state
+                    is RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE
+                ):
+                    self.state.fail_remote_setup(
+                        approved,
+                        detail=(
+                            "durable command-start boundary failed after verified "
+                            f"SSH key enrollment: {str(exc)[:800]}"
+                        ),
+                    )
+                elif approved is not None:
                     self.state.fail_pre_remote(approved, detail=str(exc)[:1000])
             finally:
                 lease.release()
+            if (
+                approved is not None
+                and approved.remote_mutation_started
+            ):
+                return ExecutionResult(
+                    request_id,
+                    TransportStatus.REMOTE_SETUP_FAILURE,
+                    detail=(
+                        "SSH key enrollment was verified, but the durable command-start "
+                        f"boundary failed: {exc}; no route fallback was attempted"
+                    ),
+                )
             return ExecutionResult(
                 request_id,
                 TransportStatus.PRE_REMOTE_FAILURE,
