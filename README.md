@@ -331,10 +331,18 @@ enrollment or its verification then fails, the request ends with
 `remote_setup_failure`; it is never retried or offered a fallback route. An
 already-present exact key is detected with a read-only check and does not cross
 that mutation boundary.
-The dedicated per-machine key is the only effective identity file permitted,
-and it is used with `IdentitiesOnly=yes`, so unrelated agent/default keys
-cannot consume the server's authentication-attempt limit. Profile-added
-`IdentityFile` or `CertificateFile` entries make SSH planning fail closed.
+The dedicated per-machine key is the only effective identity file permitted.
+The narrowly scoped enrollment master explicitly allows public-key, keyboard-
+interactive, and password authentication so first use can install that key,
+but it sets `IdentityAgent=none`, uses `IdentitiesOnly=yes`, disables GSSAPI and
+host-based authentication, and is used only for the enrollment protocol. Once
+the exact key is verified, tmuxgate closes that master and creates the command
+master with public-key authentication only: password and keyboard-interactive
+fallback are disabled before any requested command can start. SSH subprocesses
+also receive no `SSH_AUTH_SOCK`. Profile-added `IdentityFile` or
+`CertificateFile` entries make SSH planning fail closed. The complete
+enrollment and post-enrollment authentication policy is included in the SSH
+policy and resolved-identity digests shown in approval evidence.
 
 ## Security model
 

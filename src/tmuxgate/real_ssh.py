@@ -97,7 +97,7 @@ def _discard_pending_terminal_input(terminal: BinaryIO, expected_tty: str) -> No
 def _safe_environment() -> dict[str, str]:
     allowed = (
         "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME",
-        "SSH_AUTH_SOCK", "TERM", "USER",
+        "TERM", "USER",
     )
     environment = {"PATH": "/usr/bin:/bin"}
     for name in allowed:
@@ -132,15 +132,25 @@ class SubprocessMasterBackend:
         self.terminal_lock = threading.RLock() if terminal_lock is None else terminal_lock
 
     def start_master(self, invocation: SshInvocation, control_path: Path) -> None:
-        if invocation.kind != "start-master" or not invocation.interactive_terminal:
-            raise TransportError("master start requires the interactive start invocation")
+        expected_interactive = invocation.kind == "start-enrollment-master"
+        if invocation.kind not in {"start-enrollment-master", "start-master"}:
+            raise TransportError("master start requires a start invocation")
+        if invocation.interactive_terminal != expected_interactive:
+            raise TransportError("master start has an invalid terminal policy")
         with self.terminal_lock:
             with self.terminal_opener("/dev/tty", "r+b", buffering=0) as terminal:
-                terminal.write(
-                    b"\r\n[tmuxgate] Establishing the approved SSH connection. "
-                    b"Complete any OpenSSH prompt below; no remote command has "
-                    b"started.\r\n"
-                )
+                if expected_interactive:
+                    terminal.write(
+                        b"\r\n[tmuxgate] Establishing the approved enrollment "
+                        b"connection. Complete any OpenSSH prompt below; this "
+                        b"connection can only inspect or enroll the dedicated "
+                        b"tmuxgate key, and no requested command has started.\r\n"
+                    )
+                else:
+                    terminal.write(
+                        b"\r\n[tmuxgate] Establishing the public-key-only SSH "
+                        b"connection; no requested command has started.\r\n"
+                    )
                 terminal.flush()
                 completed = self.runner(
                     invocation.argv,

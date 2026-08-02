@@ -284,7 +284,7 @@ class RealSshProcessTests(unittest.TestCase):
             ],
         )
 
-    def test_master_authentication_inherits_only_broker_terminal(self):
+    def test_enrollment_authentication_inherits_only_broker_terminal(self):
         calls = []
         terminal = FakeTerminal()
         terminal_lock = FlagLock()
@@ -299,13 +299,36 @@ class RealSshProcessTests(unittest.TestCase):
             terminal_opener=lambda *args, **kwargs: terminal,
             terminal_lock=terminal_lock,
         )
-        invocation = SshInvocation("start-master", ("/usr/bin/ssh",), True)
+        invocation = SshInvocation(
+            "start-enrollment-master", ("/usr/bin/ssh",), True
+        )
         backend.start_master(invocation, Path("/tmp/master.sock"))
         kwargs = calls[0][1]
         self.assertIs(kwargs["stdin"], terminal)
         self.assertIs(kwargs["stdout"], terminal)
         self.assertIs(kwargs["stderr"], terminal)
-        self.assertIn(b"no remote command has started", terminal.getvalue())
+        self.assertNotIn("SSH_AUTH_SOCK", kwargs["env"])
+        self.assertIn(b"no requested command has started", terminal.getvalue())
+
+    def test_post_enrollment_master_cannot_be_prompt_capable(self):
+        terminal = FakeTerminal()
+        backend = SubprocessMasterBackend(
+            runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv, 0, b"", b""
+            ),
+            terminal_opener=lambda *args, **kwargs: terminal,
+        )
+        backend.start_master(
+            SshInvocation("start-master", ("/usr/bin/ssh",), False),
+            Path("/tmp/master.sock"),
+        )
+        self.assertIn(b"public-key-only", terminal.getvalue())
+
+        with self.assertRaisesRegex(TransportError, "terminal policy"):
+            backend.start_master(
+                SshInvocation("start-master", ("/usr/bin/ssh",), True),
+                Path("/tmp/master.sock"),
+            )
 
     def test_master_failure_reports_status_without_copying_terminal_output(self):
         terminal = FakeTerminal()
@@ -322,7 +345,9 @@ class RealSshProcessTests(unittest.TestCase):
             runner=run,
             terminal_opener=lambda *args, **kwargs: terminal,
         )
-        invocation = SshInvocation("start-master", ("/usr/bin/ssh",), True)
+        invocation = SshInvocation(
+            "start-enrollment-master", ("/usr/bin/ssh",), True
+        )
 
         with self.assertRaises(SshMasterStartError) as raised:
             backend.start_master(invocation, Path("/tmp/master.sock"))

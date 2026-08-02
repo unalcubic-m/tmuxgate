@@ -239,10 +239,18 @@ def _connection_plan_lines(
                 f"{prefix}.proxy_jump: {_quoted_text(resolved.proxy_jump or 'none')}",
                 f"{prefix}.proxy_command: {_quoted_text(resolved.proxy_command or 'none')}",
                 f"{prefix}.identity_agent: {_quoted_text(resolved.identity_agent or 'default')}",
+                f"{prefix}.enrollment_authentication_methods: "
+                f"{_quoted_text(','.join(resolved.enabled_authentication_methods))}",
+                f"{prefix}.post_enrollment_authentication_methods: "
+                f"{_quoted_text(','.join(resolved.post_enrollment_authentication_methods))}",
                 f"{prefix}.ssh_g_output_sha256: {resolved.ssh_g_output_sha256}",
                 f"{prefix}.ssh_policy_sha256: {resolved.ssh_policy_sha256}",
             ]
         )
+        for identity_file in resolved.identity_files:
+            lines.append(
+                f"{prefix}.identity_file: {_quoted_text(identity_file)}"
+            )
         for record in resolved.host_key_evidence.records:
             lines.append(
                 f"{prefix}.host_key: {record.algorithm} {record.fingerprint_sha256} "

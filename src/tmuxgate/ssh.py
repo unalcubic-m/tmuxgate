@@ -26,7 +26,7 @@ DEFAULT_SSH_KEYGEN_PATH = Path("/usr/bin/ssh-keygen")
 DEFAULT_RESOLUTION_TIMEOUT_SECONDS = 5.0
 MAX_SSH_G_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_KNOWN_HOSTS_BYTES = 16 * 1024 * 1024
-SSH_POLICY_VERSION = 2
+SSH_POLICY_VERSION = 3
 
 _KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*\Z", re.ASCII)
 _SAFE_STRICT_HOST_KEY_CHECKING = frozenset({"ask", "yes"})
@@ -130,6 +130,7 @@ class ResolvedSshEndpoint:
     identity_agent: str | None
     identity_files: tuple[str, ...]
     enabled_authentication_methods: tuple[str, ...]
+    post_enrollment_authentication_methods: tuple[str, ...]
     ssh_g_output_sha256: str
     ssh_policy_sha256: str
     ssh_g_argv: tuple[str, ...]
@@ -148,6 +149,9 @@ class ResolvedSshEndpoint:
             "host_key_evidence": self.host_key_evidence.canonical_document(),
             "identity_agent": self.identity_agent,
             "identity_files": list(self.identity_files),
+            "post_enrollment_authentication_methods": list(
+                self.post_enrollment_authentication_methods
+            ),
             "proxy_command": self.proxy_command,
             "proxy_jump": self.proxy_jump,
             "required_context": self.required_context,
@@ -182,7 +186,9 @@ def _canonical_sha256(document: Mapping[str, object]) -> str:
 
 
 def _safe_environment() -> dict[str, str]:
-    allowed = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "SSH_AUTH_SOCK", "USER")
+    allowed = (
+        "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "USER"
+    )
     environment: dict[str, str] = {"PATH": "/usr/bin:/bin"}
     for name in allowed:
         value = os.environ.get(name)
@@ -218,9 +224,23 @@ def build_ssh_g_argv(
         "-o",
         f"IdentityFile={default_tmuxgate_identity_file(machine.name)}",
         "-o",
+        "IdentityAgent=none",
+        "-o",
         "IdentitiesOnly=yes",
         "-o",
+        "GSSAPIAuthentication=no",
+        "-o",
+        "HostbasedAuthentication=no",
+        "-o",
+        "KbdInteractiveAuthentication=yes",
+        "-o",
+        "PasswordAuthentication=yes",
+        "-o",
         "PermitLocalCommand=no",
+        "-o",
+        "PreferredAuthentications=publickey,keyboard-interactive,password",
+        "-o",
+        "PubkeyAuthentication=yes",
         "-o",
         f"Port={endpoint.port}",
         "-o",
@@ -413,7 +433,17 @@ def collect_host_key_evidence(
 
 def _policy_document(machine: Machine, endpoint: Endpoint) -> dict[str, object]:
     return {
-        "batch_mode_for_initial_master": False,
+        "enrollment_authentication": {
+            "batch_mode": False,
+            "gssapi_authentication": False,
+            "hostbased_authentication": False,
+            "keyboard_interactive_authentication": True,
+            "password_authentication": True,
+            "preferred_authentications": [
+                "publickey", "keyboard-interactive", "password"
+            ],
+            "publickey_authentication": True,
+        },
         "batch_mode_for_post_auth_channels": True,
         "certificate_files": [],
         "canonicalize_hostname": False,
@@ -424,6 +454,7 @@ def _policy_document(machine: Machine, endpoint: Endpoint) -> dict[str, object]:
         "identity_files": [
             os.fspath(default_tmuxgate_identity_file(machine.name))
         ],
+        "identity_agent": "none",
         "identities_only": True,
         "machine_control": {
             "remote_command": "none",
@@ -431,6 +462,15 @@ def _policy_document(machine: Machine, endpoint: Endpoint) -> dict[str, object]:
             "ssh_flag": "-T",
         },
         "permit_local_command": False,
+        "post_enrollment_authentication": {
+            "batch_mode": True,
+            "gssapi_authentication": False,
+            "hostbased_authentication": False,
+            "keyboard_interactive_authentication": False,
+            "password_authentication": False,
+            "preferred_authentications": ["publickey"],
+            "publickey_authentication": True,
+        },
         "policy_version": SSH_POLICY_VERSION,
         "remote_user": machine.user,
         "viewer": {
@@ -489,6 +529,7 @@ def resolve_ssh_endpoint(
     request_tty = _single(parsed, "requesttty")
     batch_mode = _single(parsed, "batchmode")
     identities_only = _single(parsed, "identitiesonly")
+    identity_agent = _single(parsed, "identityagent")
     canonicalize = _single(parsed, "canonicalizehostname")
     permit_local = _single(parsed, "permitlocalcommand")
     remote_command = _optional_value(parsed, "remotecommand")
@@ -519,6 +560,8 @@ def resolve_ssh_endpoint(
         raise SshResolutionError(
             "SSH must use only explicitly configured identities"
         )
+    if identity_agent.lower() != "none":
+        raise SshResolutionError("SSH agent use must be disabled")
     expected_identity_file = os.fspath(
         default_tmuxgate_identity_file(machine.name)
     )
@@ -566,6 +609,25 @@ def resolve_ssh_endpoint(
         for label, key in authentication_options
         if (_single(parsed, key, required=False) or "no").lower() not in _FALSE_VALUES
     )
+    if enabled_authentication != (
+        "publickey", "password", "keyboard-interactive"
+    ):
+        raise SshResolutionError(
+            "SSH enrollment authentication policy was not applied exactly"
+    )
+    for option in ("gssapiauthentication", "hostbasedauthentication"):
+        observed = (_single(parsed, option, required=False) or "yes").lower()
+        if observed not in _FALSE_VALUES:
+            raise SshResolutionError(
+                "SSH enrollment must disable non-key workstation authentication"
+            )
+    preferred_authentication = _single(
+        parsed, "preferredauthentications", required=False
+    )
+    if preferred_authentication != "publickey,keyboard-interactive,password":
+        raise SshResolutionError(
+            "SSH enrollment authentication order was not applied exactly"
+        )
     policy_sha256 = _canonical_sha256(_policy_document(machine, endpoint))
     return ResolvedSshEndpoint(
         machine_name=machine.name,
@@ -587,9 +649,10 @@ def resolve_ssh_endpoint(
         host_key_evidence=host_key_evidence,
         proxy_jump=_optional_value(parsed, "proxyjump"),
         proxy_command=_optional_value(parsed, "proxycommand"),
-        identity_agent=_optional_value(parsed, "identityagent"),
+        identity_agent=identity_agent,
         identity_files=identity_files,
         enabled_authentication_methods=enabled_authentication,
+        post_enrollment_authentication_methods=("publickey",),
         ssh_g_output_sha256=hashlib.sha256(raw_output).hexdigest(),
         ssh_policy_sha256=policy_sha256,
         ssh_g_argv=argv,

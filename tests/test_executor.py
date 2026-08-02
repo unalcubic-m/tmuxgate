@@ -227,7 +227,10 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
         self.assertEqual(len(fallback_calls), 1)
         self.assertFalse(fallback_calls[0][1]["remote_mutation_started"])
-        self.assertEqual(len(self.master_backend.starts), 2)
+        self.assertEqual(
+            [item.kind for item in self.master_backend.starts],
+            ["start-enrollment-master", "start-enrollment-master", "start-master"],
+        )
         durable = self.state.load(REQUEST_ID)
         self.assertEqual(durable.endpoint_id, "wireguard")
 

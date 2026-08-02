@@ -19,6 +19,7 @@ from tmuxgate.transport import (
     TransportError,
     TransportIdentityError,
     build_batch_channel_prefix,
+    build_enrollment_master_start_invocation,
     build_master_control_invocation,
     build_master_start_invocation,
     issue_fallback_transport_authorization,
@@ -176,21 +177,39 @@ class InvocationTests(unittest.TestCase):
         self.endpoint = build_plan().selected.resolved
         self.control = Path("/run/user/1000/tmuxgate/control/master-test.sock")
 
-    def test_initial_master_is_interactive_but_overrides_global_remote_session(self):
+    def test_post_enrollment_master_is_public_key_only_and_agent_free(self):
         invocation = build_master_start_invocation(
             self.endpoint, self.control, control_persist_seconds=600
         )
-        self.assertTrue(invocation.interactive_terminal)
+        self.assertFalse(invocation.interactive_terminal)
         self.assertEqual(invocation.kind, "start-master")
         self.assertEqual(invocation.argv[0], "/usr/bin/ssh")
         for required in (
-            "-M", "-N", "-f", "BatchMode=no", "RemoteCommand=none",
-            "RequestTTY=no", "IdentitiesOnly=yes", "ClearAllForwardings=yes",
-            "ControlMaster=yes",
+            "-M", "-N", "-f", "BatchMode=yes", "RemoteCommand=none",
+            "RequestTTY=no", "IdentityAgent=none", "IdentitiesOnly=yes",
+            "GSSAPIAuthentication=no", "HostbasedAuthentication=no",
+            "KbdInteractiveAuthentication=no", "PasswordAuthentication=no",
+            "PreferredAuthentications=publickey", "PubkeyAuthentication=yes",
+            "ClearAllForwardings=yes", "ControlMaster=yes",
             "StrictHostKeyChecking=ask", "HostName=192.0.2.20", "-T",
         ):
             self.assertIn(required, invocation.argv)
         self.assertEqual(invocation.argv[-2:], ("--", "app-server"))
+
+    def test_enrollment_master_is_the_only_prompt_capable_exception(self):
+        invocation = build_enrollment_master_start_invocation(
+            self.endpoint, self.control, control_persist_seconds=600
+        )
+        self.assertTrue(invocation.interactive_terminal)
+        self.assertEqual(invocation.kind, "start-enrollment-master")
+        for required in (
+            "BatchMode=no", "IdentityAgent=none", "IdentitiesOnly=yes",
+            "GSSAPIAuthentication=no", "HostbasedAuthentication=no",
+            "KbdInteractiveAuthentication=yes", "PasswordAuthentication=yes",
+            "PreferredAuthentications=publickey,keyboard-interactive,password",
+            "PubkeyAuthentication=yes", "StrictHostKeyChecking=ask",
+        ):
+            self.assertIn(required, invocation.argv)
 
     def test_control_and_batch_channels_can_never_prompt(self):
         check = build_master_control_invocation(self.endpoint, self.control, "check")
@@ -198,7 +217,11 @@ class InvocationTests(unittest.TestCase):
         for invocation in (check, batch):
             self.assertFalse(invocation.interactive_terminal)
             self.assertIn("BatchMode=yes", invocation.argv)
+            self.assertIn("IdentityAgent=none", invocation.argv)
             self.assertIn("IdentitiesOnly=yes", invocation.argv)
+            self.assertIn("PasswordAuthentication=no", invocation.argv)
+            self.assertIn("KbdInteractiveAuthentication=no", invocation.argv)
+            self.assertIn("PreferredAuthentications=publickey", invocation.argv)
             self.assertIn("RemoteCommand=none", invocation.argv)
             self.assertIn("RequestTTY=no", invocation.argv)
             self.assertIn("-T", invocation.argv)
@@ -344,14 +367,15 @@ class MasterPoolTests(unittest.TestCase):
         self.assertEqual(self.pool.pinned_request_id, REQUEST_ID)
         first.release()
 
-    def test_expired_or_missing_master_reauthenticates_interactively(self):
+    def test_expired_or_missing_master_reauthenticates_without_password_fallback(self):
         lease = self.acquire(0)
         path = lease.transport.control_path
         lease.release()
         self.backend.expire(path, leave_path=True)
         replacement = self.acquire(0, request_id=SECOND_ID)
         self.assertEqual(len(self.backend.starts), 2)
-        self.assertTrue(self.backend.starts[-1].interactive_terminal)
+        self.assertFalse(self.backend.starts[-1].interactive_terminal)
+        self.assertIn("PasswordAuthentication=no", self.backend.starts[-1].argv)
         replacement.release()
 
         self.backend.expire(path, leave_path=False)
@@ -438,6 +462,14 @@ class MasterPoolTests(unittest.TestCase):
                 ("enrollment-verified", "home-lan"),
             ],
         )
+        self.assertEqual(
+            [item.kind for item in self.backend.starts],
+            ["start-enrollment-master", "start-master"],
+        )
+        self.assertTrue(self.backend.starts[0].interactive_terminal)
+        self.assertFalse(self.backend.starts[1].interactive_terminal)
+        self.assertIn("PasswordAuthentication=no", self.backend.starts[1].argv)
+        self.assertEqual(len(self.backend.stops), 1)
         lease.release()
 
     def test_preinstalled_key_needs_no_mutation_boundary(self):
@@ -453,6 +485,10 @@ class MasterPoolTests(unittest.TestCase):
         )
 
         self.assertEqual(lifecycle.events, [])
+        self.assertEqual(
+            [item.kind for item in self.backend.starts],
+            ["start-enrollment-master", "start-master"],
+        )
         lease.release()
 
     def test_post_boundary_enrollment_failure_is_never_downgraded(self):

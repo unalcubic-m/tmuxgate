@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest import mock
 
 from tmuxgate.config import parse_config
 from tmuxgate.ssh import (
@@ -32,6 +33,7 @@ def ssh_g_output(**changes):
         "hostname": "192.0.2.20",
         "port": "22",
         "batchmode": "no",
+        "identityagent": "none",
         "identitiesonly": "yes",
         "canonicalizehostname": "false",
         "requesttty": "false",
@@ -43,6 +45,9 @@ def ssh_g_output(**changes):
         "pubkeyauthentication": "true",
         "passwordauthentication": "true",
         "kbdinteractiveauthentication": "true",
+        "gssapiauthentication": "false",
+        "hostbasedauthentication": "false",
+        "preferredauthentications": "publickey,keyboard-interactive,password",
         "identityfile": str(default_tmuxgate_identity_file("app-server")),
         "hostkeyalgorithms": "ssh-ed25519,rsa-sha2-512",
         "canonicalizePermittedcnames": "none",
@@ -89,13 +94,21 @@ class SshResolutionTests(unittest.TestCase):
         self.assertIn("RequestTTY=no", argv)
         self.assertIn("HostName=192.0.2.20", argv)
         self.assertIn("HostKeyAlias=tmuxgate-app-server", argv)
+        self.assertIn("IdentityAgent=none", argv)
         self.assertIn("IdentitiesOnly=yes", argv)
+        self.assertIn("GSSAPIAuthentication=no", argv)
+        self.assertIn("HostbasedAuthentication=no", argv)
+        self.assertIn(
+            "PreferredAuthentications=publickey,keyboard-interactive,password",
+            argv,
+        )
         self.assertNotIn("ProxyCommand", " ".join(argv))
 
         resolved = self.resolve()
         self.assertEqual(resolved.resolved_user, "operator")
         self.assertEqual(resolved.resolved_hostname, "192.0.2.20")
         self.assertEqual(resolved.host_key_evidence.status, "unknown")
+        self.assertEqual(resolved.identity_agent, "none")
         self.assertEqual(
             resolved.identity_files,
             (str(default_tmuxgate_identity_file("app-server")),),
@@ -105,10 +118,14 @@ class SshResolutionTests(unittest.TestCase):
         ))
 
     def test_resolution_is_noninteractive_and_bounded(self):
-        self.resolve()
+        with mock.patch.dict(
+            "os.environ", {"SSH_AUTH_SOCK": "/tmp/unrelated-agent.sock"}
+        ):
+            self.resolve()
         self.assertEqual(self.last_runner_kwargs["timeout"], 5.0)
         self.assertFalse(self.last_runner_kwargs["check"])
         self.assertEqual(self.last_runner_kwargs["env"]["PATH"], "/usr/bin:/bin")
+        self.assertNotIn("SSH_AUTH_SOCK", self.last_runner_kwargs["env"])
 
     def test_exact_identity_fields_cannot_be_changed_by_ssh_config(self):
         changes = (
@@ -127,7 +144,13 @@ class SshResolutionTests(unittest.TestCase):
         changes = (
             ("requesttty", "true"),
             ("batchmode", "yes"),
+            ("identityagent", "/tmp/unrelated-agent.sock"),
             ("identitiesonly", "no"),
+            ("gssapiauthentication", "yes"),
+            ("hostbasedauthentication", "yes"),
+            ("passwordauthentication", "no"),
+            ("kbdinteractiveauthentication", "no"),
+            ("preferredauthentications", "publickey,password"),
             ("canonicalizehostname", "true"),
             ("permitlocalcommand", "yes"),
             ("remotecommand", "tmux new-session -A -s base"),
