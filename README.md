@@ -308,6 +308,28 @@ internal to the MCP adapter and tests. `tmuxgate jobs`, `attach`, `collect`,
 `recover`, configuration commands, and fail-closed administrative surfaces
 remain available.
 
+### Recovering after an intentional whole-host reboot
+
+An intentional reboot can end the SSH connection after remote completion is
+observed but before canonical output is copied into the verified local spool.
+If startup names that request as a recovery blocker, use this workflow only
+after confirming that the entire logical machine rebooted after the request's
+recorded start time:
+
+1. Stop the tmuxgate application completely. This retires its in-memory command
+   lease and dead SSH-master pin and releases the durable-state lock.
+2. Inspect the exact request with `tmuxgate jobs --json`. Do not use standalone
+   `cleanup`; it cannot establish the required reboot evidence.
+3. Run `tmuxgate recover after-reboot REQUEST_ID` and type the exact phrase shown
+   on the controlling terminal.
+4. Restart `tmuxgate`. A subsequent request can authenticate a fresh SSH master.
+
+The recovery record is an audited abandonment, not a successful result. It
+does not contact the remote machine, publish output, invent an exit status, or
+prove that earlier command effects were rolled back. When completion had
+already been proven, its timestamp and exit status are preserved in the audit
+detail while the unverified result gates are cleared.
+
 ### Migrating from the earlier CLI workflow
 
 1. Upgrade/install the package so the MCP dependency is present.

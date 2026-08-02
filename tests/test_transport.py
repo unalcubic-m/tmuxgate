@@ -383,6 +383,51 @@ class MasterPoolTests(unittest.TestCase):
         self.assertEqual(len(self.backend.starts), 3)
         third.release()
 
+    def test_reboot_recovery_restart_retires_pin_and_reauthenticates(self):
+        approved_reboot = self.acquire(0)
+        lost_path = approved_reboot.transport.control_path
+        self.backend.expire(lost_path, leave_path=False)
+
+        for request_id in (SECOND_ID, "3" * 32):
+            with self.subTest(request_id=request_id):
+                with self.assertRaisesRegex(
+                    TransportBusyError,
+                    "active machine transport lost its control socket",
+                ):
+                    self.acquire(0, request_id=request_id)
+
+        restarted_pool = MasterTransportPool(
+            self.pool.control_dir,
+            backend=self.backend,
+            identity_revalidator=lambda endpoint: self.current.get(
+                endpoint.ssh_profile, endpoint
+            ),
+            clock=lambda: self.now,
+            max_masters=3,
+            idle_timeout_seconds=600,
+        )
+        replacement = restarted_pool.acquire(
+            authorization(
+                self.endpoints[0].ssh_profile,
+                self.endpoints[0],
+                request_id=SECOND_ID,
+            ),
+            self.endpoints[0],
+        )
+        replacement.release()
+        repeated = restarted_pool.acquire(
+            authorization(
+                self.endpoints[0].ssh_profile,
+                self.endpoints[0],
+                request_id="3" * 32,
+            ),
+            self.endpoints[0],
+        )
+        repeated.release()
+
+        self.assertEqual(len(self.backend.starts), 2)
+        self.assertEqual(restarted_pool.pinned_request_ids, ())
+
     def test_identity_change_after_approval_prevents_reuse_or_authentication(self):
         endpoint = self.endpoints[0]
         self.current[endpoint.ssh_profile] = replace(
