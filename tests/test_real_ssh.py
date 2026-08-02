@@ -12,6 +12,12 @@ import time
 import tty
 import unittest
 
+from tmuxgate.approval import ApprovalDecision
+from tmuxgate.models import ExecutionMode, RequestSpec
+from tmuxgate.operator_interface import (
+    OperatorDecision,
+    SecretInputRecipient,
+)
 from tmuxgate.real_ssh import (
     DetachedTmuxViewerProcess,
     SecretPromptPresenter,
@@ -21,6 +27,7 @@ from tmuxgate.real_ssh import (
     secret_prompt_signature,
 )
 from tmuxgate.transport import SshInvocation, SshMasterStartError, TransportError
+from test_connection_plan import build_plan
 
 
 class FakeTerminal(BytesIO):
@@ -104,6 +111,33 @@ class ScriptedDetachedViewer(DetachedTmuxViewerProcess):
         self.detach_count += 1
         self.process.returncode = 0
         self.detached.set()
+
+
+_SECRET_REQUEST = RequestSpec(
+    "app-server",
+    ExecutionMode.ARGV,
+    "/opt/docker",
+    argv=("sudo", "--", "/bin/true"),
+)
+_SECRET_PLAN = build_plan()
+
+
+def secret_input_recipient(viewer):
+    suffix = viewer.session_name.removeprefix("tmuxgate-")
+    return SecretInputRecipient(
+        suffix + ("0" * 20),
+        _SECRET_REQUEST,
+        _SECRET_PLAN,
+        "home-lan",
+    )
+
+
+def approve_secret_input(prompt):
+    return OperatorDecision.for_prompt(prompt, ApprovalDecision.APPROVED)
+
+
+def approved_presenter(**kwargs):
+    return SecretPromptPresenter(authorizer=approve_secret_input, **kwargs)
 
 
 class RealSshProcessTests(unittest.TestCase):
@@ -196,7 +230,7 @@ class RealSshProcessTests(unittest.TestCase):
         def fail_flush(terminal, path):
             raise TransportError("injected flush failure")
 
-        presenter = SecretPromptPresenter(
+        presenter = approved_presenter(
             terminal_opener=lambda *args, **kwargs: FakeTerminal(),
             popen=lambda *args, **kwargs: attach_calls.append((args, kwargs)),
             terminal_path_resolver=lambda: "/dev/pts/test",
@@ -204,8 +238,75 @@ class RealSshProcessTests(unittest.TestCase):
         )
         try:
             with self.assertRaisesRegex(TransportError, "injected flush failure"):
-                presenter._present(viewer)
+                presenter._present(viewer, secret_input_recipient(viewer))
             self.assertEqual(attach_calls, [])
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_remote_prompt_notifies_but_denial_never_attaches_terminal(self):
+        viewer = ScriptedDetachedViewer("dededededede")
+        notifications = []
+        authorization_prompts = []
+        attach_calls = []
+
+        def deny(prompt):
+            authorization_prompts.append(prompt)
+            return OperatorDecision.for_prompt(prompt, ApprovalDecision.DENIED)
+
+        presenter = SecretPromptPresenter(
+            authorizer=deny,
+            reporter=notifications.append,
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=lambda *args, **kwargs: attach_calls.append((args, kwargs)),
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: None,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer, secret_input_recipient(viewer))
+            deadline = time.monotonic() + 1
+            while len(authorization_prompts) < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(authorization_prompts), 1)
+            self.assertEqual(attach_calls, [])
+            self.assertTrue(viewer.attached)
+            self.assertTrue(any("awaiting independent" in item for item in notifications))
+            self.assertTrue(any("denied" in item for item in notifications))
+            self.assertEqual(
+                authorization_prompts[0].request_id,
+                "dededededede" + ("0" * 20),
+            )
+            time.sleep(0.08)
+            self.assertEqual(len(authorization_prompts), 1)
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_stale_secret_authorization_cannot_attach_terminal(self):
+        viewer = ScriptedDetachedViewer("efefefefefef")
+        recipient = secret_input_recipient(viewer)
+        attach_calls = []
+
+        def stale_authorization(prompt):
+            replacement = recipient.create_prompt(viewer.session_name)
+            self.assertNotEqual(replacement.prompt_id, prompt.prompt_id)
+            return OperatorDecision.for_prompt(
+                replacement, ApprovalDecision.APPROVED
+            )
+
+        presenter = SecretPromptPresenter(
+            authorizer=stale_authorization,
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=lambda *args, **kwargs: attach_calls.append((args, kwargs)),
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: None,
+        )
+        try:
+            with self.assertRaisesRegex(
+                TransportError, "authorization failed closed"
+            ):
+                presenter._present(viewer, recipient)
+            self.assertEqual(attach_calls, [])
+            self.assertTrue(viewer.attached)
         finally:
             self.assertTrue(presenter.close())
 
@@ -227,7 +328,7 @@ class RealSshProcessTests(unittest.TestCase):
             ).encode("ascii")
             return process
 
-        presenter = SecretPromptPresenter(
+        presenter = approved_presenter(
             terminal_opener=lambda *args, **kwargs: OrderedTerminal(),
             popen=popen,
             terminal_path_resolver=lambda: "/dev/pts/test",
@@ -235,7 +336,7 @@ class RealSshProcessTests(unittest.TestCase):
             poll_seconds=0.005,
         )
         try:
-            presenter._present(viewer)
+            presenter._present(viewer, secret_input_recipient(viewer))
             self.assertEqual(events, ["flush", "notice", "attach"])
             self.assertEqual(viewer.detach_count, 1)
         finally:
@@ -446,7 +547,7 @@ class RealSshProcessTests(unittest.TestCase):
             started_event.set()
             return process
 
-        presenter = SecretPromptPresenter(
+        presenter = approved_presenter(
             terminal_opener=lambda *args, **kwargs: terminal,
             popen=popen,
             terminal_path_resolver=lambda: "/dev/pts/test",
@@ -456,8 +557,14 @@ class RealSshProcessTests(unittest.TestCase):
             poll_seconds=0.01,
         )
         try:
-            presenter.watch(viewers["aaaaaaaaaaaa"])
-            presenter.watch(viewers["bbbbbbbbbbbb"])
+            presenter.watch(
+                viewers["aaaaaaaaaaaa"],
+                secret_input_recipient(viewers["aaaaaaaaaaaa"]),
+            )
+            presenter.watch(
+                viewers["bbbbbbbbbbbb"],
+                secret_input_recipient(viewers["bbbbbbbbbbbb"]),
+            )
             self.assertTrue(started_event.wait(timeout=1))
             time.sleep(0.05)
             self.assertEqual(len(started), 1)
@@ -499,7 +606,7 @@ class RealSshProcessTests(unittest.TestCase):
             attached.set()
             return process
 
-        presenter = SecretPromptPresenter(
+        presenter = approved_presenter(
             terminal_opener=lambda *args, **kwargs: FakeTerminal(),
             popen=popen,
             terminal_path_resolver=lambda: "/dev/pts/test",
@@ -507,7 +614,7 @@ class RealSshProcessTests(unittest.TestCase):
             poll_seconds=0.005,
         )
         try:
-            presenter.watch(viewer)
+            presenter.watch(viewer, secret_input_recipient(viewer))
             self.assertTrue(attached.wait(timeout=1))
             for prompt in (
                 b"[sudo] password for operator: *\n",
@@ -560,7 +667,7 @@ class RealSshProcessTests(unittest.TestCase):
                     attached.set()
                     return process
 
-                presenter = SecretPromptPresenter(
+                presenter = approved_presenter(
                     terminal_opener=lambda *args, **kwargs: FakeTerminal(),
                     popen=popen,
                     terminal_path_resolver=lambda: "/dev/pts/test",
@@ -568,7 +675,7 @@ class RealSshProcessTests(unittest.TestCase):
                     poll_seconds=0.005,
                 )
                 try:
-                    presenter.watch(viewer)
+                    presenter.watch(viewer, secret_input_recipient(viewer))
                     self.assertTrue(attached.wait(timeout=1))
                     viewer.prompt = rejection
                     time.sleep(0.12)
@@ -597,7 +704,7 @@ class RealSshProcessTests(unittest.TestCase):
             attached.set()
             return process
 
-        presenter = SecretPromptPresenter(
+        presenter = approved_presenter(
             terminal_opener=lambda *args, **kwargs: FakeTerminal(),
             popen=popen,
             terminal_path_resolver=lambda: "/dev/pts/test",
@@ -605,7 +712,7 @@ class RealSshProcessTests(unittest.TestCase):
             poll_seconds=0.005,
         )
         try:
-            presenter.watch(viewer)
+            presenter.watch(viewer, secret_input_recipient(viewer))
             self.assertTrue(attached.wait(timeout=1))
             for sequence in range(6):
                 viewer.prompt = f"ordinary output {sequence}\n".encode("ascii")
@@ -634,7 +741,7 @@ class RealSshProcessTests(unittest.TestCase):
             attached.set()
             return process
 
-        presenter = SecretPromptPresenter(
+        presenter = approved_presenter(
             terminal_opener=lambda *args, **kwargs: FakeTerminal(),
             popen=popen,
             terminal_path_resolver=lambda: "/dev/pts/test",
@@ -642,7 +749,7 @@ class RealSshProcessTests(unittest.TestCase):
             poll_seconds=0.005,
         )
         try:
-            presenter.watch(viewer)
+            presenter.watch(viewer, secret_input_recipient(viewer))
             self.assertTrue(attached.wait(timeout=1))
             viewer.prompt = marker + b"ordinary output\n"
             time.sleep(0.12)
@@ -664,7 +771,7 @@ class RealSshProcessTests(unittest.TestCase):
             processes.append(process)
             return process
 
-        presenter = SecretPromptPresenter(
+        presenter = approved_presenter(
             terminal_opener=lambda *args, **kwargs: FakeTerminal(),
             popen=popen,
             terminal_path_resolver=lambda: "/dev/pts/test",
@@ -672,7 +779,7 @@ class RealSshProcessTests(unittest.TestCase):
             poll_seconds=0.005,
         )
         try:
-            presenter.watch(viewer)
+            presenter.watch(viewer, secret_input_recipient(viewer))
             deadline = time.monotonic() + 1
             while len(processes) < 1 and time.monotonic() < deadline:
                 time.sleep(0.01)
@@ -714,7 +821,7 @@ class RealSshProcessTests(unittest.TestCase):
             ).encode("ascii")
             return process
 
-        presenter = SecretPromptPresenter(
+        presenter = approved_presenter(
             terminal_opener=lambda *args, **kwargs: FakeTerminal(),
             popen=popen,
             terminal_path_resolver=lambda: "/dev/pts/test",
@@ -723,7 +830,7 @@ class RealSshProcessTests(unittest.TestCase):
         )
         try:
             with self.assertRaisesRegex(TransportError, "injected detach failure"):
-                presenter._present(viewer)
+                presenter._present(viewer, secret_input_recipient(viewer))
             self.assertEqual(viewer.detach_count, 1)
             self.assertEqual(process.terminate_count, 1)
             self.assertEqual(process.kill_count, 0)
@@ -753,7 +860,7 @@ class RealSshProcessTests(unittest.TestCase):
             viewer.process = process
             return process
 
-        presenter = SecretPromptPresenter(
+        presenter = approved_presenter(
             terminal_opener=lambda *args, **kwargs: FakeTerminal(),
             popen=popen,
             terminal_path_resolver=lambda: "/dev/pts/test",
@@ -764,7 +871,7 @@ class RealSshProcessTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 TransportError, "prompt inspection failed"
             ):
-                presenter._present(viewer)
+                presenter._present(viewer, secret_input_recipient(viewer))
             self.assertTrue(viewer.detached.is_set())
             self.assertEqual(viewer.detach_count, 1)
         finally:

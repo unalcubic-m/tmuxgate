@@ -19,6 +19,7 @@ from tmuxgate.operator_interface import (
     RemoteMutationState,
     RouteFallbackPrompt,
     SecretInputAuthorizationPrompt,
+    SecretInputRecipient,
     SshRetryPrompt,
     require_operator_decision,
 )
@@ -191,6 +192,12 @@ class StructuredPromptTests(unittest.TestCase):
                 endpoint_id="home-lan",
                 viewer_session_id="tmuxgate-0123456789aZ",
             )
+        recipient = SecretInputRecipient(
+            REQUEST_ID, self.request, self.plan, "home-lan"
+        )
+        replacement = recipient.create_prompt("tmuxgate-0123456789ab")
+        self.assertNotEqual(replacement.prompt_id, prompt.prompt_id)
+        self.assertEqual(replacement.request_id, REQUEST_ID)
 
     def test_activity_requires_valid_structured_identity(self):
         event = OperationalActivity.create(
@@ -372,7 +379,7 @@ class PlainTerminalInterfaceTests(unittest.TestCase):
         blocked._thread.join(timeout=1)
         self.assertFalse(blocked._thread.is_alive())
 
-    def test_secret_authorization_is_defined_but_phase_one_fails_closed(self):
+    def test_secret_authorization_requires_exact_trusted_terminal_phrase(self):
         spec = request()
         plan = build_plan()
         prompt = SecretInputAuthorizationPrompt.create(
@@ -382,11 +389,43 @@ class PlainTerminalInterfaceTests(unittest.TestCase):
             endpoint_id="home-lan",
             viewer_session_id="tmuxgate-0123456789ab",
         )
-        interface = PlainTerminalInterface(FakeTerminalArbiter())
+        output = io.StringIO()
+        interface = PlainTerminalInterface(
+            FakeTerminalArbiter(),
+            approval_terminal=ApprovalTerminal(
+                io.StringIO(f"forward {SECOND_REQUEST_ID}\n\n"), output
+            ),
+            approval_mode="disabled",
+        )
         self.addCleanup(interface.close)
         self.assertIs(
             interface.request_secret_input_authorization(prompt).decision,
             ApprovalDecision.DENIED,
+        )
+        rendered = output.getvalue()
+        self.assertIn(f"request_id: {REQUEST_ID}", rendered)
+        self.assertIn('machine: "app-server"', rendered)
+        self.assertIn("approved_argv:", rendered)
+        self.assertIn("every byte typed", rendered)
+
+        approved_prompt = SecretInputAuthorizationPrompt.create(
+            REQUEST_ID,
+            spec,
+            plan,
+            endpoint_id="home-lan",
+            viewer_session_id="tmuxgate-0123456789ab",
+        )
+        approved = PlainTerminalInterface(
+            FakeTerminalArbiter(),
+            approval_terminal=ApprovalTerminal(
+                io.StringIO(f"forward {REQUEST_ID}\n"), io.StringIO()
+            ),
+            approval_mode="disabled",
+        )
+        self.addCleanup(approved.close)
+        self.assertIs(
+            approved.request_secret_input_authorization(approved_prompt).decision,
+            ApprovalDecision.APPROVED,
         )
 
     def test_automatic_policy_decisions_are_one_shot_and_close_denies(self):

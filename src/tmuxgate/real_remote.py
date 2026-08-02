@@ -16,6 +16,7 @@ import time
 
 from tmuxgate.config import ResultLimits
 from tmuxgate.models import ExecutionMode, RequestSpec
+from tmuxgate.operator_interface import SecretInputRecipient
 from tmuxgate.real_ssh import SshChannelRunner, ViewerProcess
 from tmuxgate.remote_job import (
     CollectedRemoteFiles,
@@ -230,6 +231,7 @@ class RealRemoteJobBackend(RemoteJobBackend):
         transport: MasterTransport,
         *,
         channels: SshChannelRunner | None = None,
+        secret_input_recipient: SecretInputRecipient | None = None,
         attach_timeout_seconds: float = 10,
         viewer_dir: Path | None = None,
         collection_dir: Path | None = None,
@@ -238,6 +240,24 @@ class RealRemoteJobBackend(RemoteJobBackend):
     ) -> None:
         self.transport = transport
         self.channels = SshChannelRunner() if channels is None else channels
+        if secret_input_recipient is not None:
+            if not isinstance(secret_input_recipient, SecretInputRecipient):
+                raise TypeError(
+                    "secret_input_recipient must be a SecretInputRecipient"
+                )
+            if (
+                not isinstance(transport, MasterTransport)
+                or transport.machine_name
+                != secret_input_recipient.request.machine_alias
+                or transport.endpoint.endpoint_id
+                != secret_input_recipient.endpoint_id
+                or transport.connection_plan_sha256
+                != secret_input_recipient.connection_plan.plan_sha256
+            ):
+                raise RemoteJobError(
+                    "secret-input recipient does not match the acquired transport"
+                )
+        self.secret_input_recipient = secret_input_recipient
         self.attach_timeout_seconds = float(attach_timeout_seconds)
         self.viewer_dir = viewer_dir
         self.collection_dir = collection_dir
@@ -324,6 +344,7 @@ class RealRemoteJobBackend(RemoteJobBackend):
                 argv,
                 socket_path=self.viewer_dir / f"{identity.request_id}.sock",
                 session_name=f"tmuxgate-{identity.request_id[:12]}",
+                secret_input_recipient=self.secret_input_recipient,
             )
         deadline = time.monotonic() + self.attach_timeout_seconds
         while time.monotonic() < deadline:

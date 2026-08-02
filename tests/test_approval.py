@@ -27,11 +27,15 @@ from tmuxgate.approval import (
     render_approval_summary,
     render_approval_document,
     render_code_document,
+    render_secret_input_authorization_document,
     request_approval,
     request_machine_disable,
+    request_secret_input_authorization,
     secure_less_pager,
 )
 from tmuxgate.models import ExecutionMode, RequestSpec
+from tmuxgate.operator_interface import SecretInputAuthorizationPrompt
+from test_connection_plan import build_plan
 
 
 REQUEST_ID = "89abcdef0123456789abcdef01234567"
@@ -85,6 +89,90 @@ class ShortWriteBuffer:
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_secret_input_authorization_displays_exact_recipient_and_command(self):
+        request = RequestSpec(
+            "app-server",
+            ExecutionMode.ARGV,
+            "/opt/docker",
+            argv=("sudo", "--", "/bin/true"),
+        )
+        plan = build_plan()
+        prompt = SecretInputAuthorizationPrompt.create(
+            REQUEST_ID,
+            request,
+            plan,
+            endpoint_id="home-lan",
+            viewer_session_id=f"tmuxgate-{REQUEST_ID[:12]}",
+        )
+        document = render_secret_input_authorization_document(
+            REQUEST_ID,
+            request,
+            plan,
+            prompt_id=prompt.prompt_id,
+            endpoint_id=prompt.endpoint_id,
+            viewer_session_id=prompt.viewer_session_id,
+            command_identity_sha256=prompt.command_identity_sha256,
+            secret_input_binding_sha256=prompt.secret_input_binding_sha256,
+        )
+        self.assertIn(f"request_id: {REQUEST_ID}", document)
+        self.assertIn('machine: "app-server"', document)
+        self.assertIn('  [0] "sudo"', document)
+        self.assertIn("every byte typed", document)
+        self.assertIn(prompt.secret_input_binding_sha256, document)
+
+    def test_secret_input_authorization_accepts_only_full_bound_phrase(self):
+        request = RequestSpec(
+            "app-server",
+            ExecutionMode.SCRIPT,
+            "/opt/docker",
+            script=b"sudo /bin/true\n",
+        )
+        plan = build_plan()
+        prompt = SecretInputAuthorizationPrompt.create(
+            REQUEST_ID,
+            request,
+            plan,
+            endpoint_id="home-lan",
+            viewer_session_id=f"tmuxgate-{REQUEST_ID[:12]}",
+        )
+
+        denied_terminal, denied_output = terminal_with_input(
+            f"forward {REQUEST_ID[:-1]}0\n\n"
+        )
+        self.assertIs(
+            request_secret_input_authorization(
+                REQUEST_ID,
+                request,
+                plan,
+                prompt_id=prompt.prompt_id,
+                endpoint_id=prompt.endpoint_id,
+                viewer_session_id=prompt.viewer_session_id,
+                command_identity_sha256=prompt.command_identity_sha256,
+                secret_input_binding_sha256=prompt.secret_input_binding_sha256,
+                terminal=denied_terminal,
+            ),
+            ApprovalDecision.DENIED,
+        )
+        self.assertIn("not authorized", denied_output.getvalue())
+
+        approved_terminal, _output = terminal_with_input(
+            f"forward {REQUEST_ID}\n"
+        )
+        self.assertIs(
+            request_secret_input_authorization(
+                REQUEST_ID,
+                request,
+                plan,
+                prompt_id=prompt.prompt_id,
+                endpoint_id=prompt.endpoint_id,
+                viewer_session_id=prompt.viewer_session_id,
+                command_identity_sha256=prompt.command_identity_sha256,
+                secret_input_binding_sha256=prompt.secret_input_binding_sha256,
+                terminal=approved_terminal,
+            ),
+            ApprovalDecision.APPROVED,
+        )
+
     def test_machine_disable_prompt_defaults_to_no_and_accepts_yes(self):
         for response in ("\n", "n\n", "N\n", "no\n", "NO\n"):
             with self.subTest(response=response):

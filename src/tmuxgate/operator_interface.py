@@ -29,6 +29,7 @@ from .approval import (
     request_approval,
     request_fallback_approval,
     request_machine_disable,
+    request_secret_input_authorization,
     request_ssh_retry,
 )
 from .connection_plan import ConnectionPlan
@@ -508,7 +509,7 @@ class RouteFallbackPrompt:
 
 @dataclass(frozen=True, slots=True)
 class SecretInputAuthorizationPrompt:
-    """Future handoff authority; phase 1 defines it but never auto-approves it."""
+    """Exact, one-shot authority for one broker-terminal handoff."""
 
     prompt_id: str
     request_id: str
@@ -601,6 +602,30 @@ class SecretInputAuthorizationPrompt:
             command_digest,
             plan_digest,
             binding,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SecretInputRecipient:
+    """Request and route identity retained while its isolated viewer is live."""
+
+    request_id: str
+    request: RequestSpec
+    connection_plan: ConnectionPlan
+    endpoint_id: str
+
+    def __post_init__(self) -> None:
+        _require_request(self.request_id, self.request)
+        _require_plan(self.request, self.connection_plan)
+        _endpoint_index(self.connection_plan, self.endpoint_id)
+
+    def create_prompt(self, viewer_session_id: str) -> SecretInputAuthorizationPrompt:
+        return SecretInputAuthorizationPrompt.create(
+            self.request_id,
+            self.request,
+            self.connection_plan,
+            endpoint_id=self.endpoint_id,
+            viewer_session_id=viewer_session_id,
         )
 
 
@@ -1090,11 +1115,9 @@ class PlainTerminalInterface:
     ) -> OperatorDecision:
         if not isinstance(prompt, SecretInputAuthorizationPrompt):
             raise TypeError("prompt must be a SecretInputAuthorizationPrompt")
-        # Phase 1 defines the exact authority but intentionally does not add a
-        # new secret-input handoff.  Any accidental call therefore fails closed.
-        return self._prompts.decide_without_presentation(
-            prompt, ApprovalDecision.DENIED
-        )
+        # This permission is independent of per-request execution approval.
+        # In particular, approval_mode="disabled" never bypasses it.
+        return self._request(prompt)
 
     def request_machine_disable(
         self, prompt: MachineDisablePrompt
@@ -1123,7 +1146,7 @@ class PlainTerminalInterface:
     def _present_prompt(self, prompt: OperatorPrompt) -> ApprovalDecision:
         priority = (
             TerminalPriority.SECRET
-            if isinstance(prompt, SshRetryPrompt)
+            if isinstance(prompt, (SshRetryPrompt, SecretInputAuthorizationPrompt))
             else TerminalPriority.APPROVAL
         )
         with self.terminal.claim(priority=priority, purpose=type(prompt).__name__):
@@ -1160,6 +1183,18 @@ class PlainTerminalInterface:
                     prompt.request,
                     prompt.connection_plan,
                     **keywords,
+                )
+            if isinstance(prompt, SecretInputAuthorizationPrompt):
+                return request_secret_input_authorization(
+                    prompt.request_id,
+                    prompt.request,
+                    prompt.connection_plan,
+                    prompt_id=prompt.prompt_id,
+                    endpoint_id=prompt.endpoint_id,
+                    viewer_session_id=prompt.viewer_session_id,
+                    command_identity_sha256=prompt.command_identity_sha256,
+                    secret_input_binding_sha256=prompt.secret_input_binding_sha256,
+                    terminal=self._approval_terminal,
                 )
             if isinstance(prompt, MachineDisablePrompt):
                 return request_machine_disable(
@@ -1221,5 +1256,6 @@ __all__ = [
     "RemoteMutationState",
     "RouteFallbackPrompt",
     "SecretInputAuthorizationPrompt",
+    "SecretInputRecipient",
     "SshRetryPrompt",
 ]

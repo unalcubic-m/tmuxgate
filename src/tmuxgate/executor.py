@@ -14,6 +14,7 @@ from tmuxgate.operator_interface import (
     OperatorInterface,
     RemoteMutationState,
     RouteFallbackPrompt,
+    SecretInputRecipient,
     SshRetryPrompt,
     require_operator_decision,
 )
@@ -140,7 +141,7 @@ class _DurableKeyEnrollmentLifecycle:
         return self.record
 
 
-RemoteBackendFactory = Callable[[MasterTransport], object]
+RemoteBackendFactory = Callable[[MasterTransport, SecretInputRecipient], object]
 DetachedHandler = Callable[[str], str]
 
 
@@ -500,7 +501,13 @@ class RealExecutor:
         coordinator: RemoteJobCoordinator | None = None
         job: RemoteJob | None = None
         try:
-            backend = self.backend_factory(lease.transport)
+            recipient = SecretInputRecipient(
+                request_id,
+                request,
+                context.connection_plan,
+                endpoint.resolved.endpoint_id,
+            )
+            backend = self.backend_factory(lease.transport, recipient)
             coordinator = RemoteJobCoordinator(backend)
             job = coordinator.prepare(request_id, request, permit)
             coordinator.attach_and_start(job)
