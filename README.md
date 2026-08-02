@@ -66,8 +66,10 @@ SSH/tmux isolation, result verification, or cleanup rules.
 - `ip`; NetworkManager's `nmcli` is also used when collecting configured
   home-network identity evidence
 
-The package pins the tested official Python MCP SDK (`mcp==2.0.0`) and Uvicorn
-(`uvicorn==0.52.0`), which provide the embedded Streamable HTTP stack.
+The package pins the tested official Python MCP SDK (`mcp==2.0.0`), Textual
+(`textual==8.2.8`), and Uvicorn (`uvicorn==0.52.0`). Textual supports the
+explicit read-only full-screen preview; the MCP SDK and Uvicorn provide the
+embedded Streamable HTTP stack.
 
 ## Install
 
@@ -230,6 +232,18 @@ form. `tmuxgate broker` is a deprecated compatibility alias for the same
 unified application. Stop it from the dashboard or with `Ctrl-C`; do not start
 a separate MCP process.
 
+The established line-oriented interface remains the production default.
+`tmuxgate --plain` selects it explicitly. `tmuxgate --tui` starts the phase-two
+read-only Textual preview, which provides keyboard-accessible Dashboard, Jobs,
+Machines, Activity, queued-request, and Help views. The preview requires
+`approval_mode = "always"`; it displays decision requests but cannot approve
+them, and quitting denies every unresolved prompt. Use `--plain` for execution
+approval, SSH retry, route fallback, machine-disable, or secret-input decisions.
+This restriction prevents Textual and direct terminal readers from competing
+until those security decision paths receive complete TUI modals in later
+phases. The TUI also refuses redirected/mismatched terminal input and output or
+a background process group instead of silently falling back to plain mode.
+
 The recommended `./install.sh` workflow has already registered this endpoint
 with Codex and installed the token loader. Start tmuxgate in one terminal,
 then open a new Bash shell and restart Codex. The application must remain in
@@ -366,14 +380,17 @@ process stdin cannot answer the prompt. The dashboard does not hold the
 terminal while idle, allowing approvals, SSH authentication, and separately
 authorized secret-input attachments to use the same terminal safely.
 
-The plain screen is implemented behind a presentation-independent operator
+Both screens are implemented behind a presentation-independent operator
 interface. Execution, SSH-retry, fallback, and machine-disable prompts carry
 their complete internal request/connection bindings through an exactly-once
 FIFO decision queue; broker and executor workers do not parse terminal text.
-Closing or failing the interface denies all unresolved prompts. This is an
-internal architecture migration only: the visible line-oriented interface and
-`/dev/tty` trust boundary remain the defaults, and no Textual/full-screen TUI
-is included yet.
+Closing or failing either interface denies all unresolved prompts. The visible
+line-oriented interface and `/dev/tty` trust boundary remain the production
+defaults. The opt-in Textual interface is deliberately read-only: it renders
+bounded structured activity and runtime snapshots with markup disabled and
+control characters escaped, uses a fixed widget tree, enters the alternate
+screen only after foreground-terminal validation, and relies on Textual's
+driver cleanup to restore terminal contents and modes on every exit path.
 
 Remote password-like pane text is notification only. Before tmuxgate attaches
 the broker terminal to a detached viewer, a separate card identifies the full

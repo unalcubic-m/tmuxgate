@@ -16,15 +16,18 @@ from tmuxgate import application
 from tmuxgate.application import RecoveryBlockedError, UnifiedApplication
 from tmuxgate.mcp_server import McpServerError
 from tmuxgate.runtime import RuntimeSecurityError, acquire_state_lock
+from tmuxgate.textual_interface import TextualOperatorInterface
 
 
-def _write_config(path: Path, *, mcp_port: int = 18765) -> None:
+def _write_config(
+    path: Path, *, mcp_port: int = 18765, approval_mode: str = "disabled"
+) -> None:
     path.write_text(
         f"""\
 version = 2
 
 [broker]
-approval_mode = "disabled"
+approval_mode = "{approval_mode}"
 
 [mcp]
 host = "127.0.0.1"
@@ -103,6 +106,86 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
         self.assertLess(events.index("mcp.request_stop"), events.index("operator.close"))
         self.assertLess(events.index("operator.close"), events.index("broker.stop"))
         operator.close.assert_called_once_with()
+
+    def test_textual_runtime_provider_exposes_ready_application_state(self):
+        _write_config(self.config_path, approval_mode="always")
+        terminal = mock.Mock()
+        terminal.claim.return_value = nullcontext()
+        terminal.state.return_value = SimpleNamespace(busy=False, purpose=None)
+
+        class CapturingTextualInterface(TextualOperatorInterface):
+            snapshot = None
+
+            def run_dashboard(self, stop, config):
+                del stop
+                self.snapshot = self.dashboard_snapshot(config)
+
+        operator = CapturingTextualInterface(terminal, validate_terminal=False)
+        broker = mock.Mock()
+        broker.stop.return_value = True
+        mcp_http = mock.Mock()
+        mcp_http.stop.return_value = True
+        app = UnifiedApplication(
+            config_path=self.config_path,
+            socket_path=self.socket_path,
+            state_dir=self.state_dir,
+            fake=True,
+            terminal=terminal,
+            operator_interface=operator,
+        )
+        with (
+            mock.patch.object(application, "BrokerServer", return_value=broker),
+            mock.patch.object(application, "create_mcp_server", return_value=object()),
+            mock.patch.object(
+                application, "EmbeddedMcpServer", return_value=mcp_http
+            ),
+        ):
+            self.assertEqual(app.run(), 0)
+
+        snapshot = operator.snapshot
+        self.assertIsNotNone(snapshot)
+        self.assertTrue(snapshot.ready)
+        self.assertEqual(snapshot.listener, "http://127.0.0.1:18765/mcp")
+        self.assertEqual(snapshot.approval_mode, "always")
+        self.assertEqual(snapshot.terminal_owner, "Textual dashboard")
+        self.assertEqual(len(snapshot.machines), 1)
+        self.assertEqual(snapshot.machines[0].alias, "local")
+        self.assertEqual(snapshot.machines[0].ssh_state, "not used (fake)")
+
+    def test_textual_mode_rejects_disabled_approvals_before_listener_start(self):
+        app = UnifiedApplication(
+            config_path=self.config_path,
+            socket_path=self.socket_path,
+            state_dir=self.state_dir,
+            fake=True,
+            textual=True,
+        )
+        with (
+            self.assertRaisesRegex(RuntimeError, "--plain"),
+            mock.patch.object(application, "open_broker_listener") as listener,
+        ):
+            app.run()
+        listener.assert_not_called()
+
+    def test_textual_terminal_validation_precedes_listener_start(self):
+        _write_config(self.config_path, approval_mode="always")
+        app = UnifiedApplication(
+            config_path=self.config_path,
+            socket_path=self.socket_path,
+            state_dir=self.state_dir,
+            fake=True,
+            textual=True,
+        )
+        with (
+            self.assertRaisesRegex(RuntimeError, "synthetic terminal failure"),
+            mock.patch(
+                "tmuxgate.textual_interface.validate_textual_terminal",
+                side_effect=RuntimeError("synthetic terminal failure"),
+            ),
+            mock.patch.object(application, "open_broker_listener") as listener,
+        ):
+            app.run()
+        listener.assert_not_called()
 
     def test_fake_mode_starts_broker_then_mcp_and_stops_in_reverse_order(self):
         events: list[str] = []

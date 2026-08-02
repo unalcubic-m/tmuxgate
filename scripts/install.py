@@ -1016,7 +1016,11 @@ def install(args: argparse.Namespace) -> int:
             label="installing tmuxgate and runtime dependencies",
         )
         _run(
-            (str(venv_python), "-c", "import mcp, uvicorn, tmuxgate"),
+            (
+                str(venv_python),
+                "-c",
+                "import mcp, textual, uvicorn, tmuxgate, tmuxgate.textual_interface",
+            ),
             capture=True,
             label="verifying installed Python imports",
         )

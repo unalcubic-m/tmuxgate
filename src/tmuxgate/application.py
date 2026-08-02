@@ -50,10 +50,17 @@ from tmuxgate.runtime import (
 )
 from tmuxgate.spool import ResultSpool
 from tmuxgate.settings import set_machine_enabled
+from tmuxgate.scheduler import RequestState
 from tmuxgate.ssh import ResolvedSshEndpoint, resolve_ssh_endpoint
 from tmuxgate.ssh_key import AutoSshKeyManager
 from tmuxgate.state import DurableStateStore, recover_startup
 from tmuxgate.terminal import TerminalArbiter
+from tmuxgate.textual_interface import (
+    DashboardJob,
+    DashboardMachine,
+    DashboardRuntimeSnapshot,
+    TextualOperatorInterface,
+)
 from tmuxgate.transport import MasterTransportPool
 
 
@@ -93,6 +100,7 @@ class UnifiedApplication:
         dashboard: Dashboard | None = None,
         terminal: TerminalArbiter | None = None,
         operator_interface: OperatorInterface | None = None,
+        textual: bool = False,
     ) -> None:
         self._config_path = Path(config_path)
         self._socket_path = socket_path
@@ -101,6 +109,7 @@ class UnifiedApplication:
         self._dashboard = dashboard
         self._terminal = TerminalArbiter() if terminal is None else terminal
         self._operator_interface = operator_interface
+        self._textual = bool(textual)
         self._stop = threading.Event()
 
     @property
@@ -140,11 +149,19 @@ class UnifiedApplication:
             state_dir=self._state_dir,
         )
         bearer_token = load_or_create_mcp_token(paths.state_dir)
-        operator = self._operator_interface or PlainTerminalInterface(
-            self._terminal,
-            dashboard=self._dashboard,
-            approval_mode=config.broker.approval_mode,
-        )
+        if self._operator_interface is not None:
+            operator = self._operator_interface
+        elif self._textual:
+            operator = TextualOperatorInterface(
+                self._terminal,
+                approval_mode=config.broker.approval_mode,
+            )
+        else:
+            operator = PlainTerminalInterface(
+                self._terminal,
+                dashboard=self._dashboard,
+                approval_mode=config.broker.approval_mode,
+            )
         clean = True
         pool: MasterTransportPool | None = None
         prompt_presenter: SecretPromptPresenter | None = None
@@ -374,10 +391,72 @@ class UnifiedApplication:
                 bearer_token=bearer_token,
                 on_unexpected_exit=lambda _failure: self.request_stop(),
             )
+            services_ready = [False]
+
+            if isinstance(operator, TextualOperatorInterface):
+                terminal_states = {
+                    RequestState.CANCELLED_BEFORE_APPROVAL,
+                    RequestState.DENIED,
+                    RequestState.FAILED_PRE_REMOTE,
+                    RequestState.FAILED_REMOTE_SETUP,
+                    RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
+                    RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE,
+                    RequestState.ABANDONED_AFTER_PROVEN_UNSTARTED,
+                    RequestState.DONE,
+                }
+
+                def dashboard_snapshot() -> DashboardRuntimeSnapshot:
+                    retained = set(pool.retained_machine_names()) if pool else set()
+                    records = store.load_all()
+                    jobs = tuple(
+                        DashboardJob(
+                            request_id=record.request_id,
+                            machine_alias=record.machine_alias,
+                            state=record.state.value,
+                            updated_at=record.updated_at,
+                            active=record.state not in terminal_states,
+                        )
+                        for record in records[-100:]
+                    )
+                    machines = tuple(
+                        DashboardMachine(
+                            alias=name,
+                            description=machine.description,
+                            enabled=availability.is_enabled(name),
+                            ssh_state=(
+                                "retained"
+                                if name in retained
+                                else "not used (fake)"
+                                if self._fake
+                                else "idle"
+                            ),
+                        )
+                        for name, machine in sorted(config.machines.items())
+                    )
+                    terminal = self._terminal.state()
+                    owner = (
+                        terminal.purpose or "external terminal user"
+                        if terminal.busy
+                        else "Textual dashboard"
+                    )
+                    return DashboardRuntimeSnapshot(
+                        ready=services_ready[0],
+                        listener=f"http://{config.mcp.host}:{config.mcp.port}/mcp",
+                        approval_mode=config.broker.approval_mode,
+                        machines=machines,
+                        jobs=jobs,
+                        active_job_count=sum(
+                            record.state not in terminal_states for record in records
+                        ),
+                        terminal_owner=owner,
+                    )
+
+                operator.bind_dashboard_provider(dashboard_snapshot)
             previous = self._install_signal_handlers()
             try:
                 broker.start()
                 mcp_http.start()
+                services_ready[0] = True
                 self._report_started(
                     operator, config, paths.socket_path, paths.mcp_token_path
                 )

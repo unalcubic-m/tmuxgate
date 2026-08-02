@@ -364,7 +364,30 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertIsNone(arguments["state_dir"])
         self.assertFalse(arguments["fake"])
         self.assertTrue(callable(arguments["dashboard"]))
+        self.assertFalse(arguments["textual"])
         application.return_value.run.assert_called_once_with()
+
+    def test_plain_and_tui_select_explicit_operator_paths(self):
+        with mock.patch("tmuxgate.cli.UnifiedApplication") as application:
+            application.return_value.run.return_value = 0
+            self.assertEqual(cli.main(["--plain"]), 0)
+        plain = application.call_args.kwargs
+        self.assertFalse(plain["textual"])
+        self.assertTrue(callable(plain["dashboard"]))
+
+        with mock.patch("tmuxgate.cli.UnifiedApplication") as application:
+            application.return_value.run.return_value = 0
+            self.assertEqual(cli.main(["--tui"]), 0)
+        tui = application.call_args.kwargs
+        self.assertTrue(tui["textual"])
+        self.assertIsNone(tui["dashboard"])
+
+        with mock.patch("tmuxgate.cli.UnifiedApplication") as application:
+            application.return_value.run.return_value = 0
+            self.assertEqual(cli.main(["dashboard", "--tui"]), 0)
+        dashboard_tui = application.call_args.kwargs
+        self.assertTrue(dashboard_tui["textual"])
+        self.assertIsNone(dashboard_tui["dashboard"])
 
 
 if __name__ == "__main__":

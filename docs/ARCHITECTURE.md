@@ -61,7 +61,8 @@ The unified lifecycle starts resources in fail-closed order:
    presenter, executor, broker, and broker control service.
 7. Start the broker, then start and await readiness of the MCP HTTP listener.
 8. Report only sanitized listener/token-path information and enter the
-   dashboard loop.
+   selected dashboard loop. Plain mode is the default; the read-only Textual
+   preview is selected only by explicit `--tui`.
 
 Startup refuses to accept new approvals when durable recovery reports a
 possibly running or incompletely collected request. An MCP bind or startup
@@ -381,14 +382,42 @@ request-bound contexts may await parallel executor workers.
 ## Operator-interface boundary
 
 `OperatorInterface` is the presentation-independent boundary between broker or
-executor work and operator interaction. `PlainTerminalInterface` is the only
-implementation in this phase. It preserves the line-oriented dashboard and
-the existing exact approval, SSH-retry, fallback, and machine-disable
-renderers. It continues to obtain decision bytes only from the controlling
-`/dev/tty` under `TerminalArbiter`; stdin, MCP/Unix-socket frames, request
-content, remote output, viewer pane content, rendered diagnostics, and pager
-return values are never input sources. No Textual dependency, alternate-screen
-mode, widget, or full-screen behavior exists in this phase.
+executor work and operator interaction. `PlainTerminalInterface` preserves the
+line-oriented dashboard and the existing exact approval, SSH-retry, fallback,
+machine-disable, and secret-input renderers. It remains the production default
+and may be selected explicitly with `--plain`. It obtains decision bytes only
+from the controlling `/dev/tty` under `TerminalArbiter`; stdin,
+MCP/Unix-socket frames, request content, remote output, viewer pane content,
+rendered diagnostics, and pager return values are never input sources.
+
+`TextualOperatorInterface`, selected only with `--tui`, is the phase-two
+read-only preview built on exactly pinned `textual==8.2.8`. Before entering
+application mode it verifies that Textual's real stdin and stdout are the same
+character terminal and that tmuxgate's process group owns that terminal in the
+foreground. Validation, driver initialization, snapshot refresh, or terminal
+ownership failure aborts the unified application; there is no automatic plain
+fallback and no approval-policy change. Textual's driver owns alternate-screen
+entry, resize/full redraw, signal/cancellation unwinding, and restoration of
+the prior terminal modes and contents.
+
+The Textual preview has one fixed widget tree with keyboard-accessible
+Dashboard, Jobs, Machines, Activity, queued-request, and Help views. Its
+runtime snapshot reports application/broker readiness, MCP listener and
+approval mode, configured/enabled machines, bounded recent durable jobs,
+retained SSH state, pending prompts, bounded activity, and terminal ownership.
+Every externally derived string is passed as literal non-markup content after
+C0/C1, DEL, format, bidi, and surrogate controls are escaped. Job, machine,
+activity, and prompt rows are bounded without creating per-record widgets. A
+terminal below 72 columns by 20 rows shows only a resize/quit guard.
+
+Phase two deliberately implements no Textual decision modal. The preview
+therefore requires `approval_mode = "always"`, queues and displays structured
+prompts without resolving them, and denies every unresolved prompt on exit.
+Consequently no request can reach SSH or another direct terminal reader while
+Textual owns application mode. Operators must restart with `--plain` to make
+execution, retry, fallback, machine-disable, or secret-input decisions. This
+keeps the incomplete TUI from becoming the production default and prevents
+Textual and direct terminal readers from competing.
 
 Workers submit immutable structured objects rather than presentation
 arguments:
@@ -429,7 +458,9 @@ increasing sequence number while holding that mutex, so concurrent worker
 requests have one deterministic presentation order. Each queued item owns its
 own `PendingDecision` condition variable. The plain interface has one daemon
 presenter thread and is the sole queue consumer; workers wait only on the slot
-created for their exact prompt.
+created for their exact prompt. The Textual preview's consumer records a
+bounded read-only projection while leaving each slot unresolved until
+fail-closed shutdown.
 
 An immutable `OperatorDecision` repeats the prompt ID and canonical binding
 digest in addition to Approved or Denied. `PendingDecision.resolve()` checks
@@ -545,8 +576,9 @@ inspection, Ctrl-C, or manual detach. Lost viewers are recreated automatically.
 Normal completion closes the remote pane and local viewer automatically;
 canonical capture does not depend on pane history.
 
-One process-local `TerminalArbiter` serializes dashboard transactions, the
-optional execution approval UI, mandatory secret-input authorization,
+In plain mode, one process-local `TerminalArbiter` serializes dashboard
+transactions, the optional execution approval UI, mandatory secret-input
+authorization,
 fallback approval, interactive first-master SSH authentication, and approved
 viewer attachments. The dashboard polls for a
 complete canonical `/dev/tty` line in bounded slices without retaining a lease
@@ -562,7 +594,10 @@ choose the next owner. Reentrant ownership allows existing approval and SSH
 components to use the arbiter through their lock-compatible interface. Parallel
 execution never places two password prompts or an approval and password prompt
 on `/dev/tty` concurrently. This serialization applies only to human terminal
-interaction; the remote command leases continue independently.
+interaction; the remote command leases continue independently. In the
+phase-two Textual preview, decision prompts cannot resolve and approval-disabled
+mode is rejected, so execution cannot advance to a direct terminal reader
+while Textual owns the full-screen driver.
 
 Separately, up to three authenticated `ssh -N` ControlMaster transports may
 remain idle. Reusing a transport never reuses request identity. Queued requests

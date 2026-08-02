@@ -705,7 +705,9 @@ class InstallerFlowTests(unittest.TestCase):
             output = io.StringIO()
             errors = io.StringIO()
             with mock.patch.dict(os.environ, fixture["environment"], clear=True):
-                with mock.patch.object(installer, "_run", side_effect=fake_run):
+                with mock.patch.object(
+                    installer, "_run", side_effect=fake_run
+                ) as run:
                     with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                         self.assertEqual(installer.install(self._arguments(fixture)), 0)
                         self.assertEqual(installer.install(self._arguments(fixture)), 0)
@@ -735,6 +737,13 @@ class InstallerFlowTests(unittest.TestCase):
             combined_output = output.getvalue() + errors.getvalue()
             self.assertNotIn(fixture["token"], combined_output)
             self.assertNotIn("e" * 64, combined_output)
+            import_checks = [
+                call.args[0]
+                for call in run.call_args_list
+                if call.kwargs["label"] == "verifying installed Python imports"
+            ]
+            self.assertTrue(import_checks)
+            self.assertTrue(all("textual" in command[2] for command in import_checks))
 
     def test_manifest_failure_restores_links_and_retains_published_release(self):
         with tempfile.TemporaryDirectory() as temporary:
