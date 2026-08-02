@@ -6,6 +6,7 @@ import select
 import signal
 import subprocess
 import termios
+import tempfile
 import threading
 import time
 import tty
@@ -106,6 +107,47 @@ class ScriptedDetachedViewer(DetachedTmuxViewerProcess):
 
 
 class RealSshProcessTests(unittest.TestCase):
+    def test_streaming_batch_enforces_limit_while_receiving(self):
+        runner = SshChannelRunner()
+        with tempfile.TemporaryFile("w+b") as destination:
+            result = runner.batch_to_file(
+                ("/bin/bash", "-c", "printf abc; printf diagnostic >&2; exit 7"),
+                destination,
+                max_output_bytes=3,
+                timeout_seconds=5,
+            )
+            destination.seek(0)
+            self.assertEqual(destination.read(), b"abc")
+            self.assertEqual(result.size, 3)
+            self.assertEqual(result.stderr, b"diagnostic")
+            self.assertEqual(result.returncode, 7)
+
+        with tempfile.TemporaryFile("w+b") as destination:
+            with self.assertRaisesRegex(TransportError, "exceeds"):
+                runner.batch_to_file(
+                    ("/bin/bash", "-c", "printf abcd"),
+                    destination,
+                    max_output_bytes=3,
+                    timeout_seconds=5,
+                )
+
+    def test_streaming_batch_fails_closed_on_local_write_error(self):
+        class FailingDestination:
+            def write(self, content):
+                del content
+                raise OSError("injected disk failure")
+
+            def flush(self):
+                raise AssertionError("failed output must not be flushed")
+
+        with self.assertRaisesRegex(TransportError, "could not be stored"):
+            SshChannelRunner().batch_to_file(
+                ("/bin/bash", "-c", "printf data"),
+                FailingDestination(),
+                max_output_bytes=4,
+                timeout_seconds=5,
+            )
+
     def test_prompt_handoff_discards_only_preexisting_terminal_input(self):
         child = os.fork()
         if child == 0:

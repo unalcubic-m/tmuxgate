@@ -40,6 +40,7 @@ def serialize_config(config: AppConfig) -> bytes:
         raise TypeError("config must be an AppConfig")
     broker = config.broker
     mcp = config.mcp
+    limits = config.limits
     lines = [
         "# Managed by tmuxgate configuration commands.",
         "version = 2",
@@ -55,6 +56,17 @@ def serialize_config(config: AppConfig) -> bytes:
         "[mcp]",
         f"host = {_quote(mcp.host)}",
         f"port = {mcp.port}",
+        "",
+        "[limits]",
+        f"max_stdout_bytes = {limits.max_stdout_bytes}",
+        f"max_stderr_bytes = {limits.max_stderr_bytes}",
+        f"max_total_result_bytes = {limits.max_total_result_bytes}",
+        f"max_local_collection_bytes = {limits.max_local_collection_bytes}",
+        f"max_remote_capture_bytes = {limits.max_remote_capture_bytes}",
+        (
+            "max_aggregate_collection_bytes = "
+            f"{limits.max_aggregate_collection_bytes}"
+        ),
     ]
     if config.home is not None:
         home = config.home

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 import hashlib
+from pathlib import Path
 import re
 from typing import Protocol
 
@@ -118,6 +120,69 @@ class CollectedRemoteResult:
         if type(self.exit_status) is not int or not 0 <= self.exit_status <= 255:
             raise RemoteJobError("collected exit status is invalid")
 
+    @property
+    def stdout_size(self) -> int:
+        return len(self.stdout)
+
+    @property
+    def stderr_size(self) -> int:
+        return len(self.stderr)
+
+    @property
+    def stdout_sha256(self) -> str:
+        return hashlib.sha256(self.stdout).hexdigest()
+
+    @property
+    def stderr_sha256(self) -> str:
+        return hashlib.sha256(self.stderr).hexdigest()
+
+
+@dataclass(slots=True)
+class CollectedRemoteFiles:
+    """Private streamed result files plus their receive-time evidence."""
+
+    stdout_path: Path
+    stderr_path: Path
+    stdout_size: int
+    stderr_size: int
+    stdout_sha256: str
+    stderr_sha256: str
+    exit_status: int
+    _cleanup: Callable[[], None]
+    _closed: bool = False
+
+    def __post_init__(self) -> None:
+        for name, path in (
+            ("stdout", self.stdout_path),
+            ("stderr", self.stderr_path),
+        ):
+            if not isinstance(path, Path) or not path.is_absolute():
+                raise RemoteJobError(f"collected {name} path is invalid")
+        for name, value in (
+            ("stdout_size", self.stdout_size),
+            ("stderr_size", self.stderr_size),
+        ):
+            if type(value) is not int or value < 0:
+                raise RemoteJobError(f"collected {name} is invalid")
+        for name, value in (
+            ("stdout_sha256", self.stdout_sha256),
+            ("stderr_sha256", self.stderr_sha256),
+        ):
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise RemoteJobError(f"collected {name} is invalid")
+        if type(self.exit_status) is not int or not 0 <= self.exit_status <= 255:
+            raise RemoteJobError("collected exit status is invalid")
+        if not callable(self._cleanup):
+            raise RemoteJobError("collected result cleanup is invalid")
+
+    def close(self) -> None:
+        if not self._closed:
+            self._cleanup()
+            self._closed = True
+
+
+RemoteCollection = CollectedRemoteResult | CollectedRemoteFiles
+
 
 class ViewerHandle(Protocol):
     @property
@@ -133,7 +198,7 @@ class RemoteJobBackend(Protocol):
     def attach(self, identity: RemoteJobIdentity) -> ViewerHandle: ...
     def observe(self, identity: RemoteJobIdentity) -> RemoteObservation: ...
     def release_gate(self, identity: RemoteJobIdentity) -> None: ...
-    def collect(self, identity: RemoteJobIdentity) -> CollectedRemoteResult: ...
+    def collect(self, identity: RemoteJobIdentity) -> RemoteCollection: ...
     def cleanup(self, identity: RemoteJobIdentity) -> None: ...
 
 
@@ -144,7 +209,7 @@ class RemoteJob:
     durable_generation: int
     state: RemoteJobState = RemoteJobState.PLANNED
     viewer: ViewerHandle | None = None
-    result: CollectedRemoteResult | None = None
+    result: RemoteCollection | None = None
 
 
 class RemoteJobCoordinator:
@@ -253,7 +318,7 @@ class RemoteJobCoordinator:
         job.state = RemoteJobState.RUNNING_ATTACHED
         return viewer
 
-    def collect(self, job: RemoteJob) -> CollectedRemoteResult:
+    def collect(self, job: RemoteJob) -> RemoteCollection:
         self._require_active(job, RemoteJobState.COMPLETE_DETACHED)
         observation = self.backend.observe(job.identity)
         if not observation.completion_proven or observation.attached_clients != 0:
@@ -261,11 +326,13 @@ class RemoteJobCoordinator:
         result = self.backend.collect(job.identity)
         if (
             result.exit_status != observation.exit_status
-            or len(result.stdout) != observation.stdout_size
-            or len(result.stderr) != observation.stderr_size
-            or hashlib.sha256(result.stdout).hexdigest() != observation.stdout_sha256
-            or hashlib.sha256(result.stderr).hexdigest() != observation.stderr_sha256
+            or result.stdout_size != observation.stdout_size
+            or result.stderr_size != observation.stderr_size
+            or result.stdout_sha256 != observation.stdout_sha256
+            or result.stderr_sha256 != observation.stderr_sha256
         ):
+            if isinstance(result, CollectedRemoteFiles):
+                result.close()
             job.state = RemoteJobState.RECOVERY_REQUIRED
             raise RemoteJobError("collected result does not match remote completion evidence")
         job.result = result

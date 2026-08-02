@@ -17,6 +17,7 @@ from tmuxgate.spool import (
     ResultSpool,
     SpoolConflictError,
     SpoolCorruptionError,
+    SpoolError,
 )
 
 
@@ -34,6 +35,65 @@ class ResultSpoolTests(unittest.TestCase):
 
     def result_path(self):
         return self.spool.path / REQUEST_ID
+
+    def _collected_files(self, stdout=b"out", stderr=b"err"):
+        directory = Path(self.temporary.name) / "collected"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        stdout_path = directory / "stdout.raw"
+        stderr_path = directory / "stderr.raw"
+        stdout_path.write_bytes(stdout)
+        stderr_path.write_bytes(stderr)
+        stdout_path.chmod(0o600)
+        stderr_path.chmod(0o600)
+        return stdout_path, stderr_path
+
+    def test_store_files_streams_private_inputs_into_atomic_spool(self):
+        stdout = b"stdout\x00\xff"
+        stderr = b"stderr\x00\xfe"
+        stdout_path, stderr_path = self._collected_files(stdout, stderr)
+        stored = self.spool.store_files(
+            REQUEST_ID,
+            stdout_path,
+            stderr_path,
+            stdout_size=len(stdout),
+            stdout_sha256=hashlib.sha256(stdout).hexdigest(),
+            stderr_size=len(stderr),
+            stderr_sha256=hashlib.sha256(stderr).hexdigest(),
+            exit_status=7,
+        )
+        self.assertEqual(stored.stdout, stdout)
+        self.assertEqual(stored.stderr, stderr)
+        self.assertEqual(self.spool.load(REQUEST_ID), stored)
+
+    def test_store_files_rejects_changed_or_unsafe_inputs_without_publication(self):
+        stdout_path, stderr_path = self._collected_files()
+        with self.assertRaisesRegex(SpoolError, "does not match"):
+            self.spool.store_files(
+                REQUEST_ID,
+                stdout_path,
+                stderr_path,
+                stdout_size=3,
+                stdout_sha256=hashlib.sha256(b"OUT").hexdigest(),
+                stderr_size=3,
+                stderr_sha256=hashlib.sha256(b"err").hexdigest(),
+                exit_status=7,
+            )
+        self.assertEqual(list(self.spool.path.iterdir()), [])
+
+        stdout_path.unlink()
+        stdout_path.symlink_to(stderr_path)
+        with self.assertRaisesRegex(SpoolError, "safely open"):
+            self.spool.store_files(
+                REQUEST_ID,
+                stdout_path,
+                stderr_path,
+                stdout_size=3,
+                stdout_sha256=hashlib.sha256(b"err").hexdigest(),
+                stderr_size=3,
+                stderr_sha256=hashlib.sha256(b"err").hexdigest(),
+                exit_status=7,
+            )
+        self.assertEqual(list(self.spool.path.iterdir()), [])
 
     def test_store_and_load_preserve_separate_binary_streams_and_exit_seven(self):
         stdout = b"stdout\x00\xff\n"

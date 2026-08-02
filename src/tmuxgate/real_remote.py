@@ -6,19 +6,25 @@ from io import BytesIO
 from importlib import resources
 import os
 from pathlib import Path
+import re
 import shlex
+import stat
 import tarfile
+import tempfile
+import threading
 import time
 
+from tmuxgate.config import ResultLimits
 from tmuxgate.models import ExecutionMode, RequestSpec
 from tmuxgate.real_ssh import SshChannelRunner, ViewerProcess
 from tmuxgate.remote_job import (
-    CollectedRemoteResult,
+    CollectedRemoteFiles,
     RemoteJobBackend,
     RemoteJobError,
     RemoteJobIdentity,
     RemoteObservation,
 )
+from tmuxgate.runtime import ensure_private_directory
 from tmuxgate.transport import (
     MasterTransport,
     build_batch_channel_prefix,
@@ -27,7 +33,7 @@ from tmuxgate.transport import (
 
 
 MAX_STAGE_ARCHIVE_BYTES = 20 * 1024 * 1024
-MAX_COLLECT_ARCHIVE_BYTES = 300 * 1024 * 1024
+_COLLECTION_TEMP_RE = re.compile(r"\.[0-9a-f]{32}\.[A-Za-z0-9_-]{6,32}\Z", re.ASCII)
 
 _STAGE_SCRIPT = r"""
 set -eu
@@ -76,7 +82,12 @@ def _tar_add(archive: tarfile.TarFile, name: str, content: bytes) -> None:
     archive.addfile(info, BytesIO(content))
 
 
-def build_stage_archive(request: RequestSpec) -> bytes:
+def build_stage_archive(
+    request: RequestSpec,
+    limits: ResultLimits = ResultLimits(),
+) -> bytes:
+    if not isinstance(limits, ResultLimits):
+        raise RemoteJobError("result limits are invalid")
     stream = BytesIO()
     with tarfile.open(fileobj=stream, mode="w", format=tarfile.USTAR_FORMAT) as archive:
         _tar_add(archive, "mode", request.mode.value.encode("ascii") + b"\n")
@@ -92,6 +103,15 @@ def build_stage_archive(request: RequestSpec) -> bytes:
             else f"{request.timeout_seconds}\n".encode("ascii")
         )
         _tar_add(archive, "timeout", timeout)
+        _tar_add(
+            archive,
+            "result-limits",
+            (
+                f"{limits.max_stdout_bytes}\n"
+                f"{limits.max_stderr_bytes}\n"
+                f"{limits.max_remote_capture_bytes}\n"
+            ).encode("ascii"),
+        )
         if request.mode is ExecutionMode.ARGV:
             _tar_add(
                 archive,
@@ -108,6 +128,102 @@ def build_stage_archive(request: RequestSpec) -> bytes:
     return content
 
 
+class LocalCollectionBudget:
+    """Reserve aggregate local temporary bytes across concurrent jobs."""
+
+    def __init__(self, max_bytes: int) -> None:
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("aggregate collection limit must be positive")
+        self.max_bytes = max_bytes
+        self._used = 0
+        self._lock = threading.Lock()
+
+    def reserve(self, size: int) -> "_CollectionReservation":
+        if type(size) is not int or size < 0:
+            raise RemoteJobError("local collection reservation is invalid")
+        with self._lock:
+            if size > self.max_bytes - self._used:
+                raise RemoteJobError(
+                    "aggregate local collection space limit would be exceeded"
+                )
+            self._used += size
+        return _CollectionReservation(self, size)
+
+    def _release(self, size: int) -> None:
+        with self._lock:
+            if not 0 <= size <= self._used:
+                raise RuntimeError("local collection reservation accounting failed")
+            self._used -= size
+
+
+def prepare_collection_directory(path: Path) -> Path:
+    """Create the private root and remove only proven stale collection temps."""
+
+    root = ensure_private_directory(path)
+    root_fd = os.open(
+        root,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        for name in os.listdir(root_fd):
+            if _COLLECTION_TEMP_RE.fullmatch(name) is None:
+                raise RemoteJobError(
+                    f"unexpected entry in local collection directory: {name}"
+                )
+            directory_fd = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+            try:
+                metadata = os.fstat(directory_fd)
+                entries = set(os.listdir(directory_fd))
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o700
+                    or not entries.issubset({"stdout.raw", "stderr.raw"})
+                ):
+                    raise RemoteJobError("stale local collection directory is unsafe")
+                for entry in entries:
+                    file_metadata = os.stat(
+                        entry, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (
+                        not stat.S_ISREG(file_metadata.st_mode)
+                        or file_metadata.st_uid != os.getuid()
+                        or stat.S_IMODE(file_metadata.st_mode) != 0o600
+                    ):
+                        raise RemoteJobError("stale local collection file is unsafe")
+                for entry in entries:
+                    os.unlink(entry, dir_fd=directory_fd)
+            finally:
+                os.close(directory_fd)
+            os.rmdir(name, dir_fd=root_fd)
+        os.fsync(root_fd)
+    finally:
+        os.close(root_fd)
+    return root
+
+
+class _CollectionReservation:
+    def __init__(self, budget: LocalCollectionBudget, size: int) -> None:
+        self._budget = budget
+        self._size = size
+        self._released = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._budget._release(self._size)
+            self._released = True
+
+
 class RealRemoteJobBackend(RemoteJobBackend):
     def __init__(
         self,
@@ -116,11 +232,21 @@ class RealRemoteJobBackend(RemoteJobBackend):
         channels: SshChannelRunner | None = None,
         attach_timeout_seconds: float = 10,
         viewer_dir: Path | None = None,
+        collection_dir: Path | None = None,
+        limits: ResultLimits = ResultLimits(),
+        collection_budget: LocalCollectionBudget | None = None,
     ) -> None:
         self.transport = transport
         self.channels = SshChannelRunner() if channels is None else channels
         self.attach_timeout_seconds = float(attach_timeout_seconds)
         self.viewer_dir = viewer_dir
+        self.collection_dir = collection_dir
+        self.limits = limits
+        self.collection_budget = (
+            LocalCollectionBudget(limits.max_aggregate_collection_bytes)
+            if collection_budget is None
+            else collection_budget
+        )
 
     def _batch_prefix(self) -> tuple[str, ...]:
         return build_batch_channel_prefix(
@@ -138,7 +264,7 @@ class RealRemoteJobBackend(RemoteJobBackend):
     def _control_command(identity: RemoteJobIdentity, operation: str) -> str:
         if operation not in {
             "validate", "create", "observe", "release",
-            "attach", "collect", "cleanup",
+            "attach", "collect-stdout", "collect-stderr", "cleanup",
         }:
             raise RemoteJobError("unsupported remote control operation")
         request_id = identity.request_id
@@ -169,7 +295,7 @@ class RealRemoteJobBackend(RemoteJobBackend):
         return result.stdout
 
     def stage(self, identity: RemoteJobIdentity, request: RequestSpec) -> None:
-        archive = build_stage_archive(request)
+        archive = build_stage_archive(request, self.limits)
         command = (
             "/bin/bash -c "
             + shlex.quote(_STAGE_SCRIPT)
@@ -265,44 +391,134 @@ class RealRemoteJobBackend(RemoteJobBackend):
     def release_gate(self, identity: RemoteJobIdentity) -> None:
         self._batch(identity, "release")
 
-    @staticmethod
-    def _parse_collection(content: bytes) -> CollectedRemoteResult:
-        if len(content) > MAX_COLLECT_ARCHIVE_BYTES:
-            raise RemoteJobError("remote collection archive exceeds the configured limit")
-        expected = {"stdout.raw", "stderr.raw", "exit-code", "state"}
-        extracted: dict[str, bytes] = {}
-        try:
-            with tarfile.open(fileobj=BytesIO(content), mode="r:") as archive:
-                for member in archive.getmembers():
-                    if (
-                        member.name not in expected
-                        or not member.isfile()
-                        or member.name in extracted
-                        or member.size < 0
-                    ):
-                        raise RemoteJobError("remote collection archive is unsafe")
-                    source = archive.extractfile(member)
-                    if source is None:
-                        raise RemoteJobError("remote collection member is unreadable")
-                    extracted[member.name] = source.read()
-        except tarfile.TarError as exc:
-            raise RemoteJobError("remote collection is not a valid tar archive") from exc
-        if set(extracted) != expected or extracted["state"] != b"complete\n":
-            raise RemoteJobError("remote collection is incomplete")
-        try:
-            exit_status = int(extracted["exit-code"].decode("ascii").strip())
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise RemoteJobError("remote exit status is invalid") from exc
-        return CollectedRemoteResult(
-            extracted["stdout.raw"],
-            extracted["stderr.raw"],
-            exit_status,
-        )
+    def collect(self, identity: RemoteJobIdentity) -> CollectedRemoteFiles:
+        observation = self.observe(identity)
+        if (
+            not observation.completion_proven
+            or observation.attached_clients != 0
+            or observation.stdout_size is None
+            or observation.stderr_size is None
+            or observation.stdout_sha256 is None
+            or observation.stderr_sha256 is None
+            or observation.exit_status is None
+        ):
+            raise RemoteJobError("remote collection lacks complete detached evidence")
+        total = observation.stdout_size + observation.stderr_size
+        if observation.stdout_size > self.limits.max_stdout_bytes:
+            raise RemoteJobError("remote stdout exceeds the configured limit")
+        if observation.stderr_size > self.limits.max_stderr_bytes:
+            raise RemoteJobError("remote stderr exceeds the configured limit")
+        if total > self.limits.max_total_result_bytes:
+            raise RemoteJobError("remote result exceeds the configured total limit")
+        if total > self.limits.max_local_collection_bytes:
+            raise RemoteJobError("remote result exceeds local collection space limit")
+        if self.collection_dir is None:
+            raise RemoteJobError("local collection directory is unavailable")
 
-    def collect(self, identity: RemoteJobIdentity) -> CollectedRemoteResult:
-        return self._parse_collection(
-            self._batch(identity, "collect", timeout_seconds=60)
-        )
+        reservation = self.collection_budget.reserve(total)
+        temporary: Path | None = None
+
+        def cleanup() -> None:
+            try:
+                if temporary is not None:
+                    for name in ("stdout.raw", "stderr.raw"):
+                        try:
+                            os.unlink(temporary / name)
+                        except FileNotFoundError:
+                            pass
+                    try:
+                        os.rmdir(temporary)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                reservation.release()
+
+        try:
+            temporary = Path(tempfile.mkdtemp(
+                prefix=f".{identity.request_id}.",
+                dir=self.collection_dir,
+            ))
+            os.chmod(temporary, 0o700)
+            metadata = temporary.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise RemoteJobError("local collection directory is unsafe")
+
+            received = {}
+            for stream, expected_size, expected_sha256 in (
+                ("stdout", observation.stdout_size, observation.stdout_sha256),
+                ("stderr", observation.stderr_size, observation.stderr_sha256),
+            ):
+                path = temporary / f"{stream}.raw"
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                descriptor = os.open(path, flags, 0o600)
+                with os.fdopen(descriptor, "wb", buffering=0) as destination:
+                    file_metadata = os.fstat(destination.fileno())
+                    if (
+                        not stat.S_ISREG(file_metadata.st_mode)
+                        or file_metadata.st_uid != os.getuid()
+                        or stat.S_IMODE(file_metadata.st_mode) != 0o600
+                    ):
+                        raise RemoteJobError("local collection file is unsafe")
+                    streamed = self.channels.batch_to_file(
+                        (*self._batch_prefix(), self._control_command(
+                            identity, f"collect-{stream}"
+                        )),
+                        destination,
+                        max_output_bytes=expected_size,
+                        timeout_seconds=60,
+                    )
+                    if streamed.returncode != 0:
+                        detail = streamed.stderr.decode(
+                            "utf-8", "backslashreplace"
+                        ).strip()[:500]
+                        raise RemoteJobError(
+                            f"remote {stream} collection failed with status "
+                            f"{streamed.returncode}"
+                            + (f": {detail}" if detail else "")
+                        )
+                    os.fsync(destination.fileno())
+                if (
+                    streamed.size != expected_size
+                    or streamed.sha256 != expected_sha256
+                ):
+                    raise RemoteJobError(
+                        f"streamed remote {stream} does not match completion evidence"
+                    )
+                received[stream] = streamed
+            directory_fd = os.open(
+                temporary,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return CollectedRemoteFiles(
+                stdout_path=temporary / "stdout.raw",
+                stderr_path=temporary / "stderr.raw",
+                stdout_size=received["stdout"].size,
+                stderr_size=received["stderr"].size,
+                stdout_sha256=received["stdout"].sha256,
+                stderr_sha256=received["stderr"].sha256,
+                exit_status=observation.exit_status,
+                _cleanup=cleanup,
+            )
+        except BaseException:
+            cleanup()
+            raise
 
     def cleanup(self, identity: RemoteJobIdentity) -> None:
         self._batch(identity, "cleanup")

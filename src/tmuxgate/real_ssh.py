@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import queue
 import re
+import selectors
 import stat
 import subprocess
 import termios
@@ -19,6 +21,8 @@ from tmuxgate.transport import SshInvocation, SshMasterStartError, TransportErro
 
 
 MAX_BATCH_OUTPUT_BYTES = 300 * 1024 * 1024
+MAX_BATCH_DIAGNOSTIC_BYTES = 64 * 1024
+STREAM_CHUNK_BYTES = 64 * 1024
 _VIEWER_SESSION_RE = re.compile(r"tmuxgate-[0-9a-f]{12}\Z", re.ASCII)
 _SECRET_PROMPT_RE = re.compile(
     rb"(?:password(?:\s+for\s+[^:\r\n]{1,160})?|passphrase(?:\s+for\s+[^:\r\n]{1,160})?)"
@@ -202,6 +206,14 @@ class BatchResult:
     returncode: int
 
 
+@dataclass(frozen=True, slots=True)
+class StreamBatchResult:
+    stderr: bytes
+    returncode: int
+    size: int
+    sha256: str
+
+
 class SshChannelRunner:
     """Execute fixed remote controls over one private authenticated master."""
 
@@ -240,6 +252,148 @@ class SshChannelRunner:
             "batch SSH channel",
         )
         return BatchResult(completed.stdout, completed.stderr, completed.returncode)
+
+    def batch_to_file(
+        self,
+        argv: tuple[str, ...],
+        destination: BinaryIO,
+        *,
+        max_output_bytes: int,
+        timeout_seconds: float = 30,
+    ) -> StreamBatchResult:
+        """Drain a batch channel incrementally into an already-private file."""
+
+        if (
+            not argv
+            or type(max_output_bytes) is not int
+            or max_output_bytes < 0
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            raise TransportError("streaming batch SSH invocation is invalid")
+        try:
+            process = self.popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_safe_environment(),
+                close_fds=True,
+            )
+        except BaseException as exc:
+            raise TransportError("streaming batch SSH channel could not start") from exc
+        stdout = getattr(process, "stdout", None)
+        stderr = getattr(process, "stderr", None)
+        if stdout is None or stderr is None:
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except BaseException:
+                pass
+            raise TransportError("streaming batch SSH channel has no byte pipes")
+
+        selector = selectors.DefaultSelector()
+        digest = hashlib.sha256()
+        size = 0
+        diagnostic = bytearray()
+        failure: TransportError | None = None
+        deadline = time.monotonic() + float(timeout_seconds)
+        try:
+            selector.register(stdout, selectors.EVENT_READ, "stdout")
+            selector.register(stderr, selectors.EVENT_READ, "stderr")
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = TransportError("streaming batch SSH channel timed out")
+                    break
+                events = selector.select(min(remaining, 0.25))
+                if not events:
+                    continue
+                for key, _mask in events:
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), STREAM_CHUNK_BYTES)
+                    except OSError as exc:
+                        failure = TransportError(
+                            "streaming batch SSH channel could not be read"
+                        )
+                        failure.__cause__ = exc
+                        break
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    if key.data == "stdout":
+                        if size + len(chunk) > max_output_bytes:
+                            failure = TransportError(
+                                "streaming batch SSH output exceeds the configured limit"
+                            )
+                            break
+                        try:
+                            written = destination.write(chunk)
+                        except OSError as exc:
+                            failure = TransportError(
+                                "streaming batch SSH output could not be stored"
+                            )
+                            failure.__cause__ = exc
+                            break
+                        if written != len(chunk):
+                            failure = TransportError(
+                                "streaming batch SSH output write was incomplete"
+                            )
+                            break
+                        digest.update(chunk)
+                        size += len(chunk)
+                    else:
+                        if len(diagnostic) + len(chunk) > MAX_BATCH_DIAGNOSTIC_BYTES:
+                            failure = TransportError(
+                                "streaming batch SSH diagnostics exceed the configured limit"
+                            )
+                            break
+                        diagnostic.extend(chunk)
+                if failure is not None:
+                    break
+            if failure is not None:
+                try:
+                    process.kill()
+                except BaseException:
+                    pass
+            try:
+                returncode = process.wait(timeout=5 if failure is not None else max(
+                    0.1, deadline - time.monotonic()
+                ))
+            except BaseException as exc:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except BaseException:
+                    pass
+                if failure is None:
+                    failure = TransportError(
+                        "streaming batch SSH channel did not terminate"
+                    )
+                    failure.__cause__ = exc
+            if failure is not None:
+                raise failure
+            try:
+                destination.flush()
+            except OSError as exc:
+                raise TransportError(
+                    "streaming batch SSH output could not be flushed"
+                ) from exc
+            if type(returncode) is not int:
+                raise TransportError(
+                    "streaming batch SSH channel returned no exit status"
+                )
+            return StreamBatchResult(
+                bytes(diagnostic), returncode, size, digest.hexdigest()
+            )
+        finally:
+            selector.close()
+            for pipe in (stdout, stderr):
+                try:
+                    pipe.close()
+                except BaseException:
+                    pass
 
     def viewer(self, argv: tuple[str, ...]) -> "ViewerProcess":
         terminal = self.terminal_opener("/dev/tty", "r+b", buffering=0)

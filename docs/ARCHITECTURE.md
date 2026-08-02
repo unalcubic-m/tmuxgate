@@ -772,9 +772,14 @@ submitted process but cannot replace or configure tmuxgate's gate, FIFO,
 capture, state-publication, hashing, or cleanup tools. Runner control-plane
 utilities use fixed absolute paths where practical.
 
-stdout and stderr will be drained through separate FIFOs and tee processes to
-raw result files while remaining visible in the pane. `capture-pane` is not a
-canonical result source.
+stdout and stderr are drained through separate bounded FIFO pipelines to raw
+result files while remaining visible in the pane. Each pipeline admits at most
+its configured stream limit plus one sentinel byte, and a concurrent monitor
+checks the combined per-job remote-capture ceiling while the submitted command
+runs. Any independent or combined overrun publishes
+`capture-limit-exceeded`, omits the exit-status file, and cannot become proven
+completion. This bounds each raw file and actively monitors combined remote
+disk growth. `capture-pane` is not a canonical result source.
 
 The real backend implements this lifecycle; fake and real-local-tmux tests
 exercise the same scripts. A durable start permit is required before staging. The coordinator
@@ -783,16 +788,34 @@ and only then releases the unique wait channel. A running viewer accepts input
 and Ctrl-C and can detach/reattach without affecting another job. Completion
 closes its pane/viewer automatically; collection requires the remote exit status,
 both byte counts, and both SHA-256 digests to match the separately collected
-raw streams. Missing sessions, mismatched output, or ambiguous completion enter
-recovery-required state, and cleanup is allowed only after verified collection.
-The canonical local spool publishes a result only by atomically renaming an
-owner-only directory after both raw streams and a checksummed manifest have
-been written and fsynced. It detects stream/manifest corruption, rejects unsafe
-modes, symlinks, unexpected entries, and conflicts, and treats a pre-publish
-interruption as incomplete rather than visible.
-The packaged Bash runner retains pane stdin, uses separate mode-`0600` FIFOs and
-tee processes, writes the exit status only after both tees finish, and cleans up
-failed-gate FIFOs without manufacturing completion. Tests also execute the
+raw streams. Collection no longer transports a complete tar archive. Fixed
+`collect-stdout` and `collect-stderr` controls stream the two canonical files
+over separate batch channels into newly created owner-only local temporary
+files. Each SSH pipe is drained incrementally with receive-time byte and
+diagnostic ceilings; hashes and sizes are accumulated as bytes arrive. The
+collector rejects a stream, total, per-job local-space, or shared aggregate
+reservation before publication. The shared reservation object serializes all
+active jobs, so three parallel commands cannot each consume the full aggregate
+allowance.
+
+The canonical local spool copies those private files with no-follow opens and
+bounded blocks into a private temporary result directory. It verifies owner,
+mode, size, and receive-time SHA-256 evidence while copying, fsyncs both raw
+streams and the manifest, and publishes only by atomic directory rename. Local
+write failure, transport truncation, limit failure, changed source evidence,
+or interruption removes the unpublished collection/spool temporary files and
+never marks durable state spool-verified. Missing sessions, mismatched output,
+quota failures, or ambiguous completion enter recovery-required state; remote
+cleanup remains disallowed until verified collection so evidence is retained
+for inspection and recovery.
+
+The `[limits]` configuration table defines independent stdout and stderr
+ceilings, total-result bytes, per-job local temporary bytes, remote per-job
+captured bytes, and aggregate local collection bytes. Limits are inclusive:
+exactly at the boundary succeeds and one byte over fails closed. The packaged
+Bash runner retains pane stdin, uses separate mode-`0600` FIFOs and bounded
+capture pipelines, writes the exit status only after both collectors finish,
+and cleans up failed-gate FIFOs without manufacturing completion. Tests also execute the
 exact staging shell and lifecycle in a private real local tmux server. The first
 approved remote job completed successfully on July 19, 2026.
 
