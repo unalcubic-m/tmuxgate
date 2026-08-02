@@ -32,8 +32,10 @@ class LocalRealTmuxIntegrationTests(unittest.TestCase):
                 argv=(
                     "/bin/bash",
                     "-c",
-                    "printf 'stdout-line\\n'; printf 'stderr-line\\n' >&2; exit 7",
+                    "printf 'stdout-path=%s\\n' \"$PATH\"; "
+                    "printf 'stderr-line\\n' >&2; exit 7",
                 ),
+                environment={"PATH": "/request-controlled-path"},
             )
             archive_path = root / "stage.tar"
             archive_path.write_bytes(build_stage_archive(request))
@@ -124,7 +126,11 @@ class LocalRealTmuxIntegrationTests(unittest.TestCase):
                 result = RealRemoteJobBackend._parse_collection(collected.stdout)
                 self.assertEqual(
                     (result.stdout, result.stderr, result.exit_status),
-                    (b"stdout-line\n", b"stderr-line\n", 7),
+                    (
+                        b"stdout-path=/request-controlled-path\n",
+                        b"stderr-line\n",
+                        7,
+                    ),
                 )
                 self.assertEqual(run("cleanup").returncode, 0)
                 base = subprocess.run(

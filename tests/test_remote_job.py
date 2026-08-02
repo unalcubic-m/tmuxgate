@@ -249,10 +249,15 @@ class RemoteRunnerTests(unittest.TestCase):
             environment = {
                 "HOME": str(home),
                 "PATH": "/usr/bin:/bin",
-                "TMUXGATE_TMUX_BIN": str(fake_tmux),
             }
             completed = subprocess.run(
-                ["/bin/bash", str(runner), str(job), f"tmuxgate-start-{REQUEST_ID}"],
+                [
+                    "/bin/bash",
+                    str(runner),
+                    str(job),
+                    f"tmuxgate-start-{REQUEST_ID}",
+                    str(fake_tmux),
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -293,14 +298,19 @@ class RemoteRunnerTests(unittest.TestCase):
             fake_tmux.write_text("#!/bin/sh\n[ \"$1\" = wait-for ] || exit 99\nexit 0\n", encoding="ascii")
             fake_tmux.chmod(0o700)
             completed = subprocess.run(
-                ["/bin/bash", str(runner), str(job), f"tmuxgate-start-{REQUEST_ID}"],
+                [
+                    "/bin/bash",
+                    str(runner),
+                    str(job),
+                    f"tmuxgate-start-{REQUEST_ID}",
+                    str(fake_tmux),
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env={
                     "HOME": str(home),
                     "PATH": "/usr/bin:/bin",
-                    "TMUXGATE_TMUX_BIN": str(fake_tmux),
                 },
                 timeout=5,
                 check=False,
@@ -332,14 +342,19 @@ class RemoteRunnerTests(unittest.TestCase):
             fake_tmux.write_text("#!/bin/sh\nexit 99\n", encoding="ascii")
             fake_tmux.chmod(0o700)
             completed = subprocess.run(
-                ["/bin/bash", str(runner), str(job), f"tmuxgate-start-{REQUEST_ID}"],
+                [
+                    "/bin/bash",
+                    str(runner),
+                    str(job),
+                    f"tmuxgate-start-{REQUEST_ID}",
+                    str(fake_tmux),
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env={
                     "HOME": str(home),
                     "PATH": "/usr/bin:/bin",
-                    "TMUXGATE_TMUX_BIN": str(fake_tmux),
                 },
                 timeout=5,
                 check=False,
@@ -349,6 +364,154 @@ class RemoteRunnerTests(unittest.TestCase):
             self.assertFalse((job / "stdout.fifo").exists())
             self.assertFalse((job / "stderr.fifo").exists())
             self.assertFalse((job / "exit-code").exists())
+
+    def test_hostile_request_environment_is_confined_to_exec_process(self):
+        runner = Path(__file__).parents[1] / "src/tmuxgate/assets/remote_runner.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            job = home / ".cache/tmuxgate/jobs" / REQUEST_ID
+            job.mkdir(parents=True, mode=0o700)
+            marker = root / "environment-sourced"
+            bash_env = root / "bash-env"
+            shell_env = root / "shell-env"
+            for path in (bash_env, shell_env):
+                path.write_text(
+                    f"printf sourced >> {marker}\n",
+                    encoding="ascii",
+                )
+            hostile = {
+                b"PATH": os.fsencode(root / "untrusted-bin"),
+                b"LD_PRELOAD": os.fsencode(root / "untrusted-preload.so"),
+                b"IFS": b":",
+                b"BASH_ENV": os.fsencode(bash_env),
+                b"ENV": os.fsencode(shell_env),
+            }
+            environment_bytes = b"".join(
+                name + b"\0" + value + b"\0"
+                for name, value in hostile.items()
+            )
+            files = {
+                "mode": b"exec\n",
+                "cwd.bin": os.fsencode(str(job)) + b"\0",
+                "environment.bin": environment_bytes,
+                "timeout": b"5\n",
+                "argv.bin": b"/usr/bin/env\0-0\0",
+            }
+            for name, content in files.items():
+                path = job / name
+                path.write_bytes(content)
+                path.chmod(0o600)
+            control_environment = home / "control-environment.bin"
+            fake_tmux = root / "fake-tmux"
+            fake_tmux.write_text(
+                "#!/bin/sh\n"
+                f"/usr/bin/env -0 > {control_environment}\n"
+                "[ \"$1\" = wait-for ] || exit 99\n"
+                "exit 0\n",
+                encoding="ascii",
+            )
+            fake_tmux.chmod(0o700)
+
+            completed = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(runner),
+                    str(job),
+                    f"tmuxgate-start-{REQUEST_ID}",
+                    str(fake_tmux),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                timeout=5,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            target = self._parse_environment(completed.stdout)
+            control = self._parse_environment(control_environment.read_bytes())
+            for name, value in hostile.items():
+                self.assertEqual(target[name], value)
+                if name == b"PATH":
+                    self.assertEqual(control[name], b"/usr/bin:/bin")
+                else:
+                    self.assertNotIn(name, control)
+            self.assertFalse(marker.exists())
+            self.assertIn(hostile[b"LD_PRELOAD"], completed.stderr)
+            self.assertEqual((job / "state").read_bytes(), b"complete\n")
+
+    def test_argv_and_script_preserve_exact_environment_bytes_at_boundary(self):
+        runner = Path(__file__).parents[1] / "src/tmuxgate/assets/remote_runner.sh"
+        exact = {
+            b"EMPTY": b"",
+            b"MULTILINE": b"first line\nsecond line",
+            b"NON_UTF8": b"prefix-\xff-suffix",
+            b"PUNCTUATION": b" $'\";=\\tail",
+        }
+        environment_bytes = b"".join(
+            name + b"\0" + value + b"\0"
+            for name, value in exact.items()
+        )
+        for mode in ("exec", "script"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                home = root / "home"
+                job = home / ".cache/tmuxgate/jobs" / REQUEST_ID
+                job.mkdir(parents=True, mode=0o700)
+                files = {
+                    "mode": f"{mode}\n".encode("ascii"),
+                    "cwd.bin": os.fsencode(str(job)) + b"\0",
+                    "environment.bin": environment_bytes,
+                    "timeout": b"5\n",
+                }
+                if mode == "exec":
+                    files["argv.bin"] = b"/usr/bin/env\0-0\0"
+                else:
+                    files["payload.sh"] = b"/usr/bin/env -0\n"
+                for name, content in files.items():
+                    path = job / name
+                    path.write_bytes(content)
+                    path.chmod(0o600)
+                fake_tmux = root / "fake-tmux"
+                fake_tmux.write_text(
+                    "#!/bin/sh\n[ \"$1\" = wait-for ] || exit 99\nexit 0\n",
+                    encoding="ascii",
+                )
+                fake_tmux.chmod(0o700)
+
+                completed = subprocess.run(
+                    [
+                        "/bin/bash",
+                        str(runner),
+                        str(job),
+                        f"tmuxgate-start-{REQUEST_ID}",
+                        str(fake_tmux),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                    timeout=5,
+                    check=False,
+                )
+
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(completed.stderr, b"")
+                target = self._parse_environment(completed.stdout)
+                for name, value in exact.items():
+                    self.assertEqual(target[name], value)
+                self.assertEqual((job / "stdout.raw").read_bytes(), completed.stdout)
+                self.assertEqual((job / "state").read_bytes(), b"complete\n")
+
+    @staticmethod
+    def _parse_environment(content):
+        return {
+            entry.split(b"=", 1)[0]: entry.split(b"=", 1)[1]
+            for entry in content.split(b"\0")
+            if entry
+        }
 
 
 if __name__ == "__main__":

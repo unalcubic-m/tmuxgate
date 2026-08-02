@@ -709,6 +709,18 @@ under `~/.cache/tmuxgate/jobs`, and a dedicated tmux server/session. Its runner
 waits on a unique `tmux wait-for` channel until the viewer is attached and that
 attachment is verified. The normal `base` session is never touched.
 
+The remote control script starts the packaged runner with a fixed minimal
+environment containing only the remote account's `HOME` and the fixed
+`/usr/bin:/bin` tool path. The runner does not export submitted environment
+entries into its own shell. It retains them as exact `name=value` arguments
+until the final command boundary, where `/usr/bin/env -i` applies them only to
+the approved argv process or the non-profile script shell, inside any requested
+`/usr/bin/timeout` supervision. Consequently values such as `PATH`,
+`LD_PRELOAD`, `IFS`, `BASH_ENV`, and `ENV` may intentionally affect the
+submitted process but cannot replace or configure tmuxgate's gate, FIFO,
+capture, state-publication, hashing, or cleanup tools. Runner control-plane
+utilities use fixed absolute paths where practical.
+
 stdout and stderr will be drained through separate FIFOs and tee processes to
 raw result files while remaining visible in the pane. `capture-pane` is not a
 canonical result source.

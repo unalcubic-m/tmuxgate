@@ -72,7 +72,9 @@ case "$operation" in
             exit 125
         }
         "$tmux_bin" new-session -d -s "$session" -- \
-            /bin/bash "$job_dir/remote_runner.sh" "$job_dir" "$wait_channel" ||
+            /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin \
+            /bin/bash --noprofile --norc "$job_dir/remote_runner.sh" \
+            "$job_dir" "$wait_channel" "$tmux_bin" ||
             exit 125
         # A completed foreground command must close its viewer automatically.
         # Canonical stdout/stderr and exit status live in the protected job
