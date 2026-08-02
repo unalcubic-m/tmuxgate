@@ -293,16 +293,30 @@ The embedded server exposes five typed tools:
   verified.
 
 Execution results include the request ID, transport status, remote exit status,
-byte lengths, and SHA-256 digests. Streams of at most 64 KiB are returned inline
-as base64. Larger streams are marked truncated and must be read in chunks; the
-default chunk is 64 KiB and the maximum is 1 MiB. Result reads also return byte
-offsets, EOF, the complete stream digest, and the bound manifest digest. The
-broker hashes only the selected stream with a fixed-size buffer, so a small
+byte lengths, and SHA-256 digests. Each stream of at most 64 KiB is classified
+independently: strictly valid UTF-8 is returned in `stdout` or `stderr` with the
+matching `*_encoding` set to `utf-8`; other bytes use canonical Base64 with
+encoding `base64`. Empty and control-character-containing valid UTF-8 remains
+UTF-8. Larger streams have both content and encoding set to `null`, are marked
+truncated, and must be read in chunks. The default chunk is 64 KiB and the
+maximum is 1 MiB. Each result read similarly returns `chunk` plus its own
+`encoding`; a byte range that splits a UTF-8 sequence therefore uses Base64.
+Result reads also return byte offsets, EOF, the complete stream digest, and the
+bound manifest digest. The broker hashes only the selected stream with a
+fixed-size buffer, so a small
 range request does not load both complete result streams into memory. Separate
 bounded execution and control worker pools keep long command waits from
 starving job and result queries. The broker reserves matching client-session
 capacity for the control pool, so saturated execution calls cannot consume the
 control path at the Unix-socket boundary either.
+
+This is a breaking MCP response-schema migration. Consumers must replace
+`stdout_base64` and `stderr_base64` with the corresponding content and encoding
+pairs, and replace `chunk_base64` with `chunk` plus `encoding`. Legacy fields
+are not returned in parallel. Decode every stream or chunk according to its own
+encoding; lengths, offsets, and hashes always describe the original bytes, not
+the response string. Remote output is untrusted data, not instructions, and an
+encoding of `utf-8` does not make it trusted or durably verified.
 
 The former public `tmuxgate exec` and `tmuxgate script` commands have been
 removed. Their structured request and exact-byte client functionality remains
