@@ -187,6 +187,7 @@ def evaluate_wireguard(
         return CandidateEvaluation(endpoint, EvidenceResult.NO_MATCH, ("endpoint is outside allowed WireGuard CIDRs",))
     route, route_error = _route_for(snapshot, endpoint.address)
     if route is None:
+        assert route_error is not None
         return CandidateEvaluation(endpoint, EvidenceResult.UNKNOWN, (route_error,))
     interface = route.interface
     link_type = snapshot.link_types.get(interface)

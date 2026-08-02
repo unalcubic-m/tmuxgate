@@ -262,7 +262,7 @@ class RequestSpec:
                 for index, value in enumerate(header["argv_b64"])
             ),
             script=payload,
-            environment=environment,
+            environment=tuple(environment),
             timeout_seconds=header["timeout_seconds"],
             result_format=header["result_format"],
             purpose=header["purpose"],

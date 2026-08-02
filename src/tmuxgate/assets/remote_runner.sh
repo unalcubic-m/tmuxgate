@@ -97,6 +97,8 @@ unset result_limits limit
 : > stderr.raw
 printf '%s\n' gated > state
 runner_complete=0
+# shellcheck disable=SC2317
+# This function is reached indirectly through the EXIT trap below.
 cleanup_runner() {
     set +e
     if [ -n "${quota_monitor:-}" ]; then kill "$quota_monitor" 2>/dev/null; wait "$quota_monitor" 2>/dev/null; fi

@@ -11,7 +11,6 @@ from tmuxgate import cli
 from tmuxgate.models import ExecutionMode, RequestSpec, ResultFormat
 from tmuxgate.result import ExecutionResult, TransportStatus
 from tmuxgate.scheduler import ApprovalDecision, RequestState
-from tmuxgate.state import StateConflictError
 
 
 REQUEST_ID = "0123456789abcdef0123456789abcdef"

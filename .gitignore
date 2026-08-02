@@ -3,7 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.hypothesis/
 .mypy_cache/
+.pyright/
 .ruff_cache/
 .tox/
 .nox/

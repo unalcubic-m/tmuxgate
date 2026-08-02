@@ -12,7 +12,6 @@ from tmuxgate.transport import (
     KeyEnrollmentMutationError,
     KeyEnrollmentOutcome,
     MasterTransportPool,
-    SshInvocation,
     SshMasterStartError,
     TransportAuthorization,
     TransportBusyError,
