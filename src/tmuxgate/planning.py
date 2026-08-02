@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import threading
 
-from tmuxgate.approval import ApprovalDecision, request_bound_approval
+from tmuxgate.approval import ApprovalDecision
 from tmuxgate.config import AppConfig
 from tmuxgate.connection_plan import (
     ConnectionPlan,
@@ -90,7 +90,7 @@ class BoundRequestPlanner:
         route_builder: RouteBuilder = build_route_plan,
         connection_builder: ConnectionBuilder = build_connection_plan,
         endpoint_resolver: Callable[..., object] = resolve_ssh_endpoint,
-        approver: BoundApprover = request_bound_approval,
+        approver: BoundApprover | None = None,
         machine_enabled: MachineEnabled | None = None,
     ) -> None:
         if not isinstance(config, AppConfig):
@@ -100,16 +100,17 @@ class BoundRequestPlanner:
             ("route_builder", route_builder),
             ("connection_builder", connection_builder),
             ("endpoint_resolver", endpoint_resolver),
-            ("approver", approver),
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
+        if not callable(approver):
+            raise TypeError("approver must be provided by the operator boundary")
         self.config = config
         self.snapshot_collector = snapshot_collector
         self.route_builder = route_builder
         self.connection_builder = connection_builder
         self.endpoint_resolver = endpoint_resolver
-        self.approver = approver
+        self.approver: BoundApprover = approver
         self.machine_enabled = (
             (lambda alias: config.machines[alias].enabled)
             if machine_enabled is None

@@ -5,21 +5,15 @@ from __future__ import annotations
 from contextlib import ExitStack
 from pathlib import Path
 import signal
-import sys
 import threading
 from typing import Callable
 
-from tmuxgate.approval import (
-    ApprovalDecision,
-    request_approval,
-    request_fallback_approval,
-    request_machine_disable,
-    request_ssh_retry,
-)
+from tmuxgate.approval import ApprovalDecision
 from tmuxgate.availability import MachineAvailabilityRegistry
 from tmuxgate.broker import BrokerServer
 from tmuxgate.broker_api import BrokerControlService
 from tmuxgate.config import AppConfig, Machine, load_config
+from tmuxgate.connection_plan import ConnectionPlan
 from tmuxgate.executor import RealExecutor
 from tmuxgate.fake import FakeExecution
 from tmuxgate.mcp_server import (
@@ -29,6 +23,14 @@ from tmuxgate.mcp_server import (
     create_mcp_server,
 )
 from tmuxgate.models import RequestSpec
+from tmuxgate.operator_interface import (
+    ActivityKind,
+    ExecutionApprovalPrompt,
+    OperationalActivity,
+    OperatorInterface,
+    PlainTerminalInterface,
+    require_operator_decision,
+)
 from tmuxgate.planning import BoundRequestPlanner
 from tmuxgate.real_remote import RealRemoteJobBackend
 from tmuxgate.real_ssh import (
@@ -47,7 +49,7 @@ from tmuxgate.settings import set_machine_enabled
 from tmuxgate.ssh import ResolvedSshEndpoint, resolve_ssh_endpoint
 from tmuxgate.ssh_key import AutoSshKeyManager
 from tmuxgate.state import DurableStateStore, recover_startup
-from tmuxgate.terminal import TerminalArbiter, TerminalPriority
+from tmuxgate.terminal import TerminalArbiter
 from tmuxgate.transport import MasterTransportPool
 
 
@@ -86,6 +88,7 @@ class UnifiedApplication:
         fake: bool = False,
         dashboard: Dashboard | None = None,
         terminal: TerminalArbiter | None = None,
+        operator_interface: OperatorInterface | None = None,
     ) -> None:
         self._config_path = Path(config_path)
         self._socket_path = socket_path
@@ -93,6 +96,7 @@ class UnifiedApplication:
         self._fake = bool(fake)
         self._dashboard = dashboard
         self._terminal = TerminalArbiter() if terminal is None else terminal
+        self._operator_interface = operator_interface
         self._stop = threading.Event()
 
     @property
@@ -132,6 +136,11 @@ class UnifiedApplication:
             state_dir=self._state_dir,
         )
         bearer_token = load_or_create_mcp_token(paths.state_dir)
+        operator = self._operator_interface or PlainTerminalInterface(
+            self._terminal,
+            dashboard=self._dashboard,
+            approval_mode=config.broker.approval_mode,
+        )
         clean = True
         pool: MasterTransportPool | None = None
         prompt_presenter: SecretPromptPresenter | None = None
@@ -139,8 +148,27 @@ class UnifiedApplication:
         mcp_http: EmbeddedMcpServer | None = None
         previous: dict[int, object] = {}
         owned_components_clean = [True]
+        operator_closed = [False]
+
+        def close_operator() -> bool:
+            if operator_closed[0]:
+                return True
+            result = operator.close()
+            operator_closed[0] = True
+            return result
+
+        def report_error(message: str) -> None:
+            try:
+                operator.publish_activity(
+                    OperationalActivity.create(ActivityKind.ERROR, message)
+                )
+            except BaseException:
+                # The application is already failing closed.  A broken
+                # presentation boundary must not mask the original failure.
+                pass
 
         with ExitStack() as resources:
+            resources.callback(close_operator)
             # The state-directory lock is the application singleton.  It must
             # precede recovery so a second invocation (even with a different
             # custom socket path) cannot rewrite live durable records.
@@ -164,11 +192,16 @@ class UnifiedApplication:
             if self._fake:
                 if config.broker.approval_mode == "always":
                     def approver(request_id: str, request: RequestSpec) -> ApprovalDecision:
-                        with self._terminal.claim(
-                            priority=TerminalPriority.APPROVAL,
-                            purpose="execution approval",
-                        ):
-                            return request_approval(request_id, request)
+                        prompt = ExecutionApprovalPrompt.create(
+                            request_id,
+                            request,
+                            None,
+                            unbound_fake=True,
+                        )
+                        return require_operator_decision(
+                            prompt,
+                            operator.request_execution_approval(prompt),
+                        )
                 else:
                     approver = _approve_without_prompt
                 selected_executor = _ZeroFakeExecutor()
@@ -176,17 +209,29 @@ class UnifiedApplication:
                 delivery_observer = lambda request_id, delivered: None
             else:
                 if config.broker.approval_mode == "always":
+                    def bound_approver(
+                        request_id: str,
+                        request: RequestSpec,
+                        connection_plan: ConnectionPlan,
+                    ) -> ApprovalDecision:
+                        prompt = ExecutionApprovalPrompt.create(
+                            request_id,
+                            request,
+                            connection_plan,
+                        )
+                        return require_operator_decision(
+                            prompt,
+                            operator.request_execution_approval(prompt),
+                        )
+
                     planner = BoundRequestPlanner(
                         config,
+                        approver=bound_approver,
                         machine_enabled=availability.is_enabled,
                     )
 
                     def approver(request_id: str, request: RequestSpec) -> ApprovalDecision:
-                        with self._terminal.claim(
-                            priority=TerminalPriority.APPROVAL,
-                            purpose="execution approval",
-                        ):
-                            return planner(request_id, request)
+                        return planner(request_id, request)
                 else:
                     planner = BoundRequestPlanner(
                         config,
@@ -221,16 +266,18 @@ class UnifiedApplication:
                         pool.close_idle()
                     except BaseException as exc:
                         owned_components_clean[0] = False
-                        print(
-                            f"tmuxgate: could not close all idle SSH masters: {exc}",
-                            file=sys.stderr,
+                        report_error(
+                            f"tmuxgate: could not close all idle SSH masters: {exc}"
                         )
 
                 resources.callback(close_pool)
                 prompt_presenter = SecretPromptPresenter(
                     terminal_lock=self._terminal,
-                    reporter=lambda message: print(
-                        f"tmuxgate: {message}", file=sys.stderr, flush=True
+                    reporter=lambda message: operator.publish_activity(
+                        OperationalActivity.create(
+                            ActivityKind.ERROR,
+                            f"tmuxgate: {message}",
+                        )
                     ),
                 )
 
@@ -241,50 +288,12 @@ class UnifiedApplication:
                             owned_components_clean[0] = False
                     except BaseException as exc:
                         owned_components_clean[0] = False
-                        print(
-                            f"tmuxgate: could not close the prompt presenter: {exc}",
-                            file=sys.stderr,
+                        report_error(
+                            f"tmuxgate: could not close the prompt presenter: {exc}"
                         )
 
                 resources.callback(close_prompt_presenter)
                 channels = SshChannelRunner(prompt_presenter=prompt_presenter)
-
-                def fallback_approver(
-                    *arguments: object,
-                    **keywords: object,
-                ) -> ApprovalDecision:
-                    with self._terminal.claim(
-                        priority=TerminalPriority.APPROVAL,
-                        purpose="fallback approval",
-                    ):
-                        return request_fallback_approval(*arguments, **keywords)
-
-                def ssh_retry_approver(
-                    *arguments: object,
-                    **keywords: object,
-                ) -> ApprovalDecision:
-                    with self._terminal.claim(
-                        priority=TerminalPriority.SECRET,
-                        purpose="SSH setup retry decision",
-                    ):
-                        return request_ssh_retry(*arguments, **keywords)
-
-                def machine_disable_approver(
-                    request_id: str,
-                    machine_name: str,
-                    **keywords: object,
-                ) -> ApprovalDecision:
-                    with self._terminal.claim(
-                        priority=TerminalPriority.APPROVAL,
-                        purpose="machine disable decision",
-                    ):
-                        if not availability.is_enabled(machine_name):
-                            return ApprovalDecision.DENIED
-                        return request_machine_disable(
-                            request_id,
-                            machine_name,
-                            **keywords,
-                        )
 
                 def machine_disabler(machine_name: str) -> None:
                     def persist(name: str, expected_machine: Machine) -> None:
@@ -302,18 +311,12 @@ class UnifiedApplication:
                     transports=pool,
                     state=store,
                     spool=spool,
+                    operator_interface=operator,
                     backend_factory=lambda transport: RealRemoteJobBackend(
                         transport,
                         channels=channels,
                         viewer_dir=paths.viewer_dir,
                     ),
-                    fallback_approver=(
-                        fallback_approver
-                        if config.broker.approval_mode == "always"
-                        else _approve_without_prompt
-                    ),
-                    ssh_retry_approver=ssh_retry_approver,
-                    machine_disable_approver=machine_disable_approver,
                     machine_disabler=machine_disabler,
                     machine_enabled=availability.is_enabled,
                 )
@@ -341,6 +344,7 @@ class UnifiedApplication:
                 approval_discarder=approval_discarder,
                 delivery_observer=delivery_observer,
                 control_service=control_service,
+                activity_publisher=operator.publish_activity,
             )
             call_pools = resources.enter_context(
                 BrokerCallPools(run_worker_count, control_worker_count)
@@ -356,13 +360,11 @@ class UnifiedApplication:
             try:
                 broker.start()
                 mcp_http.start()
-                self._report_started(config, paths.socket_path, paths.mcp_token_path)
-                if self._dashboard is None:
-                    while not self._stop.wait(0.25):
-                        pass
-                else:
-                    self._dashboard(self._stop, self._terminal, config)
-                    self._stop.set()
+                self._report_started(
+                    operator, config, paths.socket_path, paths.mcp_token_path
+                )
+                operator.run_dashboard(self._stop, config)
+                self._stop.set()
                 # The HTTP thread notifies the shared stop event if it dies
                 # after readiness.  Turn that notification into a fatal
                 # application error instead of silently continuing broker-only.
@@ -379,36 +381,42 @@ class UnifiedApplication:
                         mcp_http.request_stop()
                     except BaseException as exc:
                         mcp_clean = False
-                        print(
-                            f"tmuxgate: could not signal the MCP server: {exc}",
-                            file=sys.stderr,
+                        report_error(
+                            f"tmuxgate: could not signal the MCP server: {exc}"
                         )
+                # Once no new HTTP work can enter, deny every pending prompt
+                # before joining broker workers that may be waiting on one.
+                try:
+                    if not close_operator():
+                        owned_components_clean[0] = False
+                except BaseException as exc:
+                    owned_components_clean[0] = False
+                    report_error(
+                        f"tmuxgate: could not close the operator interface: {exc}"
+                    )
                 if broker is not None:
                     try:
                         broker_clean = broker.stop()
                     except BaseException as exc:
                         broker_clean = False
-                        print(
-                            f"tmuxgate: could not stop the broker safely: {exc}",
-                            file=sys.stderr,
+                        report_error(
+                            f"tmuxgate: could not stop the broker safely: {exc}"
                         )
                 if mcp_http is not None:
                     try:
                         mcp_clean = mcp_http.stop() and mcp_clean
                     except BaseException as exc:
                         mcp_clean = False
-                        print(
-                            f"tmuxgate: could not stop the MCP server safely: {exc}",
-                            file=sys.stderr,
+                        report_error(
+                            f"tmuxgate: could not stop the MCP server safely: {exc}"
                         )
                 clean = broker_clean and mcp_clean and clean
                 try:
                     self._restore_signal_handlers(previous)
                 except BaseException as exc:
                     clean = False
-                    print(
-                        f"tmuxgate: could not restore signal handlers: {exc}",
-                        file=sys.stderr,
+                    report_error(
+                        f"tmuxgate: could not restore signal handlers: {exc}"
                     )
                 if not broker_clean or not mcp_clean:
                     # Live workers can still hold the state store, spool, SSH
@@ -416,38 +424,40 @@ class UnifiedApplication:
                     # them creates use-after-close races.  Keep ownership until
                     # the CLI process terminates and lets the OS reclaim it.
                     _RETAINED_SHUTDOWN_RESOURCES.append(resources.pop_all())
-                    print(
+                    report_error(
                         "tmuxgate: shutdown incomplete; retaining owned resources "
-                        "until process exit",
-                        file=sys.stderr,
+                        "until process exit"
                     )
         clean = owned_components_clean[0] and clean
         return 0 if clean else EXIT_SOFTWARE
 
     def _report_started(
         self,
+        operator: OperatorInterface,
         config: AppConfig,
         socket_path: Path,
         token_path: Path,
     ) -> None:
         kind = "fake" if self._fake else "real"
-        with self._terminal.claim(
-            priority=TerminalPriority.DASHBOARD,
-            purpose="startup status",
-            flush_input=False,
-        ):
-            print(f"tmuxgate {kind} broker listening on {socket_path}")
-            print(
-                "tmuxgate MCP listening on "
-                f"http://{config.mcp.host}:{config.mcp.port}/mcp"
+        messages = (
+            f"tmuxgate {kind} broker listening on {socket_path}",
+            "tmuxgate MCP listening on "
+            f"http://{config.mcp.host}:{config.mcp.port}/mcp",
+            "Configured machines: " + ", ".join(config.machines),
+            f"Approval mode: {config.broker.approval_mode}",
+            f"MCP bearer token file: {token_path}",
+        )
+        for message in messages:
+            operator.publish_activity(
+                OperationalActivity.create(ActivityKind.STARTUP, message)
             )
-            print("Configured machines: " + ", ".join(config.machines))
-            print(f"Approval mode: {config.broker.approval_mode}")
-            print(f"MCP bearer token file: {token_path}")
-            if config.broker.approval_mode == "disabled":
-                print(
-                    "WARNING: authenticated requests run without per-command approval."
+        if config.broker.approval_mode == "disabled":
+            operator.publish_activity(
+                OperationalActivity.create(
+                    ActivityKind.WARNING,
+                    "WARNING: authenticated requests run without per-command approval.",
                 )
+            )
 
 
 __all__ = ["RecoveryBlockedError", "UnifiedApplication"]

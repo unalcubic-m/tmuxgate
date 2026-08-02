@@ -23,6 +23,7 @@ from tmuxgate.broker_api import (
 )
 from tmuxgate.fake import FakeExecution
 from tmuxgate.models import RequestSpec, ValidationError, new_request_id, validate_alias
+from tmuxgate.operator_interface import ActivityKind, OperationalActivity
 from tmuxgate.protocol import ProtocolError, receive_single_request, send_frame
 from tmuxgate.result import ExecutionResult, TransportStatus, send_result, send_status
 from tmuxgate.runtime import require_same_uid
@@ -308,6 +309,9 @@ class BrokerServer:
             lambda request_id, delivered: None
         ),
         control_service: ControlService | None = None,
+        activity_publisher: Callable[[OperationalActivity], object] = (
+            lambda event: None
+        ),
     ) -> None:
         if listener.family != socket.AF_UNIX:
             raise ValueError("broker listener must be an AF_UNIX socket")
@@ -319,6 +323,7 @@ class BrokerServer:
                 peer_validator,
                 approval_discarder,
                 delivery_observer,
+                activity_publisher,
             )
         ):
             raise TypeError("broker callbacks must be callable")
@@ -373,6 +378,7 @@ class BrokerServer:
         self._approval_discarder = approval_discarder
         self._delivery_observer = delivery_observer
         self._control_service = control_service
+        self._activity_publisher = activity_publisher
         self._request_timeout_seconds = float(request_timeout_seconds)
         self._send_timeout_seconds = float(send_timeout_seconds)
         self._approval_heartbeat_seconds = float(approval_heartbeat_seconds)
@@ -515,6 +521,18 @@ class BrokerServer:
         with self._audit_condition:
             self._audit.append((name, request_id))
             self._audit_condition.notify_all()
+        try:
+            self._activity_publisher(
+                OperationalActivity.create(
+                    ActivityKind.BROKER_AUDIT,
+                    name,
+                    request_id=request_id,
+                )
+            )
+        except BaseException:
+            # Reporting cannot alter the authoritative broker transition that
+            # was already appended to the bounded audit above.
+            pass
 
     def _accept_loop(self) -> None:
         while not self._stopping.is_set():
@@ -942,7 +960,7 @@ class BrokerServer:
         request_id = event.work.request_id
         record = self._scheduler.request(request_id)
         if record.state is RequestState.CANCELLED_BEFORE_APPROVAL:
-            # The waiting client disappeared while /dev/tty was prompting.
+            # The waiting client disappeared while the operator was deciding.
             # Its eventual RUN is stale and must never authorize execution.
             self._authorize_without_blocking(event.work, False)
             self._approval_work = None

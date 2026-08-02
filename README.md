@@ -306,6 +306,15 @@ process stdin cannot answer the prompt. The dashboard does not hold the
 terminal while idle, allowing approvals, SSH authentication, and automatic
 secret-prompt attachments to use the same terminal safely.
 
+The plain screen is implemented behind a presentation-independent operator
+interface. Execution, SSH-retry, fallback, and machine-disable prompts carry
+their complete internal request/connection bindings through an exactly-once
+FIFO decision queue; broker and executor workers do not parse terminal text.
+Closing or failing the interface denies all unresolved prompts. This is an
+internal architecture migration only: the visible line-oriented interface and
+`/dev/tty` trust boundary remain the defaults, and no Textual/full-screen TUI
+is included yet.
+
 If initial OpenSSH master setup exits, tmuxgate leaves OpenSSH's diagnostic in
 that controlling terminal, reports its exit status without copying terminal
 output into MCP or durable state, and offers at most one exact broker-terminal

@@ -5,14 +5,17 @@ from __future__ import annotations
 from collections.abc import Callable
 import threading
 import time
-from typing import TextIO
 
-from tmuxgate.approval import (
-    ApprovalDecision,
-    request_fallback_approval,
-    request_ssh_retry,
-)
+from tmuxgate.approval import ApprovalDecision
 from tmuxgate.models import RequestSpec
+from tmuxgate.operator_interface import (
+    MachineDisablePrompt,
+    OperatorInterface,
+    RemoteMutationState,
+    RouteFallbackPrompt,
+    SshRetryPrompt,
+    require_operator_decision,
+)
 from tmuxgate.planning import BoundRequestPlanner
 from tmuxgate.remote_job import (
     RemoteJob,
@@ -46,40 +49,12 @@ RemoteBackendFactory = Callable[[MasterTransport], object]
 DetachedHandler = Callable[[str], str]
 
 
-def _deny_machine_disable(*_arguments: object, **_keywords: object) -> ApprovalDecision:
-    return ApprovalDecision.DENIED
-
-
 def _ignore_machine_disable(_machine_name: str) -> None:
     return None
 
 
 def _machine_enabled(_machine_name: str) -> bool:
     return True
-
-
-def prompt_detached_job(request_id: str) -> str:
-    """Ask only on the broker terminal whether to reattach or keep waiting."""
-
-    with open("/dev/tty", "r+", encoding="utf-8", errors="strict", buffering=1) as tty:
-        while True:
-            tty.write(
-                "\nJob "
-                + request_id[:8]
-                + " is still running detached. Type ATTACH "
-                + request_id[:8]
-                + " or WAIT: "
-            )
-            tty.flush()
-            line = tty.readline()
-            if line == "":
-                raise ExecutorError("broker terminal closed during detached-job prompt")
-            answer = line.rstrip("\r\n")
-            if answer == f"ATTACH {request_id[:8]}":
-                return "reattach"
-            if answer == "WAIT":
-                return "wait"
-            tty.write("Exact input required.\n")
 
 
 def reattach_detached_job(request_id: str) -> str:
@@ -99,11 +74,7 @@ class RealExecutor:
         state: DurableStateStore,
         spool: ResultSpool,
         backend_factory: RemoteBackendFactory,
-        fallback_approver: Callable[..., ApprovalDecision] = request_fallback_approval,
-        ssh_retry_approver: Callable[..., ApprovalDecision] = request_ssh_retry,
-        machine_disable_approver: Callable[..., ApprovalDecision] = (
-            _deny_machine_disable
-        ),
+        operator_interface: OperatorInterface,
         machine_disabler: Callable[[str], object] = _ignore_machine_disable,
         machine_enabled: Callable[[str], bool] = _machine_enabled,
         detached_handler: DetachedHandler = reattach_detached_job,
@@ -112,23 +83,28 @@ class RealExecutor:
     ) -> None:
         for name, callback in (
             ("backend_factory", backend_factory),
-            ("fallback_approver", fallback_approver),
-            ("ssh_retry_approver", ssh_retry_approver),
-            ("machine_disable_approver", machine_disable_approver),
             ("machine_disabler", machine_disabler),
             ("machine_enabled", machine_enabled),
             ("detached_handler", detached_handler),
         ):
             if not callable(callback):
                 raise TypeError(f"{name} must be callable")
+        for method_name in (
+            "request_ssh_retry",
+            "request_fallback",
+            "request_machine_disable",
+            "publish_activity",
+        ):
+            if not callable(getattr(operator_interface, method_name, None)):
+                raise TypeError(
+                    f"operator_interface must provide callable {method_name}"
+                )
         self.planner = planner
         self.transports = transports
         self.state = state
         self.spool = spool
         self.backend_factory = backend_factory
-        self.fallback_approver = fallback_approver
-        self.ssh_retry_approver = ssh_retry_approver
-        self.machine_disable_approver = machine_disable_approver
+        self.operator_interface = operator_interface
         self.machine_disabler = machine_disabler
         self.machine_enabled = machine_enabled
         self.detached_handler = detached_handler
@@ -157,16 +133,18 @@ class RealExecutor:
                 )
             else:
                 previous = plan.endpoints[index - 1]
-                decision = ApprovalDecision(
-                    self.fallback_approver(
+                prompt = RouteFallbackPrompt.create(
                         request_id,
                         request,
                         plan,
                         failed_endpoint_id=previous.resolved.endpoint_id,
                         fallback_endpoint_id=endpoint.resolved.endpoint_id,
                         failure_detail=str(failure)[:500],
-                        remote_mutation_started=False,
+                        remote_mutation_state=RemoteMutationState.NOT_STARTED,
                     )
+                decision = require_operator_decision(
+                    prompt,
+                    self.operator_interface.request_fallback(prompt),
                 )
                 if decision is not ApprovalDecision.APPROVED:
                     raise TransportError("human denied the next approved fallback")
@@ -187,15 +165,19 @@ class RealExecutor:
                 except SshMasterStartError as exc:
                     failure = exc
                     if ssh_attempt == 0:
-                        decision = ApprovalDecision(
-                            self.ssh_retry_approver(
+                        prompt = SshRetryPrompt.create(
                                 request_id,
                                 request,
                                 plan,
                                 endpoint_id=endpoint.resolved.endpoint_id,
                                 failure_detail=str(exc)[:500],
-                                remote_mutation_started=False,
+                                remote_mutation_state=(
+                                    RemoteMutationState.NOT_STARTED
+                                ),
                             )
+                        decision = require_operator_decision(
+                            prompt,
+                            self.operator_interface.request_ssh_retry(prompt),
                         )
                         if decision is ApprovalDecision.APPROVED:
                             self.planner.revalidate_connection_plan(
@@ -298,13 +280,16 @@ class RealExecutor:
                 if not enabled:
                     disable_detail = "; machine was already disabled"
                 else:
-                    decision = ApprovalDecision(
-                        self.machine_disable_approver(
+                    prompt = MachineDisablePrompt.create(
                             request_id,
-                            request.machine_alias,
+                            request,
+                            context.connection_plan,
                             failure_detail=str(exc)[:500],
-                            remote_mutation_started=False,
+                            remote_mutation_state=RemoteMutationState.NOT_STARTED,
                         )
+                    decision = require_operator_decision(
+                        prompt,
+                        self.operator_interface.request_machine_disable(prompt),
                     )
                     if decision is ApprovalDecision.APPROVED:
                         self.machine_disabler(request.machine_alias)
