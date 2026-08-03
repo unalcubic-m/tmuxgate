@@ -61,8 +61,8 @@ The unified lifecycle starts resources in fail-closed order:
    presenter, executor, broker, and broker control service.
 7. Start the broker, then start and await readiness of the MCP HTTP listener.
 8. Report only sanitized listener/token-path information and enter the
-   selected dashboard loop. Plain mode is the default; the Textual operator
-   preview is selected only by explicit `--tui`.
+   selected dashboard loop. The Textual operator interface is the default;
+   explicit `--plain` selects the supported line-oriented fail-safe.
 
 Startup refuses to accept new approvals when durable recovery reports a
 possibly running or incompletely collected request. An MCP bind or startup
@@ -384,19 +384,22 @@ request-bound contexts may await parallel executor workers.
 `OperatorInterface` is the presentation-independent boundary between broker or
 executor work and operator interaction. `PlainTerminalInterface` preserves the
 line-oriented dashboard and the existing exact approval, SSH-retry, fallback,
-machine-disable, and secret-input renderers. It remains the production default
-and may be selected explicitly with `--plain`. It obtains decision bytes only
+machine-disable, and secret-input renderers. It remains supported when selected
+explicitly with `--plain`. It obtains decision bytes only
 from the controlling `/dev/tty` under `TerminalArbiter`; stdin,
 MCP/Unix-socket frames, request content, remote output, viewer pane content,
 rendered diagnostics, and pager return values are never input sources.
 
-`TextualOperatorInterface`, selected only with `--tui`, is the Textual operator
-interface built on exactly pinned `textual==8.2.8`. Before entering
+`TextualOperatorInterface` is the default operator interface and is built on
+exactly pinned `textual==8.2.8`; the former `--tui` preview selector is removed.
+Before entering
 application mode it verifies that Textual's real stdin and stdout are the same
 character terminal and that tmuxgate's process group owns that terminal in the
-foreground. Validation, driver initialization, snapshot refresh, or terminal
-ownership failure aborts the unified application; there is no automatic plain
-fallback and no approval-policy change. Textual's driver owns alternate-screen
+foreground. Each dashboard refresh re-proves that ownership. Validation,
+driver initialization, snapshot refresh, or terminal ownership failure aborts
+the unified application and directs the operator to restart explicitly with
+`--plain`; there is no automatic fallback, second dashboard, or approval-policy
+change. Textual's driver owns alternate-screen
 entry, resize/full redraw, signal/cancellation unwinding, and restoration of
 the prior terminal modes and contents.
 
@@ -409,17 +412,23 @@ Every externally derived string is passed as literal non-markup content after
 C0/C1, DEL, format, bidi, and surrogate controls are escaped. Job, machine,
 activity, and prompt rows are bounded without creating per-record widgets. A
 terminal below 72 columns by 20 rows shows only a resize/quit guard when no
-security decision is active.
+security decision is active. During a decision, the same boundary hides the
+evidence region, keeps Deny/Cancel/Keep enabled visible and focused, and
+disables the positive action until the terminal is large enough to inspect the
+complete evidence again.
 
 The TUI supports execution approval, bounded SSH retry, separately authorized
-adjacent-route fallback, and exact secret-input authorization decisions. It may
-run with either approval mode: disabled execution approval is still automatic,
-but never disables secret-input authorization. Its presenter thread remains the sole FIFO consumer,
+adjacent-route fallback, exact secret-input authorization, and request-bound
+local machine-disable decisions. It may run with either approval mode: disabled
+execution approval is still automatic, but never disables secret-input
+authorization. Its presenter thread remains the sole FIFO consumer,
 but it schedules each supported prompt through Textual's thread-safe
 `call_from_thread` boundary. The UI thread creates one modal for that exact
 immutable queued item and returns its result through a callback which retains
 the original object identity; no displayed label is parsed or used to select a
-slot. Machine-disable prompts remain denied.
+slot. The machine-disable modal shows the exhausted request, complete approved
+request/plan evidence, and exact disable binding; Keep enabled is its fenced
+safe default.
 
 The interface tracks three synchronized foreground ownership states: `tui`,
 `modal`, and `external`. A positive secret-input modal result atomically reserves
@@ -505,7 +514,7 @@ requests have one deterministic presentation order. Each queued item owns its
 own `PendingDecision` condition variable. Each interface has one daemon
 presenter thread and is the sole queue consumer; workers wait only on the slot
 created for their exact prompt. The Textual interface also records a bounded
-projection of every submission, schedules only the active execution item onto
+projection of every submission, schedules only the active decision item onto
 the UI thread, waits for that item's resolution, and then advances to the next
 FIFO item. Multiple worker requests therefore remain independent and only one
 security modal can be active.
@@ -649,8 +658,8 @@ components to use the arbiter through their lock-compatible interface. Parallel
 execution never places two password prompts or an approval and password prompt
 on `/dev/tty` concurrently. This serialization applies only to human terminal
 interaction; the remote command leases continue independently. The Textual
-interface handles execution approval, SSH retry, fallback, and secret-input
-authorization inside the full-screen driver; secret bytes flow only through
+interface handles execution approval, SSH retry, fallback, machine disable,
+and secret-input authorization inside the full-screen driver; secret bytes flow only through
 the separately owned external viewer while that driver is suspended.
 
 Separately, up to three authenticated `ssh -N` ControlMaster transports may

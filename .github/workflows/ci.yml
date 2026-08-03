@@ -155,11 +155,17 @@ jobs:
           XDG_CACHE_HOME: ${{ runner.temp }}/tmuxgate-adversarial-home/cache
           SSH_AUTH_SOCK: ${{ runner.temp }}/tmuxgate-adversarial-home/no-agent
           GIT_CONFIG_GLOBAL: /dev/null
+          TMUXGATE_CI_SSH_CONTACT_MARKER: ${{ runner.temp }}/tmuxgate-adversarial-ssh-contact
           PYTHONPATH: src:tests
         run: |
-          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
-          chmod 700 "$HOME"
+          mkdir -p "$HOME/.ssh" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+          chmod 700 "$HOME" "$HOME/.ssh"
+          printf 'Host *\n    ProxyCommand /usr/bin/touch %s\n' "$TMUXGATE_CI_SSH_CONTACT_MARKER" > "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
+          python -m unittest test_textual_interface test_application -v
+          test ! -e "$TMUXGATE_CI_SSH_CONTACT_MARKER"
           coverage run -m unittest discover -s tests -v
+          test ! -e "$TMUXGATE_CI_SSH_CONTACT_MARKER"
           if coverage report --fail-under=101 >/dev/null 2>&1; then
             echo 'Coverage accepted an impossible controlled threshold' >&2
             exit 1
@@ -188,5 +194,18 @@ jobs:
       - name: Exercise installed CLI outside the source checkout
         working-directory: ${{ runner.temp }}
         run: |
+          isolated_home="$RUNNER_TEMP/tmuxgate-installed-cli"
+          mkdir -p "$isolated_home/config" "$isolated_home/state" "$isolated_home/cache" "$isolated_home/runtime"
+          chmod 700 "$isolated_home" "$isolated_home/runtime"
+          export HOME="$isolated_home"
+          export XDG_CONFIG_HOME="$isolated_home/config"
+          export XDG_STATE_HOME="$isolated_home/state"
+          export XDG_CACHE_HOME="$isolated_home/cache"
+          export XDG_RUNTIME_DIR="$isolated_home/runtime"
           tmuxgate --version
           tmuxgate --help
+          tmuxgate --plain --help
+          if tmuxgate --tui >/dev/null 2>&1; then
+            echo 'Removed preview flag --tui was unexpectedly accepted' >&2
+            exit 1
+          fi

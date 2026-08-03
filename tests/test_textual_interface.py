@@ -10,9 +10,11 @@ from pathlib import Path
 import pty
 import select
 import signal
+import socket
 import stat
 import struct
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -24,11 +26,13 @@ from unittest import mock
 from textual.widgets import Button, Static, TabbedContent
 
 from tmuxgate.approval import ApprovalDecision
+from tmuxgate.config import parse_config
 from tmuxgate.models import ExecutionMode, RequestSpec
 from tmuxgate.operator_interface import (
     ActivityKind,
     ConnectionPhase,
     ExecutionApprovalPrompt,
+    MachineDisablePrompt,
     OperationalActivity,
     OperatorInterfaceError,
     PendingDecision,
@@ -46,8 +50,10 @@ from tmuxgate.textual_interface import (
     ExecutionApprovalScreen,
     MAX_DASHBOARD_JOBS,
     MAX_DASHBOARD_MACHINES,
+    MachineDisableScreen,
     MINIMUM_COLUMNS,
     MINIMUM_ROWS,
+    REFRESH_SECONDS,
     RouteFallbackScreen,
     SecretInputAuthorizationScreen,
     SshRetryScreen,
@@ -57,6 +63,8 @@ from tmuxgate.textual_interface import (
     flush_textual_input,
     validate_textual_terminal,
 )
+from tmuxgate.settings import serialize_config
+from test_config import valid_config
 from test_connection_plan import build_plan
 
 
@@ -149,6 +157,21 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
             await pilot.pause(0.02)
         raise AssertionError("matching recovery modal did not open")
 
+    @staticmethod
+    async def _wait_for_machine_disable(app, pilot, expected_prompt):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if isinstance(app.screen, MachineDisableScreen):
+                screen = app.screen
+                if (
+                    screen.prompt.prompt_id == expected_prompt.prompt_id
+                    and len(list(screen.query("#disable-views"))) == 1
+                    and len(list(screen.query("#disable-cancel:focus"))) == 1
+                ):
+                    return screen
+            await pilot.pause(0.02)
+        raise AssertionError("matching machine-disable modal did not open")
+
     def test_terminal_ownership_validation_fails_closed(self):
         stdin = mock.Mock()
         stdout = mock.Mock()
@@ -208,6 +231,60 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
             self.assertRaisesRegex(OperatorInterfaceError, "discard buffered"),
         ):
             flush_textual_input(stream)
+
+    def test_runtime_terminal_loss_stops_tui_and_denies_pending_prompt(self):
+        terminal_lost = threading.Event()
+
+        def validator() -> None:
+            if terminal_lost.is_set():
+                raise OperatorInterfaceError("foreground terminal ownership lost")
+
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(),
+            terminal_validator=validator,
+        )
+        self.addCleanup(interface.close)
+        pending_prompt = prompt()
+        decisions = []
+        worker = threading.Thread(
+            target=lambda: decisions.append(
+                interface.request_execution_approval(pending_prompt)
+            )
+        )
+        worker.start()
+        deadline = time.monotonic() + 1
+        while interface.pending_prompt_count < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stop = threading.Event()
+        app = TmuxgateDashboardApp(interface, stop, config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                await self._wait_for_approval(app, pilot, pending_prompt)
+                terminal_lost.set()
+                await pilot.pause(REFRESH_SECONDS + 0.10)
+
+        asyncio.run(exercise())
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(stop.is_set())
+        self.assertIsInstance(app.snapshot_failure, OperatorInterfaceError)
+        self.assertEqual(len(decisions), 1)
+        self.assertIs(decisions[0].decision, ApprovalDecision.DENIED)
+
+    def test_textual_exception_directs_explicit_plain_restart(self):
+        class FailingApp(TmuxgateDashboardApp):
+            def run(self, *args, **kwargs):
+                raise RuntimeError("synthetic driver initialization failure")
+
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(),
+            validate_terminal=False,
+            app_factory=FailingApp,
+        )
+        self.addCleanup(interface.close)
+        with self.assertRaisesRegex(OperatorInterfaceError, "--plain"):
+            interface.run_dashboard(threading.Event(), config())
 
     def test_disabled_execution_approval_never_bypasses_secret_authorization(self):
         interface = TextualOperatorInterface(
@@ -689,6 +766,98 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
         self.assertIs(decisions[retry.prompt_id], ApprovalDecision.DENIED)
         self.assertIs(decisions[fallback.prompt_id], ApprovalDecision.APPROVED)
 
+    def test_machine_disable_modal_is_exact_bounded_and_safe_when_small(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        plan = build_plan()
+        first = MachineDisablePrompt.create(
+            REQUEST_ID,
+            prompt().request,
+            plan,
+            failure_detail="all routes failed [bold]\x1b[31m",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+        )
+        second = MachineDisablePrompt.create(
+            "2" * 32,
+            prompt().request,
+            plan,
+            failure_detail="all routes failed",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+        )
+        decisions: dict[str, ApprovalDecision] = {}
+
+        def decide(item: MachineDisablePrompt) -> None:
+            decisions[item.prompt_id] = interface.request_machine_disable(item).decision
+
+        workers = [
+            threading.Thread(target=decide, args=(item,))
+            for item in (first, second)
+        ]
+        for index, worker in enumerate(workers, start=1):
+            worker.start()
+            deadline = time.monotonic() + 1
+            while (
+                interface.pending_prompt_count < index and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                screen = await self._wait_for_machine_disable(app, pilot, first)
+                self.assertTrue(
+                    screen.query_one("#disable-cancel", Button).has_focus
+                )
+                summary = (
+                    screen.query_one("#disable-summary-document", Static)
+                    .render()
+                    .plain
+                )
+                request_evidence = (
+                    screen.query_one("#disable-request-document", Static)
+                    .render()
+                    .plain
+                )
+                binding = (
+                    screen.query_one("#disable-binding-document", Static)
+                    .render()
+                    .plain
+                )
+                self.assertNotIn("\x1b", summary)
+                self.assertIn(r"\u001b", summary)
+                self.assertIn(plan.plan_sha256, request_evidence)
+                self.assertIn(first.binding_sha256, binding)
+                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                self.assertFalse(
+                    screen.query_one("#disable-approve", Button).disabled
+                )
+                await pilot.resize_terminal(MINIMUM_COLUMNS - 1, MINIMUM_ROWS - 1)
+                await pilot.pause()
+                self.assertTrue(
+                    screen.query_one(".decision-size-warning", Static).display
+                )
+                self.assertTrue(
+                    screen.query_one("#disable-approve", Button).disabled
+                )
+                self.assertTrue(
+                    screen.query_one("#disable-cancel", Button).has_focus
+                )
+                await pilot.press("enter")
+
+                await self._wait_for_machine_disable(app, pilot, second)
+                await pilot.resize_terminal(100, 30)
+                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                self.assertTrue(await pilot.click("#disable-approve"))
+
+        asyncio.run(exercise())
+        for worker in workers:
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+        self.assertIs(decisions[first.prompt_id], ApprovalDecision.DENIED)
+        self.assertIs(decisions[second.prompt_id], ApprovalDecision.APPROVED)
+
     def test_execution_approval_views_resize_and_explicit_decisions(self):
         interface = TextualOperatorInterface(
             FakeTerminalArbiter(), validate_terminal=False
@@ -838,14 +1007,14 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 second_screen = await self._wait_for_approval(app, pilot, prompts[1])
                 self.assertIsNot(first_screen, second_screen)
                 second_item = interface.queued_prompts[1]
-                app._complete_execution_approval(first_item, ApprovalDecision.APPROVED)
+                app._complete_operator_decision(first_item, ApprovalDecision.APPROVED)
                 await pilot.pause()
                 self.assertTrue(workers[1].is_alive())
                 self.assertEqual(
-                    app._active_approval.prompt.prompt_id,
+                    app._active_decision.prompt.prompt_id,
                     second_item.prompt.prompt_id,
                 )
-                self.assertIs(app._active_approval.pending, second_item.pending)
+                self.assertIs(app._active_decision.pending, second_item.pending)
 
                 await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
                 self.assertTrue(await pilot.click("#approval-approve"))
@@ -1014,6 +1183,99 @@ os.close(terminal)
 
 @unittest.skipUnless(hasattr(pty, "fork"), "requires a Unix PTY")
 class TextualPtyLifecycleTests(unittest.TestCase):
+    def _run_cli(self, *, plain: bool) -> bytes:
+        with tempfile.TemporaryDirectory(prefix="tmuxgate-cli-pty-") as directory:
+            root = Path(directory)
+            home = root / "home"
+            runtime = root / "runtime"
+            state = root / "state"
+            for path in (home, runtime, state):
+                path.mkdir(mode=0o700)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            data = valid_config()
+            data["version"] = 2
+            data["mcp"] = {"host": "127.0.0.1", "port": port}
+            config_path = root / "config.toml"
+            config_path.write_bytes(serialize_config(parse_config(data)))
+            config_path.chmod(0o600)
+            arguments = [
+                sys.executable,
+                "-m",
+                "tmuxgate",
+                "--config",
+                os.fspath(config_path),
+                "--state-dir",
+                os.fspath(state),
+                "--socket",
+                os.fspath(runtime / "broker.sock"),
+                "--fake",
+            ]
+            if plain:
+                arguments.append("--plain")
+            child, master = pty.fork()
+            if child == 0:
+                environment = dict(os.environ)
+                environment.update(
+                    {
+                        "HOME": os.fspath(home),
+                        "PYTHONPATH": os.pathsep.join(("src", "tests")),
+                        "TERM": "xterm-256color",
+                        "XDG_CACHE_HOME": os.fspath(home / "cache"),
+                        "XDG_CONFIG_HOME": os.fspath(home / "config"),
+                        "XDG_RUNTIME_DIR": os.fspath(runtime),
+                        "XDG_STATE_HOME": os.fspath(home / "state"),
+                    }
+                )
+                os.execve(sys.executable, arguments, environment)
+            output = bytearray()
+            sent_quit = False
+            status = None
+            try:
+                fcntl.ioctl(
+                    master,
+                    termios.TIOCSWINSZ,
+                    struct.pack("HHHH", 30, 100, 0, 0),
+                )
+                deadline = time.monotonic() + 12
+                while time.monotonic() < deadline:
+                    readable, _, _ = select.select([master], [], [], 0.1)
+                    if readable:
+                        try:
+                            chunk = os.read(master, 65536)
+                        except OSError:
+                            chunk = b""
+                        if chunk:
+                            output.extend(chunk)
+                    ready = (
+                        b"Choose: " in output if plain else b"\x1b[?1049h" in output
+                    )
+                    if ready and not sent_quit:
+                        os.write(master, b"q\n" if plain else b"q")
+                        sent_quit = True
+                    waited, status = os.waitpid(child, os.WNOHANG)
+                    if waited:
+                        break
+                else:
+                    os.kill(child, signal.SIGKILL)
+                    os.waitpid(child, 0)
+                    self.fail(
+                        "default CLI PTY timed out:\n"
+                        + output.decode(errors="replace")
+                    )
+                self.assertTrue(sent_quit, output.decode(errors="replace"))
+                self.assertIsNotNone(status)
+                self.assertTrue(os.WIFEXITED(status), output.decode(errors="replace"))
+                self.assertEqual(
+                    os.WEXITSTATUS(status),
+                    0,
+                    output.decode(errors="replace"),
+                )
+                return bytes(output)
+            finally:
+                os.close(master)
+
     def _run_mode(self, mode: str) -> bytes:
         child, master = pty.fork()
         if child == 0:
@@ -1075,6 +1337,16 @@ class TextualPtyLifecycleTests(unittest.TestCase):
                 self.assertIn(b"\x1b[?1049h", output)
                 self.assertIn(b"\x1b[?1049l", output)
                 self.assertIn(b"TMUXGATE_RESTORED=yes", output)
+
+    def test_default_cli_uses_tui_and_plain_remains_explicit(self):
+        tui_output = self._run_cli(plain=False)
+        self.assertIn(b"\x1b[?1049h", tui_output)
+        self.assertIn(b"\x1b[?1049l", tui_output)
+        self.assertNotIn(b"TMUXGATE RUNNING", tui_output)
+
+        plain_output = self._run_cli(plain=True)
+        self.assertIn(b"TMUXGATE RUNNING", plain_output)
+        self.assertNotIn(b"\x1b[?1049h", plain_output)
 
     def test_external_process_owns_bytes_while_textual_is_suspended(self):
         output = self._run_mode("handoff")

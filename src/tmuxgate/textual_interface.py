@@ -26,6 +26,7 @@ from .approval import (
     render_approval_summary,
     render_code_document,
     render_fallback_approval_document,
+    render_machine_disable_document,
     render_openssh_diagnostics,
     render_secret_input_authorization_document,
     render_ssh_retry_document,
@@ -33,6 +34,7 @@ from .approval import (
 from .operator_interface import (
     ActivityKind,
     ExecutionApprovalPrompt,
+    MachineDisablePrompt,
     OperationalActivity,
     OperatorDecision,
     OperatorInterfaceError,
@@ -102,7 +104,8 @@ def validate_textual_terminal(
     output_fd = _stream_fd(output_stream, "output")
     if not os.isatty(input_fd) or not os.isatty(output_fd):
         raise OperatorInterfaceError(
-            "the TUI requires terminal input and output; use --plain"
+            "the TUI requires terminal input and output; restart explicitly "
+            "with --plain"
         )
     input_metadata = os.fstat(input_fd)
     output_metadata = os.fstat(output_fd)
@@ -112,17 +115,20 @@ def validate_textual_terminal(
         or input_metadata.st_rdev != output_metadata.st_rdev
     ):
         raise OperatorInterfaceError(
-            "Textual input and output do not belong to one terminal; use --plain"
+            "Textual input and output do not belong to one terminal; restart "
+            "explicitly with --plain"
         )
     try:
         foreground = os.tcgetpgrp(input_fd)
     except OSError as exc:
         raise OperatorInterfaceError(
-            "Textual could not verify foreground terminal ownership"
+            "Textual could not verify foreground terminal ownership; restart "
+            "explicitly with --plain"
         ) from exc
     if foreground != os.getpgrp():
         raise OperatorInterfaceError(
-            "tmuxgate does not own the foreground terminal; refusing TUI startup"
+            "tmuxgate does not own the foreground terminal; refusing TUI startup; "
+            "restart explicitly with --plain"
         )
 
 
@@ -180,7 +186,89 @@ class TerminalOwnershipState(StrEnum):
     EXTERNAL = "external"
 
 
-class ExecutionApprovalScreen(ModalScreen[ApprovalDecision]):
+class _FailClosedDecisionScreen(ModalScreen[ApprovalDecision]):
+    """Shared stale-input fence, safe default, and compact-size behavior."""
+
+    SAFE_BUTTON_ID = ""
+    POSITIVE_BUTTON_ID = ""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._arm_ready = False
+        self._compact = False
+        self._finished = False
+
+    def on_mount(self) -> None:
+        self._apply_decision_size(self.size.width, self.size.height)
+        self.call_after_refresh(self._initialize_controls)
+
+    def on_resize(self, event: Resize) -> None:
+        self._apply_decision_size(event.size.width, event.size.height)
+
+    def _apply_decision_size(self, width: int, height: int) -> None:
+        self._compact = width < MINIMUM_COLUMNS or height < MINIMUM_ROWS
+        self.set_class(self._compact, "compact-decision")
+        warnings = list(self.query(".decision-size-warning"))
+        contents = list(self.query(".decision-content"))
+        for warning in warnings:
+            warning.display = self._compact
+            if self._compact and isinstance(warning, Static):
+                warning.update(
+                    f"Terminal too small ({width}×{height}). Resize to at least "
+                    f"{MINIMUM_COLUMNS}×{MINIMUM_ROWS} to inspect evidence and "
+                    "enable the positive action. The safe action remains available."
+                )
+        for content in contents:
+            content.display = not self._compact
+        self._sync_positive_action()
+
+    def _initialize_controls(self) -> None:
+        self.query_one(f"#{self.SAFE_BUTTON_ID}", Button).focus()
+        if not self.app.is_headless:
+            try:
+                flush_textual_input()
+            except OperatorInterfaceError:
+                self._finish(ApprovalDecision.DENIED)
+                return
+        self.set_timer(APPROVAL_ARM_SECONDS, self._arm_decision)
+
+    def _arm_decision(self) -> None:
+        if self._finished:
+            return
+        self._arm_ready = True
+        self._sync_positive_action()
+
+    def _sync_positive_action(self) -> None:
+        if not self.is_mounted:
+            return
+        safe = self.query_one(f"#{self.SAFE_BUTTON_ID}", Button)
+        positive = self.query_one(f"#{self.POSITIVE_BUTTON_ID}", Button)
+        positive.disabled = not self._arm_ready or self._compact
+        if self._compact or not self._arm_ready:
+            safe.focus()
+
+    def action_safe_default(self) -> None:
+        self._finish(ApprovalDecision.DENIED)
+
+    def _finish(self, decision: ApprovalDecision) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self.dismiss(decision)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == self.SAFE_BUTTON_ID:
+            self._finish(ApprovalDecision.DENIED)
+        elif (
+            event.button.id == self.POSITIVE_BUTTON_ID
+            and self._arm_ready
+            and not self._compact
+        ):
+            self._finish(ApprovalDecision.APPROVED)
+
+
+class ExecutionApprovalScreen(_FailClosedDecisionScreen):
     """One immutable execution prompt rendered as a fail-closed modal."""
 
     CSS = """
@@ -201,21 +289,31 @@ class ExecutionApprovalScreen(ModalScreen[ApprovalDecision]):
     .approval-document { height: 1fr; overflow: auto; padding: 1; }
     #approval-actions { height: 3; align-horizontal: right; }
     #approval-actions Button { margin-left: 1; min-width: 12; }
+    .decision-size-warning {
+        display: none;
+        height: 1fr;
+        content-align: center middle;
+        text-align: center;
+        color: $warning;
+        padding: 0 1;
+    }
+    ExecutionApprovalScreen.compact-decision #approval-dialog { padding: 0 1; }
+    ExecutionApprovalScreen.compact-decision #approval-heading { display: none; }
     """
     BINDINGS = [
-        Binding("escape", "deny", "Deny", priority=True),
+        Binding("escape", "safe_default", "Deny", priority=True),
         Binding("s", "show_view('approval-summary')", "Summary"),
         Binding("c", "show_view('approval-code')", "Code"),
         Binding("t", "show_view('approval-technical')", "Technical details"),
     ]
+    SAFE_BUTTON_ID = "approval-deny"
+    POSITIVE_BUTTON_ID = "approval-approve"
 
     def __init__(self, prompt: ExecutionApprovalPrompt) -> None:
         if not isinstance(prompt, ExecutionApprovalPrompt):
             raise TypeError("prompt must be an ExecutionApprovalPrompt")
         super().__init__()
         self.prompt = prompt
-        self._armed = False
-        self._finished = False
 
     def compose(self) -> ComposeResult:
         prompt = self.prompt
@@ -225,7 +323,16 @@ class ExecutionApprovalScreen(ModalScreen[ApprovalDecision]):
                 markup=False,
                 id="approval-heading",
             )
-            with TabbedContent(initial="approval-summary", id="approval-views"):
+            yield Static(
+                "",
+                markup=False,
+                classes="decision-size-warning",
+            )
+            with TabbedContent(
+                initial="approval-summary",
+                id="approval-views",
+                classes="decision-content",
+            ):
                 with TabPane("Summary", id="approval-summary"):
                     yield Static(
                         render_approval_summary(
@@ -264,50 +371,11 @@ class ExecutionApprovalScreen(ModalScreen[ApprovalDecision]):
                     disabled=True,
                 )
 
-    def on_mount(self) -> None:
-        self.call_after_refresh(self._initialize_controls)
-
-    def _initialize_controls(self) -> None:
-        deny = self.query_one("#approval-deny", Button)
-        deny.focus()
-        if not self.app.is_headless:
-            try:
-                flush_textual_input()
-            except OperatorInterfaceError:
-                self._finish(ApprovalDecision.DENIED)
-                return
-        # Input already buffered before this exact modal existed is consumed
-        # while approval is disabled. A later, deliberate action is required.
-        self.set_timer(APPROVAL_ARM_SECONDS, self._arm_approval)
-
-    def _arm_approval(self) -> None:
-        if self._finished:
-            return
-        self.query_one("#approval-deny", Button).focus()
-        self._armed = True
-        self.query_one("#approval-approve", Button).disabled = False
-
     def action_show_view(self, view_id: str) -> None:
         self.query_one("#approval-views", TabbedContent).active = view_id
 
-    def action_deny(self) -> None:
-        self._finish(ApprovalDecision.DENIED)
 
-    def _finish(self, decision: ApprovalDecision) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        self.dismiss(decision)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        event.stop()
-        if event.button.id == "approval-deny":
-            self._finish(ApprovalDecision.DENIED)
-        elif event.button.id == "approval-approve" and self._armed:
-            self._finish(ApprovalDecision.APPROVED)
-
-
-class RecoveryDecisionScreen(ModalScreen[ApprovalDecision]):
+class RecoveryDecisionScreen(_FailClosedDecisionScreen):
     """Shared safe mechanics for exact retry and fallback recovery prompts."""
 
     CSS = """
@@ -328,21 +396,31 @@ class RecoveryDecisionScreen(ModalScreen[ApprovalDecision]):
     .recovery-document { height: 1fr; overflow: auto; padding: 1; }
     #recovery-actions { height: 3; align-horizontal: right; }
     #recovery-actions Button { margin-left: 1; min-width: 14; }
+    .decision-size-warning {
+        display: none;
+        height: 1fr;
+        content-align: center middle;
+        text-align: center;
+        color: $warning;
+        padding: 0 1;
+    }
+    .compact-decision #recovery-dialog { padding: 0 1; }
+    .compact-decision #recovery-heading { display: none; }
     """
     BINDINGS = [
-        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("escape", "safe_default", "Cancel", priority=True),
         Binding("s", "show_view('recovery-summary')", "Summary"),
         Binding("d", "show_view('recovery-diagnostics')", "Diagnostics"),
         Binding("b", "show_view('recovery-binding')", "Binding evidence"),
     ]
+    SAFE_BUTTON_ID = "recovery-cancel"
+    POSITIVE_BUTTON_ID = "recovery-approve"
 
     def __init__(self, prompt: SshRetryPrompt | RouteFallbackPrompt) -> None:
         if not isinstance(prompt, (SshRetryPrompt, RouteFallbackPrompt)):
             raise TypeError("prompt must be an SSH retry or route fallback prompt")
         super().__init__()
         self.prompt = prompt
-        self._armed = False
-        self._finished = False
 
     def _summary(self) -> tuple[str, str, str]:
         prompt = self.prompt
@@ -456,7 +534,16 @@ class RecoveryDecisionScreen(ModalScreen[ApprovalDecision]):
                 markup=False,
                 id="recovery-heading",
             )
-            with TabbedContent(initial="recovery-summary", id="recovery-views"):
+            yield Static(
+                "",
+                markup=False,
+                classes="decision-size-warning",
+            )
+            with TabbedContent(
+                initial="recovery-summary",
+                id="recovery-views",
+                classes="decision-content",
+            ):
                 with TabPane("Summary", id="recovery-summary"):
                     yield Static(
                         summary,
@@ -487,44 +574,8 @@ class RecoveryDecisionScreen(ModalScreen[ApprovalDecision]):
                     disabled=True,
                 )
 
-    def on_mount(self) -> None:
-        self.call_after_refresh(self._initialize_controls)
-
-    def _initialize_controls(self) -> None:
-        self.query_one("#recovery-cancel", Button).focus()
-        if not self.app.is_headless:
-            try:
-                flush_textual_input()
-            except OperatorInterfaceError:
-                self._finish(ApprovalDecision.DENIED)
-                return
-        self.set_timer(APPROVAL_ARM_SECONDS, self._arm_decision)
-
-    def _arm_decision(self) -> None:
-        if self._finished:
-            return
-        self.query_one("#recovery-cancel", Button).focus()
-        self._armed = True
-        self.query_one("#recovery-approve", Button).disabled = False
-
     def action_show_view(self, view_id: str) -> None:
         self.query_one("#recovery-views", TabbedContent).active = view_id
-
-    def action_cancel(self) -> None:
-        self._finish(ApprovalDecision.DENIED)
-
-    def _finish(self, decision: ApprovalDecision) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        self.dismiss(decision)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        event.stop()
-        if event.button.id == "recovery-cancel":
-            self._finish(ApprovalDecision.DENIED)
-        elif event.button.id == "recovery-approve" and self._armed:
-            self._finish(ApprovalDecision.APPROVED)
 
 
 class SshRetryScreen(RecoveryDecisionScreen):
@@ -545,7 +596,133 @@ class RouteFallbackScreen(RecoveryDecisionScreen):
         super().__init__(prompt)
 
 
-class SecretInputAuthorizationScreen(ModalScreen[ApprovalDecision]):
+class MachineDisableScreen(_FailClosedDecisionScreen):
+    """Local machine-disable decision bound to one exhausted request."""
+
+    CSS = """
+    MachineDisableScreen {
+        align: center middle;
+        background: $background 80%;
+    }
+    #disable-dialog {
+        width: 100%;
+        max-width: 110;
+        height: 100%;
+        border: heavy $warning;
+        background: $surface;
+        padding: 1 2;
+    }
+    #disable-heading { height: 3; text-style: bold; }
+    #disable-views { height: 1fr; }
+    .disable-document { height: 1fr; overflow: auto; padding: 1; }
+    #disable-actions { height: 3; align-horizontal: right; }
+    #disable-actions Button { margin-left: 1; min-width: 16; }
+    .decision-size-warning {
+        display: none;
+        height: 1fr;
+        content-align: center middle;
+        text-align: center;
+        color: $warning;
+        padding: 0 1;
+    }
+    MachineDisableScreen.compact-decision #disable-dialog { padding: 0 1; }
+    MachineDisableScreen.compact-decision #disable-heading { display: none; }
+    """
+    BINDINGS = [
+        Binding("escape", "safe_default", "Keep enabled", priority=True),
+        Binding("s", "show_view('disable-summary')", "Summary"),
+        Binding("r", "show_view('disable-request')", "Request evidence"),
+        Binding("b", "show_view('disable-binding')", "Binding evidence"),
+    ]
+    SAFE_BUTTON_ID = "disable-cancel"
+    POSITIVE_BUTTON_ID = "disable-approve"
+
+    def __init__(self, prompt: MachineDisablePrompt) -> None:
+        if not isinstance(prompt, MachineDisablePrompt):
+            raise TypeError("prompt must be a MachineDisablePrompt")
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        prompt = self.prompt
+        summary = render_machine_disable_document(
+            prompt.request_id,
+            prompt.request.machine_alias,
+            failure_detail=prompt.failure_detail,
+            remote_mutation_started=False,
+        )
+        request_evidence = render_approval_document(
+            prompt.request_id,
+            prompt.request,
+            prompt.connection_plan,
+        )
+        binding = "\n".join(
+            (
+                "=== tmuxgate machine-disable binding ===",
+                f"prompt_id: {inert_text(prompt.prompt_id)}",
+                f"request_id: {inert_text(prompt.request_id)}",
+                "machine: " + inert_text(prompt.request.machine_alias),
+                "connection_plan_sha256: "
+                + inert_text(prompt.connection_plan.plan_sha256),
+                "remote_mutation_state: "
+                + inert_text(prompt.remote_mutation_state.value),
+                "machine_disable_binding_sha256: "
+                + inert_text(prompt.binding_sha256),
+                "=== end tmuxgate machine-disable binding ===",
+            )
+        )
+        with Vertical(id="disable-dialog"):
+            yield Static(
+                "Machine unavailable\nRequest ID: "
+                + inert_text(prompt.request_id),
+                markup=False,
+                id="disable-heading",
+            )
+            yield Static("", markup=False, classes="decision-size-warning")
+            with TabbedContent(
+                initial="disable-summary",
+                id="disable-views",
+                classes="decision-content",
+            ):
+                with TabPane("Summary", id="disable-summary"):
+                    yield Static(
+                        summary,
+                        markup=False,
+                        classes="disable-document",
+                        id="disable-summary-document",
+                    )
+                with TabPane("Request Evidence", id="disable-request"):
+                    yield Static(
+                        request_evidence,
+                        markup=False,
+                        classes="disable-document",
+                        id="disable-request-document",
+                    )
+                with TabPane("Binding Evidence", id="disable-binding"):
+                    yield Static(
+                        binding,
+                        markup=False,
+                        classes="disable-document",
+                        id="disable-binding-document",
+                    )
+            with Horizontal(id="disable-actions"):
+                yield Button(
+                    "Keep enabled",
+                    variant="primary",
+                    id="disable-cancel",
+                )
+                yield Button(
+                    "Disable machine",
+                    variant="warning",
+                    id="disable-approve",
+                    disabled=True,
+                )
+
+    def action_show_view(self, view_id: str) -> None:
+        self.query_one("#disable-views", TabbedContent).active = view_id
+
+
+class SecretInputAuthorizationScreen(_FailClosedDecisionScreen):
     """Exact, independently authorized handoff to one remote recipient."""
 
     CSS = """
@@ -565,16 +742,26 @@ class SecretInputAuthorizationScreen(ModalScreen[ApprovalDecision]):
     #secret-document { height: 1fr; overflow: auto; padding: 1; }
     #secret-actions { height: 3; align-horizontal: right; }
     #secret-actions Button { margin-left: 1; min-width: 14; }
+    .decision-size-warning {
+        display: none;
+        height: 1fr;
+        content-align: center middle;
+        text-align: center;
+        color: $warning;
+        padding: 0 1;
+    }
+    SecretInputAuthorizationScreen.compact-decision #secret-dialog { padding: 0 1; }
+    SecretInputAuthorizationScreen.compact-decision #secret-heading { display: none; }
     """
-    BINDINGS = [Binding("escape", "deny", "Deny", priority=True)]
+    BINDINGS = [Binding("escape", "safe_default", "Deny", priority=True)]
+    SAFE_BUTTON_ID = "secret-deny"
+    POSITIVE_BUTTON_ID = "secret-approve"
 
     def __init__(self, prompt: SecretInputAuthorizationPrompt) -> None:
         if not isinstance(prompt, SecretInputAuthorizationPrompt):
             raise TypeError("prompt must be a SecretInputAuthorizationPrompt")
         super().__init__()
         self.prompt = prompt
-        self._armed = False
-        self._finished = False
 
     def compose(self) -> ComposeResult:
         prompt = self.prompt
@@ -600,7 +787,9 @@ class SecretInputAuthorizationScreen(ModalScreen[ApprovalDecision]):
                 document,
                 markup=False,
                 id="secret-document",
+                classes="decision-content",
             )
+            yield Static("", markup=False, classes="decision-size-warning")
             with Horizontal(id="secret-actions"):
                 yield Button("Deny", variant="error", id="secret-deny")
                 yield Button(
@@ -610,41 +799,6 @@ class SecretInputAuthorizationScreen(ModalScreen[ApprovalDecision]):
                     disabled=True,
                 )
 
-    def on_mount(self) -> None:
-        self.call_after_refresh(self._initialize_controls)
-
-    def _initialize_controls(self) -> None:
-        self.query_one("#secret-deny", Button).focus()
-        if not self.app.is_headless:
-            try:
-                flush_textual_input()
-            except OperatorInterfaceError:
-                self._finish(ApprovalDecision.DENIED)
-                return
-        self.set_timer(APPROVAL_ARM_SECONDS, self._arm_decision)
-
-    def _arm_decision(self) -> None:
-        if self._finished:
-            return
-        self.query_one("#secret-deny", Button).focus()
-        self._armed = True
-        self.query_one("#secret-approve", Button).disabled = False
-
-    def action_deny(self) -> None:
-        self._finish(ApprovalDecision.DENIED)
-
-    def _finish(self, decision: ApprovalDecision) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        self.dismiss(decision)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        event.stop()
-        if event.button.id == "secret-deny":
-            self._finish(ApprovalDecision.DENIED)
-        elif event.button.id == "secret-approve" and self._armed:
-            self._finish(ApprovalDecision.APPROVED)
 
 
 class TmuxgateDashboardApp(App[None]):
@@ -687,7 +841,6 @@ class TmuxgateDashboardApp(App[None]):
         self.config = config
         self.snapshot_failure: BaseException | None = None
         self.minimum_size = False
-        self._active_approval: QueuedPrompt | None = None
         self._active_decision: QueuedPrompt | None = None
 
     def compose(self) -> ComposeResult:
@@ -731,7 +884,7 @@ class TmuxgateDashboardApp(App[None]):
                 )
             with TabPane("Help", id="help"):
                 yield Static(
-                    "Operator interface preview\n\n"
+                    "Full-screen operator interface\n\n"
                     "d  dashboard    j  jobs       m  machines\n"
                     "a  activity     r  requests   ?  help\n"
                     "q  stop tmuxgate\n\n"
@@ -739,7 +892,8 @@ class TmuxgateDashboardApp(App[None]):
                     "route fallbacks open one at a time with a safe default. "
                     "Secret-input handoffs require a separate exact decision; "
                     "the TUI then suspends while the trusted viewer owns the "
-                    "terminal. Machine-disable decisions remain unavailable.",
+                    "terminal. Exhausted-machine disable decisions use a "
+                    "separate local-mutation modal.",
                     markup=False,
                     classes="panel",
                 )
@@ -780,11 +934,6 @@ class TmuxgateDashboardApp(App[None]):
         self.external_stop.set()
         self.exit()
 
-    def present_execution_approval(self, queued: QueuedPrompt) -> None:
-        """Push an exact prompt from the presenter thread onto the UI thread."""
-
-        self.present_operator_decision(queued)
-
     def present_operator_decision(self, queued: QueuedPrompt) -> None:
         """Present one exact supported prompt without reconstructing identity."""
 
@@ -795,6 +944,7 @@ class TmuxgateDashboardApp(App[None]):
                 SshRetryPrompt,
                 RouteFallbackPrompt,
                 SecretInputAuthorizationPrompt,
+                MachineDisablePrompt,
             ),
         ):
             queued.pending.deny()
@@ -806,7 +956,6 @@ class TmuxgateDashboardApp(App[None]):
             queued.pending.deny()
             return
         self._active_decision = queued
-        self._active_approval = queued
 
         def complete(result: ApprovalDecision | None) -> None:
             self._complete_operator_decision(queued, result)
@@ -819,18 +968,11 @@ class TmuxgateDashboardApp(App[None]):
             screen = SshRetryScreen(queued.prompt)
         elif isinstance(queued.prompt, SecretInputAuthorizationPrompt):
             screen = SecretInputAuthorizationScreen(queued.prompt)
+        elif isinstance(queued.prompt, MachineDisablePrompt):
+            screen = MachineDisableScreen(queued.prompt)
         else:
             screen = RouteFallbackScreen(queued.prompt)
         self.push_screen(screen, complete)
-
-    def _complete_execution_approval(
-        self,
-        queued: QueuedPrompt,
-        result: ApprovalDecision | None,
-    ) -> None:
-        """Resolve only the immutable queued item that owns the active modal."""
-
-        self._complete_operator_decision(queued, result)
 
     def _complete_operator_decision(
         self,
@@ -842,7 +984,6 @@ class TmuxgateDashboardApp(App[None]):
         if self._active_decision is not queued:
             return
         self._active_decision = None
-        self._active_approval = None
         decision = (
             result if isinstance(result, ApprovalDecision) else ApprovalDecision.DENIED
         )
@@ -877,6 +1018,7 @@ class TmuxgateDashboardApp(App[None]):
             self.exit()
             return
         try:
+            self.interface.validate_runtime_terminal()
             snapshot = self.interface.dashboard_snapshot(self.config)
             self._render_dashboard(snapshot)
             self._render_jobs(snapshot.jobs)
@@ -1010,6 +1152,7 @@ class TextualOperatorInterface(PlainTerminalInterface):
         activity_capacity: int = 256,
         prompt_capacity: int = MAX_DASHBOARD_PROMPTS,
         validate_terminal: bool = True,
+        terminal_validator: Callable[[], None] | None = None,
         app_factory: Callable[
             ["TextualOperatorInterface", threading.Event, object],
             TmuxgateDashboardApp,
@@ -1019,8 +1162,13 @@ class TextualOperatorInterface(PlainTerminalInterface):
             raise ValueError("approval_mode must be 'always' or 'disabled'")
         if type(validate_terminal) is not bool:
             raise TypeError("validate_terminal must be boolean")
+        if terminal_validator is None:
+            terminal_validator = validate_textual_terminal
+        if not callable(terminal_validator):
+            raise TypeError("terminal_validator must be callable")
+        self._terminal_validator = terminal_validator if validate_terminal else None
         if validate_terminal:
-            validate_textual_terminal()
+            terminal_validator()
         if (
             isinstance(prompt_capacity, bool)
             or not isinstance(prompt_capacity, int)
@@ -1238,6 +1386,7 @@ class TextualOperatorInterface(PlainTerminalInterface):
                         SshRetryPrompt,
                         RouteFallbackPrompt,
                         SecretInputAuthorizationPrompt,
+                        MachineDisablePrompt,
                     ),
                 ):
                     queued.pending.deny()
@@ -1285,6 +1434,13 @@ class TextualOperatorInterface(PlainTerminalInterface):
         self._prompts.close()
         self._app_ready.set()
 
+    def validate_runtime_terminal(self) -> None:
+        """Re-prove foreground terminal ownership while Textual is active."""
+
+        validator = self._terminal_validator
+        if validator is not None:
+            validator()
+
     def run_external_terminal_session(
         self,
         prompt: SecretInputAuthorizationPrompt,
@@ -1314,21 +1470,29 @@ class TextualOperatorInterface(PlainTerminalInterface):
             self._activity.append(event)
 
     def run_dashboard(self, stop: threading.Event, config: object) -> None:
-        validate_textual_terminal()
+        self.validate_runtime_terminal()
         app = self._app_factory(self, stop, config)
         if not isinstance(app, TmuxgateDashboardApp):
             raise OperatorInterfaceError("Textual app factory returned invalid app")
         try:
-            app.run()
+            try:
+                app.run()
+            except BaseException as exc:
+                raise OperatorInterfaceError(
+                    "the full-screen TUI failed; restart explicitly with --plain"
+                ) from exc
         finally:
             self.fail_closed()
         if app.snapshot_failure is not None:
             raise OperatorInterfaceError(
-                "Textual dashboard status refresh failed"
+                "the full-screen TUI lost terminal or status ownership "
+                f"({inert_text(app.snapshot_failure)}); "
+                "restart explicitly with --plain"
             ) from app.snapshot_failure
         if app.return_code != 0:
             raise OperatorInterfaceError(
-                f"Textual dashboard exited with status {app.return_code}"
+                f"the full-screen TUI exited with status {app.return_code}; "
+                "restart explicitly with --plain"
             )
 
     def close(self) -> bool:

@@ -111,7 +111,7 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
         _write_config(self.config_path, approval_mode="always")
         terminal = mock.Mock()
         terminal.claim.return_value = nullcontext()
-        terminal.state.return_value = SimpleNamespace(busy=False, purpose=None)
+        terminal.state = SimpleNamespace(busy=False, purpose=None)
 
         class CapturingTextualInterface(TextualOperatorInterface):
             snapshot = None

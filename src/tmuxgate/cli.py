@@ -96,25 +96,16 @@ def _add_local_paths(
 def _add_interface_selection(
     parser: argparse.ArgumentParser, *, inherit: bool = False
 ) -> None:
-    group = parser.add_mutually_exclusive_group()
-    default: object = argparse.SUPPRESS if inherit else "plain"
-    group.add_argument(
+    default: object = argparse.SUPPRESS if inherit else "tui"
+    parser.add_argument(
         "--plain",
         action="store_const",
         const="plain",
         dest="interface_mode",
         default=default,
-        help="use the established line-oriented production interface",
-    )
-    group.add_argument(
-        "--tui",
-        action="store_const",
-        const="tui",
-        dest="interface_mode",
-        default=default,
         help=(
-            "use the Textual preview with execution-approval modals "
-            "(approval_mode=always only)"
+            "use the supported line-oriented fail-safe instead of the default "
+            "full-screen TUI"
         ),
     )
 

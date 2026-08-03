@@ -434,7 +434,7 @@ class UnifiedApplication:
                         )
                         for name, machine in sorted(config.machines.items())
                     )
-                    terminal = self._terminal.state()
+                    terminal = self._terminal.state
                     owner = (
                         terminal.purpose or "external terminal user"
                         if terminal.busy
