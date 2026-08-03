@@ -1125,6 +1125,12 @@ class OperatorInterface(Protocol):
         self, prompt: SecretInputAuthorizationPrompt
     ) -> OperatorDecision: ...
 
+    def run_external_terminal_session(
+        self,
+        prompt: SecretInputAuthorizationPrompt,
+        session: Callable[[], None],
+    ) -> None: ...
+
     def request_machine_disable(
         self, prompt: MachineDisablePrompt
     ) -> OperatorDecision: ...
@@ -1255,6 +1261,23 @@ class PlainTerminalInterface:
         # This permission is independent of per-request execution approval.
         # In particular, approval_mode="disabled" never bypasses it.
         return self._request(prompt)
+
+    def run_external_terminal_session(
+        self,
+        prompt: SecretInputAuthorizationPrompt,
+        session: Callable[[], None],
+    ) -> None:
+        """Give a trusted process exclusive use of the controlling terminal."""
+
+        if not isinstance(prompt, SecretInputAuthorizationPrompt):
+            raise TypeError("prompt must be a SecretInputAuthorizationPrompt")
+        if not callable(session):
+            raise TypeError("external terminal session must be callable")
+        with self.terminal.claim(
+            priority=TerminalPriority.SECRET,
+            purpose=f"secret input for request {prompt.request_id}",
+        ):
+            session()
 
     def request_machine_disable(
         self, prompt: MachineDisablePrompt

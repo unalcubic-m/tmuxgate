@@ -341,6 +341,75 @@ class RealSshProcessTests(unittest.TestCase):
         finally:
             self.assertTrue(presenter.close())
 
+    def test_authorized_attachment_runs_only_inside_exact_terminal_handoff(self):
+        events = []
+        authorized = []
+        viewer = ScriptedDetachedViewer("abababababab")
+
+        def popen(argv, **kwargs):
+            events.append("attach")
+            process = FakeAttachProcess()
+            viewer.process = process
+            viewer.prompt = (
+                f"TMUXGATE_AUTH_COMPLETE={viewer.session_name}\n"
+            ).encode("ascii")
+            return process
+
+        def handoff(prompt, session):
+            events.append(("handoff", prompt.secret_input_binding_sha256))
+            session()
+            events.append("handoff-complete")
+
+        def authorize(prompt):
+            authorized.append(prompt)
+            return OperatorDecision.for_prompt(prompt, ApprovalDecision.APPROVED)
+
+        presenter = SecretPromptPresenter(
+            authorizer=authorize,
+            terminal_handoff=handoff,
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=popen,
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: events.append("flush"),
+            poll_seconds=0.005,
+        )
+        try:
+            recipient = secret_input_recipient(viewer)
+            presenter._present(viewer, recipient)
+            self.assertEqual(
+                events,
+                [
+                    ("handoff", authorized[0].secret_input_binding_sha256),
+                    "flush",
+                    "attach",
+                    "handoff-complete",
+                ],
+            )
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_rejected_terminal_handoff_never_opens_or_attaches(self):
+        viewer = ScriptedDetachedViewer("acacacacacac")
+        opened = []
+
+        def reject_handoff(prompt, session):
+            del prompt, session
+            raise TransportError("terminal already has an external owner")
+
+        presenter = approved_presenter(
+            terminal_handoff=reject_handoff,
+            terminal_opener=lambda *args, **kwargs: opened.append("opened"),
+            popen=lambda *args, **kwargs: opened.append("attached"),
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: None,
+        )
+        try:
+            with self.assertRaisesRegex(TransportError, "external owner"):
+                presenter._present(viewer, secret_input_recipient(viewer))
+            self.assertEqual(opened, [])
+        finally:
+            self.assertTrue(presenter.close())
+
     def test_secret_prompt_detection_uses_cursor_not_nested_tmux_status(self):
         pane = (
             b"remote_before=1785312103.646452555\n"

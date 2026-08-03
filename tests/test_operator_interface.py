@@ -359,6 +359,31 @@ class DecisionPrimitiveTests(unittest.TestCase):
 
 
 class PlainTerminalInterfaceTests(unittest.TestCase):
+    def test_plain_external_session_keeps_existing_arbiter_handoff(self):
+        claims = []
+
+        class RecordingTerminal(FakeTerminalArbiter):
+            def claim(self, **keywords):
+                claims.append(keywords)
+                return nullcontext()
+
+        interface = PlainTerminalInterface(RecordingTerminal())
+        self.addCleanup(interface.close)
+        recipient = SecretInputRecipient(
+            REQUEST_ID,
+            request(),
+            build_plan(),
+            "home-lan",
+        )
+        prompt = recipient.create_prompt("tmuxgate-" + REQUEST_ID[:12])
+        sessions = []
+        interface.run_external_terminal_session(
+            prompt, lambda: sessions.append(prompt.prompt_id)
+        )
+        self.assertEqual(sessions, [prompt.prompt_id])
+        self.assertEqual(claims[0]["priority"].name, "SECRET")
+        self.assertIn(REQUEST_ID, claims[0]["purpose"])
+
     def test_plain_execution_decision_uses_only_injected_trusted_terminal(self):
         # Approval-looking MCP/socket/remote bytes are data in the request; the
         # independent trusted terminal denial remains authoritative.

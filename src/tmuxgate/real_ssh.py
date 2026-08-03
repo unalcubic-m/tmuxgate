@@ -647,6 +647,9 @@ class SecretPromptPresenter:
         authorizer: Callable[
             [SecretInputAuthorizationPrompt], OperatorDecision
         ],
+        terminal_handoff: Callable[
+            [SecretInputAuthorizationPrompt, Callable[[], None]], None
+        ] | None = None,
         reporter: Callable[[str], object] = lambda message: None,
         poll_seconds: float = 0.10,
     ) -> None:
@@ -660,6 +663,13 @@ class SecretPromptPresenter:
         self.terminal_path_resolver = terminal_path_resolver
         self.terminal_input_flusher = terminal_input_flusher
         self.authorizer = authorizer
+        self.terminal_handoff = (
+            self._locked_terminal_handoff
+            if terminal_handoff is None
+            else terminal_handoff
+        )
+        if not callable(self.terminal_handoff):
+            raise TypeError("prompt presenter terminal handoff must be callable")
         self.reporter = reporter
         self.poll_seconds = float(poll_seconds)
         self._queue: queue.Queue[
@@ -771,108 +781,133 @@ class SecretPromptPresenter:
                 "remote command remains detached"
             )
             return
+        try:
+            self.terminal_handoff(
+                prompt,
+                lambda: self._attach_authorized_viewer(viewer, recipient),
+            )
+        except (OSError, subprocess.SubprocessError, TransportError):
+            raise
+        except BaseException as exc:
+            raise TransportError("external terminal handoff failed closed") from exc
+
+    def _locked_terminal_handoff(
+        self,
+        prompt: SecretInputAuthorizationPrompt,
+        session: Callable[[], None],
+    ) -> None:
+        del prompt
         with self.terminal_lock:
-            if self._stop.is_set() or not viewer.attached:
-                return
-            if viewer.prompt_signature() is None:
-                return
-            client_tty = self.terminal_path_resolver()
-            if (
-                not isinstance(client_tty, str)
-                or client_tty == "/dev/tty"
-                or not client_tty.startswith("/dev/")
-            ):
-                raise TransportError("broker terminal resolver returned an unsafe PTY")
-            with self.terminal_opener(client_tty, "r+b", buffering=0) as terminal:
-                self.terminal_input_flusher(terminal, client_tty)
-                terminal.write(
-                    (
-                        "\r\n[tmuxgate] Password/passphrase input required for "
-                        f"{viewer.session_name}. It stays attached through "
-                        "typing and retries; use Ctrl-b d if the command does "
-                        "not emit its authentication-complete marker.\r\n"
-                    ).encode("utf-8")
-                )
-                terminal.flush()
-                completion_count = viewer.authentication_complete_count()
-                process = self.popen(
-                    (
-                        "/usr/bin/tmux", "-S", os.fspath(viewer.socket_path),
-                        "attach-session", "-t", viewer.session_name,
-                    ),
-                    stdin=terminal,
-                    stdout=terminal,
-                    stderr=terminal,
-                    env=_safe_environment(),
-                    close_fds=True,
-                )
-                with self._active_lock:
-                    self._active = (viewer, client_tty)
-                prompt_probe_error: OSError | TransportError | None = None
-                try:
-                    while process.poll() is None and not self._stop.is_set():
-                        try:
-                            if not viewer.attached:
-                                break
-                            current_completion_count = (
-                                viewer.authentication_complete_count()
-                            )
-                            viewer.prompt_signature()
-                        except (OSError, TransportError) as exc:
-                            prompt_probe_error = exc
-                            viewer.detach_client(client_tty)
+            session()
+
+    def _attach_authorized_viewer(
+        self,
+        viewer: DetachedTmuxViewerProcess,
+        recipient: SecretInputRecipient,
+    ) -> None:
+        """Run the trusted tmux client while the presentation layer is absent."""
+
+        if self._stop.is_set() or not viewer.attached:
+            return
+        if viewer.prompt_signature() is None:
+            return
+        client_tty = self.terminal_path_resolver()
+        if (
+            not isinstance(client_tty, str)
+            or client_tty == "/dev/tty"
+            or not client_tty.startswith("/dev/")
+        ):
+            raise TransportError("broker terminal resolver returned an unsafe PTY")
+        with self.terminal_opener(client_tty, "r+b", buffering=0) as terminal:
+            self.terminal_input_flusher(terminal, client_tty)
+            terminal.write(
+                (
+                    "\r\n[tmuxgate] Password/passphrase input required for "
+                    f"{viewer.session_name}. It stays attached through "
+                    "typing and retries; use Ctrl-b d if the command does "
+                    "not emit its authentication-complete marker.\r\n"
+                ).encode("utf-8")
+            )
+            terminal.flush()
+            completion_count = viewer.authentication_complete_count()
+            process = self.popen(
+                (
+                    "/usr/bin/tmux", "-S", os.fspath(viewer.socket_path),
+                    "attach-session", "-t", viewer.session_name,
+                ),
+                stdin=terminal,
+                stdout=terminal,
+                stderr=terminal,
+                env=_safe_environment(),
+                close_fds=True,
+            )
+            with self._active_lock:
+                self._active = (viewer, client_tty)
+            prompt_probe_error: OSError | TransportError | None = None
+            try:
+                while process.poll() is None and not self._stop.is_set():
+                    try:
+                        if not viewer.attached:
                             break
-                        if current_completion_count > completion_count:
-                            viewer.detach_client(client_tty)
-                            break
-                        self._stop.wait(self.poll_seconds)
-                    if self._stop.is_set() and process.poll() is None:
+                        current_completion_count = (
+                            viewer.authentication_complete_count()
+                        )
+                        viewer.prompt_signature()
+                    except (OSError, TransportError) as exc:
+                        prompt_probe_error = exc
                         viewer.detach_client(client_tty)
+                        break
+                    if current_completion_count > completion_count:
+                        viewer.detach_client(client_tty)
+                        break
+                    self._stop.wait(self.poll_seconds)
+                if self._stop.is_set() and process.poll() is None:
+                    viewer.detach_client(client_tty)
+                if process.poll() is None:
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.terminate()
+                        process.wait(timeout=2)
+                returncode = process.poll()
+                if type(returncode) is not int or returncode != 0:
+                    raise TransportError(
+                        "automatic viewer attachment exited with status "
+                        f"{returncode}"
+                    )
+                if prompt_probe_error is not None:
+                    raise TransportError(
+                        "automatic viewer prompt inspection failed"
+                    ) from prompt_probe_error
+            finally:
+                try:
                     if process.poll() is None:
+                        try:
+                            process.terminate()
+                        except ProcessLookupError:
+                            pass
                         try:
                             process.wait(timeout=2)
                         except subprocess.TimeoutExpired:
-                            process.terminate()
-                            process.wait(timeout=2)
-                    returncode = process.poll()
-                    if type(returncode) is not int or returncode != 0:
+                            if process.poll() is None:
+                                try:
+                                    process.kill()
+                                except ProcessLookupError:
+                                    pass
+                                try:
+                                    process.wait(timeout=2)
+                                except subprocess.TimeoutExpired as exc:
+                                    raise TransportError(
+                                        "automatic viewer attachment "
+                                        "could not be stopped"
+                                    ) from exc
+                    if process.poll() is None:
                         raise TransportError(
-                            "automatic viewer attachment exited with status "
-                            f"{returncode}"
+                            "automatic viewer attachment remains active"
                         )
-                    if prompt_probe_error is not None:
-                        raise TransportError(
-                            "automatic viewer prompt inspection failed"
-                        ) from prompt_probe_error
                 finally:
-                    try:
-                        if process.poll() is None:
-                            try:
-                                process.terminate()
-                            except ProcessLookupError:
-                                pass
-                            try:
-                                process.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                if process.poll() is None:
-                                    try:
-                                        process.kill()
-                                    except ProcessLookupError:
-                                        pass
-                                    try:
-                                        process.wait(timeout=2)
-                                    except subprocess.TimeoutExpired as exc:
-                                        raise TransportError(
-                                            "automatic viewer attachment "
-                                            "could not be stopped"
-                                        ) from exc
-                        if process.poll() is None:
-                            raise TransportError(
-                                "automatic viewer attachment remains active"
-                            )
-                    finally:
-                        with self._active_lock:
-                            self._active = None
+                    with self._active_lock:
+                        self._active = None
 
     def close(self, *, timeout: float = 2.0) -> bool:
         self._stop.set()

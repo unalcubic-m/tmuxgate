@@ -298,6 +298,7 @@ class UnifiedApplication:
                 prompt_presenter = SecretPromptPresenter(
                     terminal_lock=self._terminal,
                     authorizer=operator.request_secret_input_authorization,
+                    terminal_handoff=operator.run_external_terminal_session,
                     reporter=lambda message: operator.publish_activity(
                         OperationalActivity.create(
                             ActivityKind.SSH_PROMPT,
@@ -437,7 +438,7 @@ class UnifiedApplication:
                     owner = (
                         terminal.purpose or "external terminal user"
                         if terminal.busy
-                        else "Textual dashboard"
+                        else operator.terminal_ownership_state.value
                     )
                     return DashboardRuntimeSnapshot(
                         ready=services_ready[0],

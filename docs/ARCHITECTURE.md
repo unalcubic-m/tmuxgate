@@ -390,8 +390,8 @@ from the controlling `/dev/tty` under `TerminalArbiter`; stdin,
 MCP/Unix-socket frames, request content, remote output, viewer pane content,
 rendered diagnostics, and pager return values are never input sources.
 
-`TextualOperatorInterface`, selected only with `--tui`, is the phase-four
-operator preview built on exactly pinned `textual==8.2.8`. Before entering
+`TextualOperatorInterface`, selected only with `--tui`, is the Textual operator
+interface built on exactly pinned `textual==8.2.8`. Before entering
 application mode it verifies that Textual's real stdin and stdout are the same
 character terminal and that tmuxgate's process group owns that terminal in the
 foreground. Validation, driver initialization, snapshot refresh, or terminal
@@ -411,16 +411,32 @@ activity, and prompt rows are bounded without creating per-record widgets. A
 terminal below 72 columns by 20 rows shows only a resize/quit guard when no
 security decision is active.
 
-Phase four supports execution approval, bounded SSH retry, and separately
-authorized adjacent-route fallback decisions. The preview requires
-`approval_mode = "always"`. Its presenter thread remains the sole FIFO consumer,
+The TUI supports execution approval, bounded SSH retry, separately authorized
+adjacent-route fallback, and exact secret-input authorization decisions. It may
+run with either approval mode: disabled execution approval is still automatic,
+but never disables secret-input authorization. Its presenter thread remains the sole FIFO consumer,
 but it schedules each supported prompt through Textual's thread-safe
 `call_from_thread` boundary. The UI thread creates one modal for that exact
 immutable queued item and returns its result through a callback which retains
 the original object identity; no displayed label is parsed or used to select a
-slot. Machine-disable and secret-input prompts are still denied in this TUI
-phase, so execution cannot advance into an unimplemented direct terminal
-interaction while Textual owns application mode.
+slot. Machine-disable prompts remain denied.
+
+The interface tracks three synchronized foreground ownership states: `tui`,
+`modal`, and `external`. A positive secret-input modal result atomically reserves
+`external` ownership for that exact prompt ID before its waiting worker is
+released. No later modal can open during that reservation, and a stale or
+different prompt cannot consume it. The trusted presenter then asks the
+interface to run the already-bound viewer session. On the UI thread, the
+interface acquires the highest-priority `TerminalArbiter` lease and enters
+Textual's `App.suspend()` context. Textual stops its input reader and output,
+leaves alternate-screen/raw application mode, and restores the pre-TUI terminal
+settings before the trusted tmux process is started with all three standard
+streams connected directly to the resolved broker-owned `/dev/pts/...` device.
+The TUI therefore never reads, buffers, renders, or logs secret bytes. Normal
+return, cancellation, process failure, and exceptions all unwind the suspend
+and arbiter contexts, restore `tui` ownership, and force a full layout repaint.
+Concurrent terminal ownership or a missing/exited dashboard fails closed before
+the terminal or viewer is opened.
 
 An execution modal exposes separate Summary, Code, and Technical Details tabs.
 The existing pure ASCII-safe renderers supply complete request, script,
@@ -563,8 +579,10 @@ sent to the remote process. Authorization requires typing the full
 an explicit denial denies. Socket/MCP data, request bytes, remote pane content,
 and process stdin are not input sources for this prompt. A stale prompt ID,
 binding, request, command, endpoint, or viewer cannot resolve a replacement
-prompt. Only after an Approved decision does the presenter revalidate the
-still-live viewer and still-visible prompt and attach to `/dev/tty`. The prompt
+prompt. Only after an Approved decision does the presenter request an exclusive
+presentation-layer handoff, then revalidate the still-live viewer and
+still-visible prompt and attach to the resolved broker-owned terminal device.
+In Textual mode this happens only while the application is suspended. The prompt
 matcher accepts at most 256 literal ASCII sudo `pwfeedback` stars after an
 otherwise valid cursor-row prompt, including fewer stars after backspacing; it
 does not accept arbitrary suffix text or alternate mask characters.
@@ -621,18 +639,19 @@ makes that pending dashboard line stale.
 Non-dashboard plain-mode claims reopen and revalidate `/dev/tty` and discard
 queued input before displaying their trusted interaction. Therefore pretyped
 dashboard text cannot become an approval, fallback acknowledgement, SSH
-password, or sudo secret. In Textual mode the execution modal instead fences
-Approve while buffered UI input is drained and defaults every other close or
-activation path to Deny. An active terminal transaction is not forcibly
+password, or sudo secret. In Textual mode each positive modal action is fenced
+while buffered UI input is drained and every other close or activation path
+defaults to Deny. Secret-input approval additionally suspends the whole Textual
+driver before any viewer can receive input. An active terminal transaction is not forcibly
 interrupted; priorities
 choose the next owner. Reentrant ownership allows existing approval and SSH
 components to use the arbiter through their lock-compatible interface. Parallel
 execution never places two password prompts or an approval and password prompt
 on `/dev/tty` concurrently. This serialization applies only to human terminal
-interaction; the remote command leases continue independently. The phase-four
-Textual preview rejects approval-disabled mode and handles execution approval,
-SSH retry, and fallback inside the full-screen driver while denying later
-decision kinds that do not yet have a TUI implementation.
+interaction; the remote command leases continue independently. The Textual
+interface handles execution approval, SSH retry, fallback, and secret-input
+authorization inside the full-screen driver; secret bytes flow only through
+the separately owned external viewer while that driver is suspended.
 
 Separately, up to three authenticated `ssh -N` ControlMaster transports may
 remain idle. Reusing a transport never reuses request identity. Queued requests

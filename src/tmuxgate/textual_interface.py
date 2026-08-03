@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 import os
 import stat
 import sys
@@ -26,6 +27,7 @@ from .approval import (
     render_code_document,
     render_fallback_approval_document,
     render_openssh_diagnostics,
+    render_secret_input_authorization_document,
     render_ssh_retry_document,
 )
 from .operator_interface import (
@@ -38,9 +40,10 @@ from .operator_interface import (
     PlainTerminalInterface,
     QueuedPrompt,
     RouteFallbackPrompt,
+    SecretInputAuthorizationPrompt,
     SshRetryPrompt,
 )
-from .terminal import TerminalArbiter
+from .terminal import TerminalArbiter, TerminalPriority
 
 
 MINIMUM_COLUMNS = 72
@@ -65,9 +68,7 @@ def inert_text(value: object) -> str:
             rendered.append(f"\\x{codepoint:02x}")
         elif category in {"Cc", "Cf", "Cs"}:
             rendered.append(
-                f"\\u{codepoint:04x}"
-                if codepoint <= 0xFFFF
-                else f"\\U{codepoint:08x}"
+                f"\\u{codepoint:04x}" if codepoint <= 0xFFFF else f"\\U{codepoint:08x}"
             )
         else:
             rendered.append(character)
@@ -169,6 +170,14 @@ class DashboardRuntimeSnapshot:
 
 
 DashboardProvider = Callable[[], DashboardRuntimeSnapshot]
+
+
+class TerminalOwnershipState(StrEnum):
+    """Exclusive foreground ownership visible to the dashboard boundary."""
+
+    TUI = "tui"
+    MODAL = "modal"
+    EXTERNAL = "external"
 
 
 class ExecutionApprovalScreen(ModalScreen[ApprovalDecision]):
@@ -536,6 +545,108 @@ class RouteFallbackScreen(RecoveryDecisionScreen):
         super().__init__(prompt)
 
 
+class SecretInputAuthorizationScreen(ModalScreen[ApprovalDecision]):
+    """Exact, independently authorized handoff to one remote recipient."""
+
+    CSS = """
+    SecretInputAuthorizationScreen {
+        align: center middle;
+        background: $background 80%;
+    }
+    #secret-dialog {
+        width: 100%;
+        max-width: 110;
+        height: 100%;
+        border: heavy $error;
+        background: $surface;
+        padding: 1 2;
+    }
+    #secret-heading { height: 3; text-style: bold; }
+    #secret-document { height: 1fr; overflow: auto; padding: 1; }
+    #secret-actions { height: 3; align-horizontal: right; }
+    #secret-actions Button { margin-left: 1; min-width: 14; }
+    """
+    BINDINGS = [Binding("escape", "deny", "Deny", priority=True)]
+
+    def __init__(self, prompt: SecretInputAuthorizationPrompt) -> None:
+        if not isinstance(prompt, SecretInputAuthorizationPrompt):
+            raise TypeError("prompt must be a SecretInputAuthorizationPrompt")
+        super().__init__()
+        self.prompt = prompt
+        self._armed = False
+        self._finished = False
+
+    def compose(self) -> ComposeResult:
+        prompt = self.prompt
+        document = render_secret_input_authorization_document(
+            prompt.request_id,
+            prompt.request,
+            prompt.connection_plan,
+            prompt_id=prompt.prompt_id,
+            endpoint_id=prompt.endpoint_id,
+            viewer_session_id=prompt.viewer_session_id,
+            command_identity_sha256=prompt.command_identity_sha256,
+            secret_input_binding_sha256=prompt.secret_input_binding_sha256,
+        )
+        with Vertical(id="secret-dialog"):
+            yield Static(
+                "Secret input requested\n"
+                "Deny unless you intend to hand the terminal directly to "
+                + inert_text(prompt.viewer_session_id),
+                markup=False,
+                id="secret-heading",
+            )
+            yield Static(
+                document,
+                markup=False,
+                id="secret-document",
+            )
+            with Horizontal(id="secret-actions"):
+                yield Button("Deny", variant="error", id="secret-deny")
+                yield Button(
+                    "Forward input",
+                    variant="warning",
+                    id="secret-approve",
+                    disabled=True,
+                )
+
+    def on_mount(self) -> None:
+        self.call_after_refresh(self._initialize_controls)
+
+    def _initialize_controls(self) -> None:
+        self.query_one("#secret-deny", Button).focus()
+        if not self.app.is_headless:
+            try:
+                flush_textual_input()
+            except OperatorInterfaceError:
+                self._finish(ApprovalDecision.DENIED)
+                return
+        self.set_timer(APPROVAL_ARM_SECONDS, self._arm_decision)
+
+    def _arm_decision(self) -> None:
+        if self._finished:
+            return
+        self.query_one("#secret-deny", Button).focus()
+        self._armed = True
+        self.query_one("#secret-approve", Button).disabled = False
+
+    def action_deny(self) -> None:
+        self._finish(ApprovalDecision.DENIED)
+
+    def _finish(self, decision: ApprovalDecision) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self.dismiss(decision)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "secret-deny":
+            self._finish(ApprovalDecision.DENIED)
+        elif event.button.id == "secret-approve" and self._armed:
+            self._finish(ApprovalDecision.APPROVED)
+
+
 class TmuxgateDashboardApp(App[None]):
     """Bounded dashboard with one request-bound approval modal at a time."""
 
@@ -626,8 +737,9 @@ class TmuxgateDashboardApp(App[None]):
                     "q  stop tmuxgate\n\n"
                     "Execution approvals, bounded SSH retries, and separate "
                     "route fallbacks open one at a time with a safe default. "
-                    "Machine-disable and secret-input decisions remain "
-                    "unavailable in this phase.",
+                    "Secret-input handoffs require a separate exact decision; "
+                    "the TUI then suspends while the trusted viewer owns the "
+                    "terminal. Machine-disable decisions remain unavailable.",
                     markup=False,
                     classes="panel",
                 )
@@ -678,11 +790,19 @@ class TmuxgateDashboardApp(App[None]):
 
         if not isinstance(
             queued.prompt,
-            (ExecutionApprovalPrompt, SshRetryPrompt, RouteFallbackPrompt),
+            (
+                ExecutionApprovalPrompt,
+                SshRetryPrompt,
+                RouteFallbackPrompt,
+                SecretInputAuthorizationPrompt,
+            ),
         ):
             queued.pending.deny()
             return
         if self._active_decision is not None:
+            queued.pending.deny()
+            return
+        if not self.interface._begin_modal(queued.prompt):
             queued.pending.deny()
             return
         self._active_decision = queued
@@ -697,6 +817,8 @@ class TmuxgateDashboardApp(App[None]):
             )
         elif isinstance(queued.prompt, SshRetryPrompt):
             screen = SshRetryScreen(queued.prompt)
+        elif isinstance(queued.prompt, SecretInputAuthorizationPrompt):
+            screen = SecretInputAuthorizationScreen(queued.prompt)
         else:
             screen = RouteFallbackScreen(queued.prompt)
         self.push_screen(screen, complete)
@@ -724,9 +846,31 @@ class TmuxgateDashboardApp(App[None]):
         decision = (
             result if isinstance(result, ApprovalDecision) else ApprovalDecision.DENIED
         )
-        queued.pending.resolve(
-            OperatorDecision.for_prompt(queued.prompt, decision)
-        )
+        self.interface._resolve_modal(queued, decision)
+
+    def run_external_terminal_session(
+        self,
+        prompt: SecretInputAuthorizationPrompt,
+        session: Callable[[], None],
+    ) -> None:
+        """Suspend Textual and run one previously reserved trusted session."""
+
+        if self._active_decision is not None:
+            raise OperatorInterfaceError(
+                "cannot hand off the terminal while a modal owns the UI"
+            )
+        self.interface._validate_external_reservation(prompt)
+        try:
+            with self.interface.terminal.claim(
+                priority=TerminalPriority.SECRET,
+                purpose=f"secret input for request {prompt.request_id}",
+                flush_input=False,
+            ):
+                with self.suspend():
+                    session()
+        finally:
+            self.interface._finish_external_session(prompt)
+            self.refresh(repaint=True, layout=True)
 
     def refresh_snapshot(self) -> None:
         if self.external_stop.is_set():
@@ -756,10 +900,7 @@ class TmuxgateDashboardApp(App[None]):
         )
         latest_connections: dict[str, OperationalActivity] = {}
         for event in self.interface.activity_history:
-            if (
-                event.kind is ActivityKind.CONNECTION
-                and event.request_id is not None
-            ):
+            if event.kind is ActivityKind.CONNECTION and event.request_id is not None:
                 latest_connections[event.request_id] = event
         connection_lines = [
             f"{request_id[:8]}={event.connection_phase.value}"
@@ -836,8 +977,7 @@ class TmuxgateDashboardApp(App[None]):
                 else ""
             )
             lines.append(
-                f"{inert_text(event.kind.value + phase):24} "
-                f"{inert_text(event.message)}"
+                f"{inert_text(event.kind.value + phase):24} {inert_text(event.message)}"
             )
         if not lines:
             lines.append("No recent activity.")
@@ -875,11 +1015,8 @@ class TextualOperatorInterface(PlainTerminalInterface):
             TmuxgateDashboardApp,
         ] = TmuxgateDashboardApp,
     ) -> None:
-        if approval_mode != "always":
-            raise OperatorInterfaceError(
-                "the TUI requires approval_mode='always'; "
-                "use --plain for approval_mode='disabled'"
-            )
+        if approval_mode not in {"always", "disabled"}:
+            raise ValueError("approval_mode must be 'always' or 'disabled'")
         if type(validate_terminal) is not bool:
             raise TypeError("validate_terminal must be boolean")
         if validate_terminal:
@@ -901,6 +1038,11 @@ class TextualOperatorInterface(PlainTerminalInterface):
         self._app_lock = threading.Lock()
         self._app_ready = threading.Event()
         self._active_app: TmuxgateDashboardApp | None = None
+        self._ownership_lock = threading.Lock()
+        self._ownership_state = TerminalOwnershipState.TUI
+        self._external_prompt_id: str | None = None
+        self._ui_available = threading.Event()
+        self._ui_available.set()
         super().__init__(
             terminal,
             approval_mode=approval_mode,
@@ -922,6 +1064,89 @@ class TextualOperatorInterface(PlainTerminalInterface):
         with self._queued_lock:
             return self._pending_prompt_count
 
+    @property
+    def terminal_ownership_state(self) -> TerminalOwnershipState:
+        with self._ownership_lock:
+            return self._ownership_state
+
+    def _begin_modal(self, prompt: OperatorPrompt) -> bool:
+        del prompt
+        with self._ownership_lock:
+            if self._ownership_state is not TerminalOwnershipState.TUI:
+                return False
+            self._ownership_state = TerminalOwnershipState.MODAL
+            self._ui_available.clear()
+            return True
+
+    def _complete_modal(
+        self,
+        prompt: OperatorPrompt,
+        decision: ApprovalDecision,
+    ) -> None:
+        with self._ownership_lock:
+            if self._ownership_state is not TerminalOwnershipState.MODAL:
+                raise OperatorInterfaceError("modal terminal ownership was lost")
+            if (
+                isinstance(prompt, SecretInputAuthorizationPrompt)
+                and decision is ApprovalDecision.APPROVED
+            ):
+                self._ownership_state = TerminalOwnershipState.EXTERNAL
+                self._external_prompt_id = prompt.prompt_id
+                return
+            self._ownership_state = TerminalOwnershipState.TUI
+            self._ui_available.set()
+
+    def _resolve_modal(
+        self,
+        queued: QueuedPrompt,
+        decision: ApprovalDecision,
+    ) -> bool:
+        """Atomically bind an approved secret slot to its handoff reservation."""
+
+        with self._ownership_lock:
+            if self._ownership_state is not TerminalOwnershipState.MODAL:
+                raise OperatorInterfaceError("modal terminal ownership was lost")
+            reserve = (
+                isinstance(queued.prompt, SecretInputAuthorizationPrompt)
+                and decision is ApprovalDecision.APPROVED
+            )
+            if reserve:
+                self._ownership_state = TerminalOwnershipState.EXTERNAL
+                self._external_prompt_id = queued.prompt.prompt_id
+            else:
+                self._ownership_state = TerminalOwnershipState.TUI
+            resolved = queued.pending.resolve(
+                OperatorDecision.for_prompt(queued.prompt, decision)
+            )
+            if not resolved:
+                self._external_prompt_id = None
+                self._ownership_state = TerminalOwnershipState.TUI
+            if self._ownership_state is TerminalOwnershipState.TUI:
+                self._ui_available.set()
+            return resolved
+
+    def _validate_external_reservation(
+        self, prompt: SecretInputAuthorizationPrompt
+    ) -> None:
+        with self._ownership_lock:
+            if (
+                self._ownership_state is not TerminalOwnershipState.EXTERNAL
+                or self._external_prompt_id != prompt.prompt_id
+            ):
+                raise OperatorInterfaceError(
+                    "external terminal session lacks exact authorization"
+                )
+
+    def _finish_external_session(self, prompt: SecretInputAuthorizationPrompt) -> None:
+        with self._ownership_lock:
+            if self._external_prompt_id != prompt.prompt_id:
+                raise OperatorInterfaceError(
+                    "external terminal reservation identity changed"
+                )
+            self._external_prompt_id = None
+            self._ownership_state = TerminalOwnershipState.TUI
+            self._ui_available.set()
+
     def bind_dashboard_provider(self, provider: DashboardProvider) -> None:
         if not callable(provider):
             raise TypeError("dashboard provider must be callable")
@@ -933,7 +1158,9 @@ class TextualOperatorInterface(PlainTerminalInterface):
         if self._dashboard_provider is not None:
             snapshot = self._dashboard_provider()
             if not isinstance(snapshot, DashboardRuntimeSnapshot):
-                raise OperatorInterfaceError("dashboard provider returned invalid state")
+                raise OperatorInterfaceError(
+                    "dashboard provider returned invalid state"
+                )
             return snapshot
         broker = getattr(config, "broker", None)
         mcp = getattr(config, "mcp", None)
@@ -941,8 +1168,7 @@ class TextualOperatorInterface(PlainTerminalInterface):
         return DashboardRuntimeSnapshot(
             approval_mode=str(getattr(broker, "approval_mode", "unknown")),
             listener=(
-                f"http://{getattr(mcp, 'host', '?')}:"
-                f"{getattr(mcp, 'port', '?')}/mcp"
+                f"http://{getattr(mcp, 'host', '?')}:{getattr(mcp, 'port', '?')}/mcp"
             ),
             machines=tuple(
                 DashboardMachine(
@@ -966,13 +1192,16 @@ class TextualOperatorInterface(PlainTerminalInterface):
             message = "Execution approval is waiting for an explicit decision."
         elif isinstance(prompt, SshRetryPrompt):
             message = (
-                "One bounded same-endpoint SSH retry is waiting for an exact "
-                "decision."
+                "One bounded same-endpoint SSH retry is waiting for an exact decision."
             )
         elif isinstance(prompt, RouteFallbackPrompt):
             message = (
-                "A separately bound route fallback is waiting for an exact "
-                "decision."
+                "A separately bound route fallback is waiting for an exact decision."
+            )
+        elif isinstance(prompt, SecretInputAuthorizationPrompt):
+            message = (
+                "A remote pane requested secret input. Exact independent "
+                "authorization is required before terminal handoff."
             )
         else:
             message = None
@@ -1004,7 +1233,12 @@ class TextualOperatorInterface(PlainTerminalInterface):
             try:
                 if not isinstance(
                     queued.prompt,
-                    (ExecutionApprovalPrompt, SshRetryPrompt, RouteFallbackPrompt),
+                    (
+                        ExecutionApprovalPrompt,
+                        SshRetryPrompt,
+                        RouteFallbackPrompt,
+                        SecretInputAuthorizationPrompt,
+                    ),
                 ):
                     queued.pending.deny()
                     self.publish_activity(
@@ -1017,6 +1251,8 @@ class TextualOperatorInterface(PlainTerminalInterface):
                     )
                     continue
                 while not self._prompts.closed:
+                    if not self._ui_available.wait(0.10):
+                        continue
                     if not self._app_ready.wait(0.10):
                         continue
                     with self._app_lock:
@@ -1048,6 +1284,28 @@ class TextualOperatorInterface(PlainTerminalInterface):
     def fail_closed(self) -> None:
         self._prompts.close()
         self._app_ready.set()
+
+    def run_external_terminal_session(
+        self,
+        prompt: SecretInputAuthorizationPrompt,
+        session: Callable[[], None],
+    ) -> None:
+        if not isinstance(prompt, SecretInputAuthorizationPrompt):
+            raise TypeError("prompt must be a SecretInputAuthorizationPrompt")
+        if not callable(session):
+            raise TypeError("external terminal session must be callable")
+        self._validate_external_reservation(prompt)
+        while not self._prompts.closed:
+            if not self._app_ready.wait(0.10):
+                continue
+            with self._app_lock:
+                app = self._active_app
+            if app is None:
+                continue
+            app.call_from_thread(app.run_external_terminal_session, prompt, session)
+            return
+        self._finish_external_session(prompt)
+        raise OperatorInterfaceError("dashboard closed before terminal handoff")
 
     def publish_activity(self, event: OperationalActivity) -> None:
         if not isinstance(event, OperationalActivity):
