@@ -540,7 +540,7 @@ class BrokerIntegrationTests(unittest.TestCase):
         self.assertEqual(result.transport_status, TransportStatus.DENIED)
         self.assertEqual(executor.calls, [])
         self.assertIn("RUN 00000000", terminal_output.getvalue())
-        self.assertIn("Approve? [Y/n]", terminal_output.getvalue())
+        self.assertIn("Approve? [y/N]", terminal_output.getvalue())
 
     def test_full_pending_queue_rejects_third_request_without_approval(self):
         approver = ScriptedApprover(

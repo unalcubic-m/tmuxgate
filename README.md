@@ -233,16 +233,18 @@ unified application. Stop it from the dashboard or with `Ctrl-C`; do not start
 a separate MCP process.
 
 The established line-oriented interface remains the production default.
-`tmuxgate --plain` selects it explicitly. `tmuxgate --tui` starts the phase-two
-read-only Textual preview, which provides keyboard-accessible Dashboard, Jobs,
-Machines, Activity, queued-request, and Help views. The preview requires
-`approval_mode = "always"`; it displays decision requests but cannot approve
-them, and quitting denies every unresolved prompt. Use `--plain` for execution
-approval, SSH retry, route fallback, machine-disable, or secret-input decisions.
-This restriction prevents Textual and direct terminal readers from competing
-until those security decision paths receive complete TUI modals in later
-phases. The TUI also refuses redirected/mismatched terminal input and output or
-a background process group instead of silently falling back to plain mode.
+`tmuxgate --plain` selects it explicitly. `tmuxgate --tui` starts the phase-three
+Textual preview, which provides keyboard-accessible Dashboard, Jobs, Machines,
+Activity, queued-request, and Help views plus request-bound execution-approval
+modals. Each modal has independently scrollable Summary, Code, and Technical
+Details views. Deny has default focus; Approve is briefly fenced when a modal
+opens so buffered input cannot approve it, and then requires a deliberate
+button action. Escape, quitting, UI failure, or shutdown denies unresolved
+prompts. SSH retry, route fallback, machine-disable, and secret-input decisions
+remain unavailable in the TUI and fail closed in this phase; use `--plain` for
+those paths. The TUI also refuses redirected/mismatched terminal input and
+output or a background process group instead of silently falling back to plain
+mode.
 
 The recommended `./install.sh` workflow has already registered this endpoint
 with Codex and installed the token loader. Start tmuxgate in one terminal,
@@ -372,12 +374,12 @@ detail while the unverified result gates are cleared.
 5. Replace uses of public `tmuxgate exec`/`script` with `run_argv`/`run_script`.
    Existing administrative command invocations do not need to change.
 
-When approval is set to `always`, tmuxgate shows a compact decision card in its
-controlling terminal. Enter `y`/`yes`/`approve` (or press Enter) to approve,
-`n`/`no`/`deny` to deny, `c` to inspect the exact code, or `d` to inspect the
-complete technical evidence. Dashboard input, MCP data, Unix-socket data, and
-process stdin cannot answer the prompt. The dashboard does not hold the
-terminal while idle, allowing approvals, SSH authentication, and separately
+When approval is set to `always`, plain mode shows a compact decision card in
+its controlling terminal. Enter `y`/`yes`/`approve` to approve; press Enter or
+enter `n`/`no`/`deny` to deny; use `c` to inspect the exact code or `d` to
+inspect the complete technical evidence. Dashboard input, MCP data, Unix-socket
+data, and process stdin cannot answer the prompt. The dashboard does not hold
+the terminal while idle, allowing approvals, SSH authentication, and separately
 authorized secret-input attachments to use the same terminal safely.
 
 Both screens are implemented behind a presentation-independent operator
@@ -386,11 +388,13 @@ their complete internal request/connection bindings through an exactly-once
 FIFO decision queue; broker and executor workers do not parse terminal text.
 Closing or failing either interface denies all unresolved prompts. The visible
 line-oriented interface and `/dev/tty` trust boundary remain the production
-defaults. The opt-in Textual interface is deliberately read-only: it renders
-bounded structured activity and runtime snapshots with markup disabled and
-control characters escaped, uses a fixed widget tree, enters the alternate
-screen only after foreground-terminal validation, and relies on Textual's
-driver cleanup to restore terminal contents and modes on every exit path.
+defaults. The opt-in Textual interface renders bounded structured activity and
+runtime snapshots with markup disabled and control characters escaped, uses a
+fixed dashboard widget tree, and marshals execution prompts to one exact modal
+on the UI thread. Modal documents use three fixed scrollable widgets regardless
+of content length. Textual enters the alternate screen only after
+foreground-terminal validation and relies on its driver cleanup to restore
+terminal contents and modes on every exit path.
 
 Remote password-like pane text is notification only. Before tmuxgate attaches
 the broker terminal to a detached viewer, a separate card identifies the full

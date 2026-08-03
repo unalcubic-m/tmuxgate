@@ -112,7 +112,10 @@ def _add_interface_selection(
         const="tui",
         dest="interface_mode",
         default=default,
-        help="use the read-only Textual preview (approval_mode=always only)",
+        help=(
+            "use the Textual preview with execution-approval modals "
+            "(approval_mode=always only)"
+        ),
     )
 
 
