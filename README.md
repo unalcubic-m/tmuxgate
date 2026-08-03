@@ -233,16 +233,20 @@ unified application. Stop it from the dashboard or with `Ctrl-C`; do not start
 a separate MCP process.
 
 The established line-oriented interface remains the production default.
-`tmuxgate --plain` selects it explicitly. `tmuxgate --tui` starts the phase-four
-Textual preview, which provides keyboard-accessible Dashboard, Jobs, Machines,
+`tmuxgate --plain` selects it explicitly. `tmuxgate --tui` starts the Textual
+interface, which provides keyboard-accessible Dashboard, Jobs, Machines,
 Activity, queued-request, and Help views plus request-bound execution-approval
 modals, bounded SSH-retry modals, and separately authorized route-fallback
-modals. Recovery modals expose Summary, complete inert OpenSSH Diagnostics, and
+modals plus exact secret-input authorization. Recovery modals expose Summary,
+complete inert OpenSSH Diagnostics, and
 exact Binding Evidence views. Deny or Cancel has default focus; positive
 actions are briefly fenced when a modal opens and then require a deliberate
 button action. Escape, quitting, UI failure, or shutdown denies unresolved
-prompts. Machine-disable and secret-input decisions remain unavailable in the
-TUI and fail closed in this phase; use `--plain` for those paths. The TUI also
+prompts. An approved secret-input decision suspends the TUI, restores the normal
+terminal, and gives a trusted external tmux viewer direct ownership; the TUI
+resumes with a full redraw on every return or failure path and never receives
+the typed secret bytes. Machine-disable decisions remain unavailable in the
+TUI. The TUI also
 refuses redirected/mismatched terminal input and output or a background process
 group instead of silently falling back to plain mode.
 
@@ -395,13 +399,17 @@ exact modal on the UI thread. Modal documents use three fixed scrollable
 widgets regardless
 of content length. Textual enters the alternate screen only after
 foreground-terminal validation and relies on its driver cleanup to restore
-terminal contents and modes on every exit path.
+terminal contents and modes on every exit path. Its explicit TUI, modal, and
+external ownership states prevent another reader or modal from competing with
+an authorized external viewer.
 
 Remote password-like pane text is notification only. Before tmuxgate attaches
 the broker terminal to a detached viewer, a separate card identifies the full
 request ID, logical machine, endpoint, approved argv or script digest, and the
-remote-input action. The operator must type `forward <full-request-id>` on the
-trusted terminal. This authorization remains mandatory when
+remote-input action. Plain mode requires `forward <full-request-id>` on the
+trusted terminal. The TUI shows the same exact recipient and binding in a
+Deny-default modal with a deliberately armed Forward Input action. This
+authorization remains mandatory when
 `approval_mode = "disabled"`; denial leaves the command detached, while
 `tmuxgate attach REQUEST_ID` remains available for deliberate manual
 interaction.

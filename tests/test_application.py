@@ -147,12 +147,12 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
         self.assertTrue(snapshot.ready)
         self.assertEqual(snapshot.listener, "http://127.0.0.1:18765/mcp")
         self.assertEqual(snapshot.approval_mode, "always")
-        self.assertEqual(snapshot.terminal_owner, "Textual dashboard")
+        self.assertEqual(snapshot.terminal_owner, "tui")
         self.assertEqual(len(snapshot.machines), 1)
         self.assertEqual(snapshot.machines[0].alias, "local")
         self.assertEqual(snapshot.machines[0].ssh_state, "not used (fake)")
 
-    def test_textual_mode_rejects_disabled_approvals_before_listener_start(self):
+    def test_textual_mode_accepts_disabled_execution_approval_policy(self):
         app = UnifiedApplication(
             config_path=self.config_path,
             socket_path=self.socket_path,
@@ -161,11 +161,18 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
             textual=True,
         )
         with (
-            self.assertRaisesRegex(RuntimeError, "--plain"),
-            mock.patch.object(application, "open_broker_listener") as listener,
+            self.assertRaisesRegex(RuntimeError, "listener reached"),
+            mock.patch(
+                "tmuxgate.textual_interface.validate_textual_terminal"
+            ),
+            mock.patch.object(
+                application,
+                "open_broker_listener",
+                side_effect=RuntimeError("listener reached"),
+            ) as listener,
         ):
             app.run()
-        listener.assert_not_called()
+        listener.assert_called_once_with(self.socket_path)
 
     def test_textual_terminal_validation_precedes_listener_start(self):
         _write_config(self.config_path, approval_mode="always")

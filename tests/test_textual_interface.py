@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import fcntl
 import os
 from pathlib import Path
@@ -31,8 +31,11 @@ from tmuxgate.operator_interface import (
     ExecutionApprovalPrompt,
     OperationalActivity,
     OperatorInterfaceError,
+    PendingDecision,
+    QueuedPrompt,
     RemoteMutationState,
     RouteFallbackPrompt,
+    SecretInputRecipient,
     SshRetryPrompt,
 )
 from tmuxgate.textual_interface import (
@@ -46,8 +49,10 @@ from tmuxgate.textual_interface import (
     MINIMUM_COLUMNS,
     MINIMUM_ROWS,
     RouteFallbackScreen,
+    SecretInputAuthorizationScreen,
     SshRetryScreen,
     TextualOperatorInterface,
+    TerminalOwnershipState,
     TmuxgateDashboardApp,
     flush_textual_input,
     validate_textual_terminal,
@@ -88,6 +93,16 @@ def prompt() -> ExecutionApprovalPrompt:
         None,
         unbound_fake=True,
     )
+
+
+def secret_prompt():
+    execution = prompt()
+    return SecretInputRecipient(
+        REQUEST_ID,
+        execution.request,
+        build_plan(),
+        "home-lan",
+    ).create_prompt("tmuxgate-" + REQUEST_ID[:12])
 
 
 class TextualDependencyTests(unittest.TestCase):
@@ -194,11 +209,177 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
         ):
             flush_textual_input(stream)
 
-    def test_disabled_approval_mode_fails_closed_without_plain_fallback(self):
-        with self.assertRaisesRegex(OperatorInterfaceError, "--plain"):
-            TextualOperatorInterface(
-                FakeTerminalArbiter(), approval_mode="disabled"
+    def test_disabled_execution_approval_never_bypasses_secret_authorization(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(),
+            approval_mode="disabled",
+            validate_terminal=False,
+        )
+        self.addCleanup(interface.close)
+        execution = prompt()
+        self.assertIs(
+            interface.request_execution_approval(execution).decision,
+            ApprovalDecision.APPROVED,
+        )
+
+        secret = secret_prompt()
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                interface.request_secret_input_authorization(secret)
             )
+        )
+        worker.start()
+        deadline = time.monotonic() + 1
+        while interface.pending_prompt_count != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(worker.is_alive())
+        interface.close()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertIs(result[0].decision, ApprovalDecision.DENIED)
+
+    def test_exact_secret_modal_reserves_suspends_and_restores_terminal(self):
+        events = []
+
+        class RecordingTerminal(FakeTerminalArbiter):
+            @contextmanager
+            def claim(self, **keywords):
+                events.append(("claim", keywords["priority"]))
+                yield
+                events.append(("release", keywords["priority"]))
+
+        class RecordingApp(TmuxgateDashboardApp):
+            @contextmanager
+            def suspend(self):
+                events.append("suspend")
+                yield
+                events.append("resume")
+
+        interface = TextualOperatorInterface(
+            RecordingTerminal(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        secret = secret_prompt()
+        decisions = []
+        authorizer = threading.Thread(
+            target=lambda: decisions.append(
+                interface.request_secret_input_authorization(secret)
+            )
+        )
+        authorizer.start()
+        app = RecordingApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                deadline = time.monotonic() + 2
+                while not (
+                    isinstance(app.screen, SecretInputAuthorizationScreen)
+                    and len(list(app.screen.query("#secret-document"))) == 1
+                    and len(list(app.screen.query("#secret-deny:focus"))) == 1
+                ):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("secret authorization modal did not open")
+                    await pilot.pause(0.02)
+                screen = app.screen
+                self.assertIs(
+                    interface.terminal_ownership_state,
+                    TerminalOwnershipState.MODAL,
+                )
+                document = screen.query_one("#secret-document", Static).render().plain
+                self.assertIn(secret.request_id, document)
+                self.assertIn(secret.endpoint_id, document)
+                self.assertIn(secret.viewer_session_id, document)
+                self.assertIn(secret.secret_input_binding_sha256, document)
+                self.assertTrue(screen.query_one("#secret-deny", Button).has_focus)
+                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                self.assertTrue(await pilot.click("#secret-approve"))
+                deadline = time.monotonic() + 1
+                while authorizer.is_alive() and time.monotonic() < deadline:
+                    await pilot.pause(0.02)
+                self.assertIs(
+                    interface.terminal_ownership_state,
+                    TerminalOwnershipState.EXTERNAL,
+                )
+
+                handoff = threading.Thread(
+                    target=lambda: interface.run_external_terminal_session(
+                        secret, lambda: events.append("trusted-session")
+                    )
+                )
+                handoff.start()
+                deadline = time.monotonic() + 2
+                while handoff.is_alive() and time.monotonic() < deadline:
+                    await pilot.pause(0.02)
+                handoff.join(timeout=0)
+                self.assertFalse(handoff.is_alive())
+                self.assertIs(
+                    interface.terminal_ownership_state,
+                    TerminalOwnershipState.TUI,
+                )
+
+        asyncio.run(exercise())
+        authorizer.join(timeout=1)
+        self.assertIs(decisions[0].decision, ApprovalDecision.APPROVED)
+        self.assertEqual(
+            events,
+            [
+                ("claim", 40),
+                "suspend",
+                "trusted-session",
+                "resume",
+                ("release", 40),
+            ],
+        )
+
+    def test_external_failure_restores_tui_and_rejects_stale_authority(self):
+        class RecordingApp(TmuxgateDashboardApp):
+            @contextmanager
+            def suspend(self):
+                yield
+
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        secret = secret_prompt()
+        self.assertTrue(interface._begin_modal(secret))
+        interface._complete_modal(secret, ApprovalDecision.APPROVED)
+        stale = SecretInputRecipient(
+            "1" * 32,
+            secret.request,
+            secret.connection_plan,
+            secret.endpoint_id,
+        ).create_prompt("tmuxgate-" + ("1" * 12))
+        with self.assertRaisesRegex(OperatorInterfaceError, "exact authorization"):
+            interface._validate_external_reservation(stale)
+        app = RecordingApp(interface, threading.Event(), config())
+        with self.assertRaisesRegex(RuntimeError, "synthetic handoff failure"):
+            app.run_external_terminal_session(
+                secret,
+                lambda: (_ for _ in ()).throw(
+                    RuntimeError("synthetic handoff failure")
+                ),
+            )
+        self.assertIs(
+            interface.terminal_ownership_state,
+            TerminalOwnershipState.TUI,
+        )
+
+        abandoned = secret_prompt()
+        pending = PendingDecision(abandoned)
+        pending.abandon()
+        self.assertTrue(interface._begin_modal(abandoned))
+        self.assertFalse(
+            interface._resolve_modal(
+                QueuedPrompt(99, abandoned, pending),
+                ApprovalDecision.APPROVED,
+            )
+        )
+        self.assertIs(
+            interface.terminal_ownership_state,
+            TerminalOwnershipState.TUI,
+        )
 
     def test_prompt_and_activity_history_are_bounded_and_close_denies(self):
         interface = TextualOperatorInterface(
@@ -312,13 +493,15 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                     )
 
                 jobs_text = app.query_one("#jobs-content", Static).render().plain
-                machines_text = app.query_one(
-                    "#machines-content", Static
-                ).render().plain
-                activity_text = app.query_one(
-                    "#activity-content", Static
-                ).render().plain
-                self.assertLessEqual(len(jobs_text.splitlines()), MAX_DASHBOARD_JOBS + 1)
+                machines_text = (
+                    app.query_one("#machines-content", Static).render().plain
+                )
+                activity_text = (
+                    app.query_one("#activity-content", Static).render().plain
+                )
+                self.assertLessEqual(
+                    len(jobs_text.splitlines()), MAX_DASHBOARD_JOBS + 1
+                )
                 self.assertLessEqual(
                     len(machines_text.splitlines()), MAX_DASHBOARD_MACHINES + 1
                 )
@@ -448,18 +631,24 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 self.assertTrue(
                     retry_screen.query_one("#recovery-cancel", Button).has_focus
                 )
-                summary = retry_screen.query_one(
-                    "#recovery-summary-document", Static
-                ).render().plain
+                summary = (
+                    retry_screen.query_one("#recovery-summary-document", Static)
+                    .render()
+                    .plain
+                )
                 self.assertIn("Permitted retry: 1 of 1", summary)
                 self.assertIn("Remote command: not_started", summary)
                 self.assertIn(r"\x0ainjected label", summary)
-                diagnostics_text = retry_screen.query_one(
-                    "#recovery-diagnostics-document", Static
-                ).render().plain
-                binding = retry_screen.query_one(
-                    "#recovery-binding-document", Static
-                ).render().plain
+                diagnostics_text = (
+                    retry_screen.query_one("#recovery-diagnostics-document", Static)
+                    .render()
+                    .plain
+                )
+                binding = (
+                    retry_screen.query_one("#recovery-binding-document", Static)
+                    .render()
+                    .plain
+                )
                 self.assertNotIn("\x1b", diagnostics_text)
                 self.assertIn(r"\x1b", diagnostics_text)
                 self.assertIn(retry.retry_binding_sha256, binding)
@@ -471,9 +660,11 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 fallback_screen = await self._wait_for_recovery(
                     app, pilot, RouteFallbackScreen, fallback
                 )
-                fallback_summary = fallback_screen.query_one(
-                    "#recovery-summary-document", Static
-                ).render().plain
+                fallback_summary = (
+                    fallback_screen.query_one("#recovery-summary-document", Static)
+                    .render()
+                    .plain
+                )
                 self.assertIn("Failed route: home-lan", fallback_summary)
                 self.assertIn(
                     "Failed identity: operator@192.0.2.20:22",
@@ -481,9 +672,11 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 )
                 self.assertIn("Proposed route: wireguard", fallback_summary)
                 self.assertIn("original RUN approval", fallback_summary)
-                fallback_binding = fallback_screen.query_one(
-                    "#recovery-binding-document", Static
-                ).render().plain
+                fallback_binding = (
+                    fallback_screen.query_one("#recovery-binding-document", Static)
+                    .render()
+                    .plain
+                )
                 self.assertIn(fallback.fallback_binding_sha256, fallback_binding)
                 await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
                 self.assertTrue(await pilot.click("#recovery-approve"))
@@ -501,7 +694,9 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
             FakeTerminalArbiter(), validate_terminal=False
         )
         self.addCleanup(interface.close)
-        malicious = b"echo '[bold]literal[/bold]'\n\x1b]8;;https://evil.invalid\x07link\n"
+        malicious = (
+            b"echo '[bold]literal[/bold]'\n\x1b]8;;https://evil.invalid\x07link\n"
+        )
         request = RequestSpec(
             "app-server",
             ExecutionMode.SCRIPT,
@@ -555,13 +750,19 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                         screen.query_one("#approval-views", TabbedContent).active,
                         expected,
                     )
-                code = screen.query_one("#approval-code-document", Static).render().plain
-                summary = screen.query_one(
-                    "#approval-summary-document", Static
-                ).render().plain
-                technical = screen.query_one(
-                    "#approval-technical-document", Static
-                ).render().plain
+                code = (
+                    screen.query_one("#approval-code-document", Static).render().plain
+                )
+                summary = (
+                    screen.query_one("#approval-summary-document", Static)
+                    .render()
+                    .plain
+                )
+                technical = (
+                    screen.query_one("#approval-technical-document", Static)
+                    .render()
+                    .plain
+                )
                 self.assertIn("home-lan", summary)
                 self.assertIn("192.0.2.20", summary)
                 self.assertIn(plan.plan_sha256, technical)
@@ -580,7 +781,9 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 self.assertTrue(await pilot.click("#approval-approve"))
 
                 next_screen = await self._wait_for_approval(app, pilot, denied)
-                self.assertTrue(next_screen.query_one("#approval-deny", Button).has_focus)
+                self.assertTrue(
+                    next_screen.query_one("#approval-deny", Button).has_focus
+                )
                 await pilot.press("escape")
                 await pilot.pause()
 
@@ -615,7 +818,9 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
             worker.start()
             workers.append(worker)
             deadline = time.monotonic() + 1
-            while interface.pending_prompt_count < index and time.monotonic() < deadline:
+            while (
+                interface.pending_prompt_count < index and time.monotonic() < deadline
+            ):
                 time.sleep(0.01)
         app = TmuxgateDashboardApp(interface, threading.Event(), config())
 
@@ -633,9 +838,7 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 second_screen = await self._wait_for_approval(app, pilot, prompts[1])
                 self.assertIsNot(first_screen, second_screen)
                 second_item = interface.queued_prompts[1]
-                app._complete_execution_approval(
-                    first_item, ApprovalDecision.APPROVED
-                )
+                app._complete_execution_approval(first_item, ApprovalDecision.APPROVED)
                 await pilot.pause()
                 self.assertTrue(workers[1].is_alive())
                 self.assertEqual(
@@ -681,7 +884,9 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
         for index, worker in enumerate(workers, start=1):
             worker.start()
             deadline = time.monotonic() + 1
-            while interface.pending_prompt_count < index and time.monotonic() < deadline:
+            while (
+                interface.pending_prompt_count < index and time.monotonic() < deadline
+            ):
                 time.sleep(0.01)
         stop = threading.Event()
         app = TmuxgateDashboardApp(interface, stop, config())
@@ -708,6 +913,7 @@ import asyncio
 from contextlib import nullcontext
 import os
 import signal
+import subprocess
 import termios
 import threading
 from types import SimpleNamespace
@@ -725,12 +931,48 @@ class Terminal:
         return None
 
 class Probe(TmuxgateDashboardApp):
+    tui_keys = 0
+
     def on_mount(self):
         super().on_mount()
         if mode == "normal":
             self.set_timer(0.2, self.exit)
         elif mode == "exception":
             raise RuntimeError("synthetic TUI failure")
+        elif mode in {"handoff", "handoff_failure"}:
+            self.call_after_refresh(self.run_handoff)
+
+    def on_key(self, event):
+        self.tui_keys += 1
+
+    def run_handoff(self):
+        command = (
+            "IFS= read -r secret; test \"$secret\" = external-secret"
+            if mode == "handoff"
+            else "exit 7"
+        )
+        failed = False
+        try:
+            with self.suspend():
+                os.write(terminal, b"TMUXGATE_HANDOFF_ACTIVE=yes\r\n")
+                subprocess.run(
+                    ["/bin/sh", "-c", command],
+                    stdin=terminal,
+                    stdout=terminal,
+                    stderr=terminal,
+                    check=True,
+                )
+        except subprocess.CalledProcessError:
+            failed = True
+        os.write(
+            terminal,
+            b"TMUXGATE_HANDOFF_FAILED=" + (b"yes" if failed else b"no") + b"\r\n",
+        )
+        os.write(
+            terminal,
+            b"TMUXGATE_TUI_KEYS=" + str(self.tui_keys).encode("ascii") + b"\r\n",
+        )
+        self.exit()
 
 if mode == "cancel":
     interface = TextualOperatorInterface(Terminal())
@@ -802,16 +1044,20 @@ class TextualPtyLifecycleTests(unittest.TestCase):
                     if not chunk:
                         break
                     output.extend(chunk)
-                if (
-                    mode == "signal"
-                    and not sent_signal
-                    and b"\x1b[?1049h" in output
-                ):
+                    if (
+                        mode == "handoff"
+                        and b"TMUXGATE_HANDOFF_ACTIVE=yes" in output
+                        and b"external-secret" not in output
+                    ):
+                        os.write(master, b"external-secret\n")
+                if mode == "signal" and not sent_signal and b"\x1b[?1049h" in output:
                     os.kill(child, signal.SIGTERM)
                     sent_signal = True
                 waited, status = os.waitpid(child, os.WNOHANG)
                 if waited:
-                    self.assertTrue(os.WIFEXITED(status), output.decode(errors="replace"))
+                    self.assertTrue(
+                        os.WIFEXITED(status), output.decode(errors="replace")
+                    )
                     break
             else:
                 os.kill(child, signal.SIGKILL)
@@ -829,6 +1075,21 @@ class TextualPtyLifecycleTests(unittest.TestCase):
                 self.assertIn(b"\x1b[?1049h", output)
                 self.assertIn(b"\x1b[?1049l", output)
                 self.assertIn(b"TMUXGATE_RESTORED=yes", output)
+
+    def test_external_process_owns_bytes_while_textual_is_suspended(self):
+        output = self._run_mode("handoff")
+        self.assertIn(b"TMUXGATE_HANDOFF_ACTIVE=yes", output)
+        self.assertIn(b"TMUXGATE_HANDOFF_FAILED=no", output)
+        self.assertIn(b"TMUXGATE_TUI_KEYS=0", output)
+        self.assertIn(b"TMUXGATE_RESTORED=yes", output)
+        self.assertGreaterEqual(output.count(b"\x1b[?1049h"), 2)
+        self.assertGreaterEqual(output.count(b"\x1b[?1049l"), 2)
+
+    def test_external_process_failure_resumes_and_restores_textual(self):
+        output = self._run_mode("handoff_failure")
+        self.assertIn(b"TMUXGATE_HANDOFF_FAILED=yes", output)
+        self.assertIn(b"TMUXGATE_TUI_KEYS=0", output)
+        self.assertIn(b"TMUXGATE_RESTORED=yes", output)
 
 
 if __name__ == "__main__":
