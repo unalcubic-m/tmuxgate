@@ -363,11 +363,11 @@ class SettingsCommandTests(unittest.TestCase):
         self.assertIsNone(arguments["socket_path"])
         self.assertIsNone(arguments["state_dir"])
         self.assertFalse(arguments["fake"])
-        self.assertTrue(callable(arguments["dashboard"]))
-        self.assertFalse(arguments["textual"])
+        self.assertIsNone(arguments["dashboard"])
+        self.assertTrue(arguments["textual"])
         application.return_value.run.assert_called_once_with()
 
-    def test_plain_and_tui_select_explicit_operator_paths(self):
+    def test_plain_is_explicit_and_preview_flag_is_removed(self):
         with mock.patch("tmuxgate.cli.UnifiedApplication") as application:
             application.return_value.run.return_value = 0
             self.assertEqual(cli.main(["--plain"]), 0)
@@ -377,17 +377,24 @@ class SettingsCommandTests(unittest.TestCase):
 
         with mock.patch("tmuxgate.cli.UnifiedApplication") as application:
             application.return_value.run.return_value = 0
-            self.assertEqual(cli.main(["--tui"]), 0)
-        tui = application.call_args.kwargs
-        self.assertTrue(tui["textual"])
-        self.assertIsNone(tui["dashboard"])
+            self.assertEqual(cli.main(["dashboard", "--plain"]), 0)
+        dashboard_plain = application.call_args.kwargs
+        self.assertFalse(dashboard_plain["textual"])
+        self.assertTrue(callable(dashboard_plain["dashboard"]))
 
         with mock.patch("tmuxgate.cli.UnifiedApplication") as application:
             application.return_value.run.return_value = 0
-            self.assertEqual(cli.main(["dashboard", "--tui"]), 0)
+            self.assertEqual(cli.main(["dashboard"]), 0)
         dashboard_tui = application.call_args.kwargs
         self.assertTrue(dashboard_tui["textual"])
         self.assertIsNone(dashboard_tui["dashboard"])
+
+        with (
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            cli.build_parser().parse_args(["--tui"])
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

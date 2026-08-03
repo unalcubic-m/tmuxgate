@@ -34,6 +34,12 @@ branch measurement. The enforced project threshold is 75.0 percent. The
 threshold is below the initial measured result to tolerate small changes while
 still preventing a large unreviewed coverage loss; it should rise as uncovered
 failure branches receive tests and must not be lowered without PR rationale.
+Before measuring the whole suite, the job runs the Textual and unified-
+application modules as an explicit TUI security gate. That selection includes
+headless modal tests, real PTY alternate-screen and terminal-mode restoration,
+default-TUI and explicit-plain CLI startup, resize/minimum-size behavior,
+runtime terminal loss, stale input, bounded rendering, external handoff, and
+failure/cancellation/signal paths.
 Hypothesis generates valid frames, arbitrary malformed bytes, truncations, and
 trailing data at the protocol boundary. A rule-based durable-store model checks
 generation and on-disk invariants, while injected open, write, file-fsync,
@@ -66,6 +72,12 @@ creates a unique marker. The suite asserts the marker is absent, proving no
 test tried to contact a developer-configured or real host. Real integration
 tests may use only repository-created loopback OpenSSH/tmux resources and
 session-specific temporary paths.
+
+The adversarial job uses the same poisoned SSH configuration and checks its
+unique contact marker after both the focused TUI gate and the complete coverage
+run. The package job installs without development extras, changes out of the
+checkout, creates fresh private HOME and XDG directories, verifies default and
+`--plain` help, and rejects the removed `--tui` preview flag.
 
 ## Local reproduction
 

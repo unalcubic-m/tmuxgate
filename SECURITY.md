@@ -47,6 +47,31 @@ token), inspect processes, access the Unix socket, or access SSH credentials
 are outside the documented boundary unless they also demonstrate a violation
 of a stated tmuxgate invariant.
 
+## Terminal presentation and input boundary
+
+The default Textual dashboard is presentation, not authority. Structured
+operator prompts retain their immutable request and route bindings outside the
+rendered widget tree. MCP and Unix-socket frames, remote stdout/stderr, OpenSSH
+diagnostics, tmux pane text, ANSI controls, terminal links, and Textual markup
+are untrusted data: they are escaped and cannot create widgets, key events, or
+decisions. Only deliberate input from the one validated foreground controlling
+terminal may resolve a prompt, and Deny, Cancel, or Keep enabled is always the
+focused default.
+
+The TUI revalidates terminal identity and foreground process-group ownership
+throughout its lifetime. Startup or runtime loss fails the unified application
+closed and never changes approval policy or starts a plain replacement;
+`tmuxgate --plain` must be chosen explicitly on restart. A terminal below the
+documented 72×20 minimum keeps the safe action visible and disables positive
+actions until complete evidence is visible again.
+
+Secret input is a separate ownership boundary. Prompt-like remote output is
+notification only. After an exact request-, command-, route-, endpoint-, and
+viewer-bound authorization, Textual leaves application mode and stops reading
+the terminal before the trusted external viewer receives `/dev/tty`. The TUI
+does not inspect, buffer, transform, retain, or log those bytes and must restore
+the previous screen and terminal modes on every return path.
+
 ## Installer security boundary
 
 Run `./install.sh` only from source you have reviewed and as the target user,

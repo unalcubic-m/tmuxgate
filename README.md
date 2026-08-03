@@ -68,8 +68,11 @@ SSH/tmux isolation, result verification, or cleanup rules.
 
 The package pins the tested official Python MCP SDK (`mcp==2.0.0`), Textual
 (`textual==8.2.8`), and Uvicorn (`uvicorn==0.52.0`). Textual supports the
-explicit read-only full-screen preview; the MCP SDK and Uvicorn provide the
-embedded Streamable HTTP stack.
+default full-screen operator interface; the MCP SDK and Uvicorn provide the
+embedded Streamable HTTP stack. The TUI requires one foreground character
+terminal shared by input and output. A terminal of at least 72 columns by 20
+rows is recommended; smaller terminals retain a visible safe action and require
+resizing before any positive security decision can be enabled.
 
 ## Install
 
@@ -232,23 +235,44 @@ form. `tmuxgate broker` is a deprecated compatibility alias for the same
 unified application. Stop it from the dashboard or with `Ctrl-C`; do not start
 a separate MCP process.
 
-The established line-oriented interface remains the production default.
-`tmuxgate --plain` selects it explicitly. `tmuxgate --tui` starts the Textual
-interface, which provides keyboard-accessible Dashboard, Jobs, Machines,
+The stable dashboard keeps readiness and bounded operational state in place:
+
+```text
+tmuxgate · operator interface
+Application readiness: ready       Approval mode: always
+MCP listener: http://127.0.0.1:8765/mcp
+Configured machines: 4             Active durable jobs: 0
+Pending prompts: 0                  Terminal ownership: tui
+
+[D] Dashboard  [J] Jobs  [M] Machines  [A] Activity  [R] Requests  [?] Help
+```
+
+When a decision is pending, one exact modal replaces dashboard interaction.
+Summary, complete code or diagnostics, and binding evidence remain scrollable;
+Enter and Escape select the focused safe action. Positive actions are disabled
+until the modal's stale-input fence has elapsed and require a deliberate button
+activation.
+
+The Textual interface is the default in a supported interactive terminal.
+`tmuxgate --plain` explicitly selects the supported line-oriented fail-safe;
+the former `--tui` preview flag has been removed. The full-screen interface
+provides keyboard-accessible Dashboard, Jobs, Machines,
 Activity, queued-request, and Help views plus request-bound execution-approval
 modals, bounded SSH-retry modals, and separately authorized route-fallback
-modals plus exact secret-input authorization. Recovery modals expose Summary,
-complete inert OpenSSH Diagnostics, and
-exact Binding Evidence views. Deny or Cancel has default focus; positive
+modals, an exact secret-input authorization modal, and a separately bound local
+machine-disable modal after all eligible SSH setup attempts are exhausted.
+Recovery modals expose Summary, complete inert OpenSSH Diagnostics, and exact
+Binding Evidence views. Deny, Cancel, or Keep enabled has default focus; positive
 actions are briefly fenced when a modal opens and then require a deliberate
 button action. Escape, quitting, UI failure, or shutdown denies unresolved
 prompts. An approved secret-input decision suspends the TUI, restores the normal
 terminal, and gives a trusted external tmux viewer direct ownership; the TUI
 resumes with a full redraw on every return or failure path and never receives
-the typed secret bytes. Machine-disable decisions remain unavailable in the
-TUI. The TUI also
-refuses redirected/mismatched terminal input and output or a background process
-group instead of silently falling back to plain mode.
+the typed secret bytes. The TUI continually revalidates foreground ownership
+and refuses redirected/mismatched terminal input and output, terminal loss, or
+a background process group. Initialization or runtime failure stops the unified
+application without changing approval policy or starting a plain replacement;
+after inspecting the error, restart explicitly with `tmuxgate --plain`.
 
 The recommended `./install.sh` workflow has already registered this endpoint
 with Codex and installed the token loader. Start tmuxgate in one terminal,
@@ -390,18 +414,20 @@ Both screens are implemented behind a presentation-independent operator
 interface. Execution, SSH-retry, fallback, and machine-disable prompts carry
 their complete internal request/connection bindings through an exactly-once
 FIFO decision queue; broker and executor workers do not parse terminal text.
-Closing or failing either interface denies all unresolved prompts. The visible
-line-oriented interface and `/dev/tty` trust boundary remain the production
-defaults. The opt-in Textual interface renders bounded structured activity and
+Closing or failing either interface denies all unresolved prompts. The
+line-oriented interface retains the same `/dev/tty` trust boundary when chosen
+with `--plain`. The default Textual interface renders bounded structured activity and
 runtime snapshots with markup disabled and control characters escaped, uses a
-fixed dashboard widget tree, and marshals every supported prompt to its own
+fixed dashboard widget tree, and marshals every structured prompt to its own
 exact modal on the UI thread. Modal documents use three fixed scrollable
 widgets regardless
 of content length. Textual enters the alternate screen only after
 foreground-terminal validation and relies on its driver cleanup to restore
 terminal contents and modes on every exit path. Its explicit TUI, modal, and
 external ownership states prevent another reader or modal from competing with
-an authorized external viewer.
+an authorized external viewer. Foreground ownership is re-proved on each
+dashboard refresh, and a terminal below 72×20 hides evidence and disables the
+positive action while leaving the safe action visible.
 
 Remote password-like pane text is notification only. Before tmuxgate attaches
 the broker terminal to a detached viewer, a separate card identifies the full
