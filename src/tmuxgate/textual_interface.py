@@ -24,6 +24,9 @@ from .approval import (
     render_approval_document,
     render_approval_summary,
     render_code_document,
+    render_fallback_approval_document,
+    render_openssh_diagnostics,
+    render_ssh_retry_document,
 )
 from .operator_interface import (
     ActivityKind,
@@ -34,6 +37,8 @@ from .operator_interface import (
     OperatorPrompt,
     PlainTerminalInterface,
     QueuedPrompt,
+    RouteFallbackPrompt,
+    SshRetryPrompt,
 )
 from .terminal import TerminalArbiter
 
@@ -293,6 +298,244 @@ class ExecutionApprovalScreen(ModalScreen[ApprovalDecision]):
             self._finish(ApprovalDecision.APPROVED)
 
 
+class RecoveryDecisionScreen(ModalScreen[ApprovalDecision]):
+    """Shared safe mechanics for exact retry and fallback recovery prompts."""
+
+    CSS = """
+    SshRetryScreen, RouteFallbackScreen {
+        align: center middle;
+        background: $background 80%;
+    }
+    #recovery-dialog {
+        width: 100%;
+        max-width: 110;
+        height: 100%;
+        border: heavy $warning;
+        background: $surface;
+        padding: 1 2;
+    }
+    #recovery-heading { height: 3; text-style: bold; }
+    #recovery-views { height: 1fr; }
+    .recovery-document { height: 1fr; overflow: auto; padding: 1; }
+    #recovery-actions { height: 3; align-horizontal: right; }
+    #recovery-actions Button { margin-left: 1; min-width: 14; }
+    """
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("s", "show_view('recovery-summary')", "Summary"),
+        Binding("d", "show_view('recovery-diagnostics')", "Diagnostics"),
+        Binding("b", "show_view('recovery-binding')", "Binding evidence"),
+    ]
+
+    def __init__(self, prompt: SshRetryPrompt | RouteFallbackPrompt) -> None:
+        if not isinstance(prompt, (SshRetryPrompt, RouteFallbackPrompt)):
+            raise TypeError("prompt must be an SSH retry or route fallback prompt")
+        super().__init__()
+        self.prompt = prompt
+        self._armed = False
+        self._finished = False
+
+    def _summary(self) -> tuple[str, str, str]:
+        prompt = self.prompt
+        safe = inert_text
+        endpoints = {
+            item.resolved.endpoint_id: item.resolved
+            for item in prompt.connection_plan.endpoints
+        }
+        if isinstance(prompt, SshRetryPrompt):
+            endpoint = endpoints[prompt.endpoint_id]
+            heading = "SSH setup retry"
+            approve_label = "Retry once"
+            summary = "\n".join(
+                (
+                    f"Request ID: {safe(prompt.request_id)}",
+                    f"Machine: {safe(prompt.request.machine_alias)}",
+                    f"Endpoint: {safe(prompt.endpoint_id)}",
+                    "Target: "
+                    f"{safe(endpoint.configured_address)}:"
+                    f"{safe(endpoint.configured_port)}",
+                    "Resolved identity: "
+                    f"{safe(endpoint.resolved_user)}@"
+                    f"{safe(endpoint.resolved_hostname)}:"
+                    f"{safe(endpoint.resolved_port)}",
+                    f"Failure: {safe(prompt.failure_detail)}",
+                    f"Remote command: {safe(prompt.remote_command_state.value)}",
+                    f"Remote mutation: {safe(prompt.remote_mutation_state.value)}",
+                    "Permitted retry: "
+                    f"{safe(prompt.retry_number)} of {safe(prompt.retry_limit)}",
+                    "Cancel is the safe default.",
+                )
+            )
+        else:
+            failed = endpoints[prompt.failed_endpoint_id]
+            fallback = endpoints[prompt.fallback_endpoint_id]
+            heading = "Separate route fallback authorization"
+            approve_label = "Use fallback"
+            summary = "\n".join(
+                (
+                    f"Request ID: {safe(prompt.request_id)}",
+                    f"Machine: {safe(prompt.request.machine_alias)}",
+                    f"Failed route: {safe(prompt.failed_endpoint_id)} "
+                    f"({safe(failed.configured_address)}:"
+                    f"{safe(failed.configured_port)})",
+                    "Failed identity: "
+                    f"{safe(failed.resolved_user)}@"
+                    f"{safe(failed.resolved_hostname)}:"
+                    f"{safe(failed.resolved_port)}",
+                    f"Failure: {safe(prompt.failure_detail)}",
+                    f"Proposed route: {safe(prompt.fallback_endpoint_id)} "
+                    f"({safe(fallback.configured_address)}:"
+                    f"{safe(fallback.configured_port)})",
+                    "Proposed identity: "
+                    f"{safe(fallback.resolved_user)}@"
+                    f"{safe(fallback.resolved_hostname)}:"
+                    f"{safe(fallback.resolved_port)}",
+                    f"Remote command: {safe(prompt.remote_command_state.value)}",
+                    f"Remote mutation: {safe(prompt.remote_mutation_state.value)}",
+                    "A separate decision is required because the original RUN "
+                    "approval does not authorize route fallback.",
+                    "Cancel is the safe default.",
+                )
+            )
+        return heading, approve_label, summary
+
+    def _binding_document(self) -> str:
+        prompt = self.prompt
+        if isinstance(prompt, SshRetryPrompt):
+            return render_ssh_retry_document(
+                prompt.request_id,
+                prompt.request,
+                prompt.connection_plan,
+                endpoint_id=prompt.endpoint_id,
+                failure_detail=prompt.failure_detail,
+                remote_mutation_started=False,
+                openssh_diagnostics=prompt.openssh_diagnostics,
+                openssh_diagnostics_sha256=prompt.openssh_diagnostics_sha256,
+                remote_command_state=prompt.remote_command_state.value,
+                retry_number=prompt.retry_number,
+                retry_limit=prompt.retry_limit,
+                retry_binding_sha256=prompt.retry_binding_sha256,
+                prompt_id=prompt.prompt_id,
+            )
+        return render_fallback_approval_document(
+            prompt.request_id,
+            prompt.request,
+            prompt.connection_plan,
+            failed_endpoint_id=prompt.failed_endpoint_id,
+            fallback_endpoint_id=prompt.fallback_endpoint_id,
+            failure_detail=prompt.failure_detail,
+            remote_mutation_started=False,
+            openssh_diagnostics=prompt.openssh_diagnostics,
+            openssh_diagnostics_sha256=prompt.openssh_diagnostics_sha256,
+            remote_command_state=prompt.remote_command_state.value,
+            fallback_binding_sha256=prompt.fallback_binding_sha256,
+            prompt_id=prompt.prompt_id,
+        )
+
+    def compose(self) -> ComposeResult:
+        heading, approve_label, summary = self._summary()
+        prompt = self.prompt
+        diagnostics = (
+            f"OpenSSH diagnostics SHA-256: "
+            f"{prompt.openssh_diagnostics_sha256}\n"
+            f"Exact byte length: {len(prompt.openssh_diagnostics)}\n\n"
+            + render_openssh_diagnostics(prompt.openssh_diagnostics)
+        )
+        with Vertical(id="recovery-dialog"):
+            yield Static(
+                heading + "\nRequest ID: " + inert_text(prompt.request_id),
+                markup=False,
+                id="recovery-heading",
+            )
+            with TabbedContent(initial="recovery-summary", id="recovery-views"):
+                with TabPane("Summary", id="recovery-summary"):
+                    yield Static(
+                        summary,
+                        markup=False,
+                        classes="recovery-document",
+                        id="recovery-summary-document",
+                    )
+                with TabPane("Diagnostics", id="recovery-diagnostics"):
+                    yield Static(
+                        diagnostics,
+                        markup=False,
+                        classes="recovery-document",
+                        id="recovery-diagnostics-document",
+                    )
+                with TabPane("Binding Evidence", id="recovery-binding"):
+                    yield Static(
+                        self._binding_document(),
+                        markup=False,
+                        classes="recovery-document",
+                        id="recovery-binding-document",
+                    )
+            with Horizontal(id="recovery-actions"):
+                yield Button("Cancel", variant="error", id="recovery-cancel")
+                yield Button(
+                    approve_label,
+                    variant="warning",
+                    id="recovery-approve",
+                    disabled=True,
+                )
+
+    def on_mount(self) -> None:
+        self.call_after_refresh(self._initialize_controls)
+
+    def _initialize_controls(self) -> None:
+        self.query_one("#recovery-cancel", Button).focus()
+        if not self.app.is_headless:
+            try:
+                flush_textual_input()
+            except OperatorInterfaceError:
+                self._finish(ApprovalDecision.DENIED)
+                return
+        self.set_timer(APPROVAL_ARM_SECONDS, self._arm_decision)
+
+    def _arm_decision(self) -> None:
+        if self._finished:
+            return
+        self.query_one("#recovery-cancel", Button).focus()
+        self._armed = True
+        self.query_one("#recovery-approve", Button).disabled = False
+
+    def action_show_view(self, view_id: str) -> None:
+        self.query_one("#recovery-views", TabbedContent).active = view_id
+
+    def action_cancel(self) -> None:
+        self._finish(ApprovalDecision.DENIED)
+
+    def _finish(self, decision: ApprovalDecision) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self.dismiss(decision)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "recovery-cancel":
+            self._finish(ApprovalDecision.DENIED)
+        elif event.button.id == "recovery-approve" and self._armed:
+            self._finish(ApprovalDecision.APPROVED)
+
+
+class SshRetryScreen(RecoveryDecisionScreen):
+    """Focused bounded-retry decision for one exact SSH failure."""
+
+    def __init__(self, prompt: SshRetryPrompt) -> None:
+        if not isinstance(prompt, SshRetryPrompt):
+            raise TypeError("prompt must be an SshRetryPrompt")
+        super().__init__(prompt)
+
+
+class RouteFallbackScreen(RecoveryDecisionScreen):
+    """Separate authorization for one exact adjacent fallback route."""
+
+    def __init__(self, prompt: RouteFallbackPrompt) -> None:
+        if not isinstance(prompt, RouteFallbackPrompt):
+            raise TypeError("prompt must be a RouteFallbackPrompt")
+        super().__init__(prompt)
+
+
 class TmuxgateDashboardApp(App[None]):
     """Bounded dashboard with one request-bound approval modal at a time."""
 
@@ -334,6 +577,7 @@ class TmuxgateDashboardApp(App[None]):
         self.snapshot_failure: BaseException | None = None
         self.minimum_size = False
         self._active_approval: QueuedPrompt | None = None
+        self._active_decision: QueuedPrompt | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -380,9 +624,10 @@ class TmuxgateDashboardApp(App[None]):
                     "d  dashboard    j  jobs       m  machines\n"
                     "a  activity     r  requests   ?  help\n"
                     "q  stop tmuxgate\n\n"
-                    "Execution approvals open one at a time with Deny as the "
-                    "safe default. Retry, fallback, machine-disable, and "
-                    "secret-input decisions remain unavailable in this phase.",
+                    "Execution approvals, bounded SSH retries, and separate "
+                    "route fallbacks open one at a time with a safe default. "
+                    "Machine-disable and secret-input decisions remain "
+                    "unavailable in this phase.",
                     markup=False,
                     classes="panel",
                 )
@@ -426,18 +671,35 @@ class TmuxgateDashboardApp(App[None]):
     def present_execution_approval(self, queued: QueuedPrompt) -> None:
         """Push an exact prompt from the presenter thread onto the UI thread."""
 
-        if not isinstance(queued.prompt, ExecutionApprovalPrompt):
+        self.present_operator_decision(queued)
+
+    def present_operator_decision(self, queued: QueuedPrompt) -> None:
+        """Present one exact supported prompt without reconstructing identity."""
+
+        if not isinstance(
+            queued.prompt,
+            (ExecutionApprovalPrompt, SshRetryPrompt, RouteFallbackPrompt),
+        ):
             queued.pending.deny()
             return
-        if self._active_approval is not None:
+        if self._active_decision is not None:
             queued.pending.deny()
             return
+        self._active_decision = queued
         self._active_approval = queued
 
         def complete(result: ApprovalDecision | None) -> None:
-            self._complete_execution_approval(queued, result)
+            self._complete_operator_decision(queued, result)
 
-        self.push_screen(ExecutionApprovalScreen(queued.prompt), complete)
+        if isinstance(queued.prompt, ExecutionApprovalPrompt):
+            screen: ModalScreen[ApprovalDecision] = ExecutionApprovalScreen(
+                queued.prompt
+            )
+        elif isinstance(queued.prompt, SshRetryPrompt):
+            screen = SshRetryScreen(queued.prompt)
+        else:
+            screen = RouteFallbackScreen(queued.prompt)
+        self.push_screen(screen, complete)
 
     def _complete_execution_approval(
         self,
@@ -446,8 +708,18 @@ class TmuxgateDashboardApp(App[None]):
     ) -> None:
         """Resolve only the immutable queued item that owns the active modal."""
 
-        if self._active_approval is not queued:
+        self._complete_operator_decision(queued, result)
+
+    def _complete_operator_decision(
+        self,
+        queued: QueuedPrompt,
+        result: ApprovalDecision | None,
+    ) -> None:
+        """Resolve only the immutable queued item that owns the active modal."""
+
+        if self._active_decision is not queued:
             return
+        self._active_decision = None
         self._active_approval = None
         decision = (
             result if isinstance(result, ApprovalDecision) else ApprovalDecision.DENIED
@@ -482,6 +754,28 @@ class TmuxgateDashboardApp(App[None]):
             if snapshot.active_job_count is None
             else snapshot.active_job_count
         )
+        latest_connections: dict[str, OperationalActivity] = {}
+        for event in self.interface.activity_history:
+            if (
+                event.kind is ActivityKind.CONNECTION
+                and event.request_id is not None
+            ):
+                latest_connections[event.request_id] = event
+        connection_lines = [
+            f"{request_id[:8]}={event.connection_phase.value}"
+            + (
+                f"@{inert_text(event.endpoint_id)}"
+                if event.endpoint_id is not None
+                else ""
+            )
+            + (
+                f" mutation={event.remote_mutation_state.value}"
+                if event.remote_mutation_state is not None
+                else ""
+            )
+            for request_id, event in latest_connections.items()
+            if event.connection_phase is not None
+        ]
         lines = [
             "Application readiness: " + ("ready" if snapshot.ready else "starting"),
             "Broker readiness: " + ("ready" if snapshot.ready else "starting"),
@@ -498,6 +792,8 @@ class TmuxgateDashboardApp(App[None]):
                 )
                 or "none"
             ),
+            "Request connection progress: "
+            + inert_text(", ".join(connection_lines) or "none"),
             f"Recent activity: {len(self.interface.activity_history)} "
             f"(bounded to {self.interface.activity_capacity})",
             "Terminal ownership: " + inert_text(snapshot.terminal_owner),
@@ -532,10 +828,17 @@ class TmuxgateDashboardApp(App[None]):
 
     def _render_activity(self, activity: tuple[OperationalActivity, ...]) -> None:
         bounded = activity[-MAX_RENDERED_ACTIVITY:]
-        lines = [
-            f"{inert_text(event.kind.value):12} {inert_text(event.message)}"
-            for event in bounded
-        ]
+        lines = []
+        for event in bounded:
+            phase = (
+                f"/{event.connection_phase.value}"
+                if event.connection_phase is not None
+                else ""
+            )
+            lines.append(
+                f"{inert_text(event.kind.value + phase):24} "
+                f"{inert_text(event.message)}"
+            )
         if not lines:
             lines.append("No recent activity.")
         self.query_one("#activity-content", Static).update(self._text(lines))
@@ -660,10 +963,24 @@ class TextualOperatorInterface(PlainTerminalInterface):
             self._queued.append(queued)
             self._pending_prompt_count += 1
         if isinstance(prompt, ExecutionApprovalPrompt):
+            message = "Execution approval is waiting for an explicit decision."
+        elif isinstance(prompt, SshRetryPrompt):
+            message = (
+                "One bounded same-endpoint SSH retry is waiting for an exact "
+                "decision."
+            )
+        elif isinstance(prompt, RouteFallbackPrompt):
+            message = (
+                "A separately bound route fallback is waiting for an exact "
+                "decision."
+            )
+        else:
+            message = None
+        if message is not None:
             self.publish_activity(
                 OperationalActivity.create(
                     ActivityKind.STATUS,
-                    "Execution approval is waiting for an explicit decision.",
+                    message,
                     request_id=prompt.request_id,
                     machine_name=prompt.request.machine_alias,
                 )
@@ -685,7 +1002,10 @@ class TextualOperatorInterface(PlainTerminalInterface):
             if queued.pending.resolved:
                 continue
             try:
-                if not isinstance(queued.prompt, ExecutionApprovalPrompt):
+                if not isinstance(
+                    queued.prompt,
+                    (ExecutionApprovalPrompt, SshRetryPrompt, RouteFallbackPrompt),
+                ):
                     queued.pending.deny()
                     self.publish_activity(
                         OperationalActivity.create(
@@ -703,7 +1023,7 @@ class TextualOperatorInterface(PlainTerminalInterface):
                         app = self._active_app
                     if app is None:
                         continue
-                    app.call_from_thread(app.present_execution_approval, queued)
+                    app.call_from_thread(app.present_operator_decision, queued)
                     break
                 queued.pending.wait()
             except BaseException as exc:

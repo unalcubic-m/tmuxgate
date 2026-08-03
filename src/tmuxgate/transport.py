@@ -20,7 +20,11 @@ import threading
 import time
 from typing import Protocol
 
-from tmuxgate.approval import ApprovalDecision, approval_binding_sha256
+from tmuxgate.approval import (
+    ApprovalDecision,
+    MAX_OPENSSH_DIAGNOSTIC_BYTES,
+    approval_binding_sha256,
+)
 from tmuxgate.connection_plan import ConnectionPlan, PlannedEndpoint
 from tmuxgate.models import RequestSpec, validate_alias, validate_request_id
 from tmuxgate.runtime import ensure_private_directory
@@ -62,14 +66,21 @@ class KeyEnrollmentOutcome(StrEnum):
 class SshMasterStartError(TransportError):
     """Interactive OpenSSH exited before an authenticated master was ready."""
 
-    def __init__(self, returncode: int) -> None:
+    def __init__(self, returncode: int, diagnostics: bytes = b"") -> None:
         if type(returncode) is not int:
             raise TypeError("SSH master return code must be an integer")
+        if not isinstance(diagnostics, bytes):
+            raise TypeError("OpenSSH diagnostics must be bytes")
+        if len(diagnostics) > MAX_OPENSSH_DIAGNOSTIC_BYTES:
+            raise ValueError(
+                f"OpenSSH diagnostics exceed {MAX_OPENSSH_DIAGNOSTIC_BYTES} bytes"
+            )
         self.returncode = returncode
+        self.diagnostics = diagnostics
+        self.diagnostics_sha256 = hashlib.sha256(diagnostics).hexdigest()
         super().__init__(
             "approved SSH master setup exited with status "
-            f"{returncode} before remote execution; review the OpenSSH "
-            "diagnostic printed in the broker terminal"
+            f"{returncode} before remote execution"
         )
 
 

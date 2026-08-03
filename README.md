@@ -233,18 +233,18 @@ unified application. Stop it from the dashboard or with `Ctrl-C`; do not start
 a separate MCP process.
 
 The established line-oriented interface remains the production default.
-`tmuxgate --plain` selects it explicitly. `tmuxgate --tui` starts the phase-three
+`tmuxgate --plain` selects it explicitly. `tmuxgate --tui` starts the phase-four
 Textual preview, which provides keyboard-accessible Dashboard, Jobs, Machines,
 Activity, queued-request, and Help views plus request-bound execution-approval
-modals. Each modal has independently scrollable Summary, Code, and Technical
-Details views. Deny has default focus; Approve is briefly fenced when a modal
-opens so buffered input cannot approve it, and then requires a deliberate
+modals, bounded SSH-retry modals, and separately authorized route-fallback
+modals. Recovery modals expose Summary, complete inert OpenSSH Diagnostics, and
+exact Binding Evidence views. Deny or Cancel has default focus; positive
+actions are briefly fenced when a modal opens and then require a deliberate
 button action. Escape, quitting, UI failure, or shutdown denies unresolved
-prompts. SSH retry, route fallback, machine-disable, and secret-input decisions
-remain unavailable in the TUI and fail closed in this phase; use `--plain` for
-those paths. The TUI also refuses redirected/mismatched terminal input and
-output or a background process group instead of silently falling back to plain
-mode.
+prompts. Machine-disable and secret-input decisions remain unavailable in the
+TUI and fail closed in this phase; use `--plain` for those paths. The TUI also
+refuses redirected/mismatched terminal input and output or a background process
+group instead of silently falling back to plain mode.
 
 The recommended `./install.sh` workflow has already registered this endpoint
 with Codex and installed the token loader. Start tmuxgate in one terminal,
@@ -390,8 +390,9 @@ Closing or failing either interface denies all unresolved prompts. The visible
 line-oriented interface and `/dev/tty` trust boundary remain the production
 defaults. The opt-in Textual interface renders bounded structured activity and
 runtime snapshots with markup disabled and control characters escaped, uses a
-fixed dashboard widget tree, and marshals execution prompts to one exact modal
-on the UI thread. Modal documents use three fixed scrollable widgets regardless
+fixed dashboard widget tree, and marshals every supported prompt to its own
+exact modal on the UI thread. Modal documents use three fixed scrollable
+widgets regardless
 of content length. Textual enters the alternate screen only after
 foreground-terminal validation and relies on its driver cleanup to restore
 terminal contents and modes on every exit path.
@@ -405,10 +406,12 @@ trusted terminal. This authorization remains mandatory when
 `tmuxgate attach REQUEST_ID` remains available for deliberate manual
 interaction.
 
-If initial OpenSSH master setup exits, tmuxgate leaves OpenSSH's diagnostic in
-that controlling terminal, reports its exit status without copying terminal
-output into MCP or durable state, and offers at most one exact broker-terminal
-retry for each attempted approved endpoint before any remote command starts.
+If initial OpenSSH master setup exits, tmuxgate captures bounded complete stderr
+diagnostics as exact bytes for the structured operator decision without copying
+them into MCP or durable state. The plain and Textual views render those bytes
+inertly and expose their SHA-256 and exact hexadecimal evidence. At most one
+exact operator-confirmed retry is offered for each attempted approved endpoint
+before any remote command starts; Cancel is the default action.
 The retry recollects local network evidence,
 re-resolves SSH policy, and proceeds only if the approved machine, ordered
 candidate eligibility, eligible endpoint order, and complete resolved SSH

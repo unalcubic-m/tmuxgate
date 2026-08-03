@@ -27,9 +27,13 @@ from tmuxgate.approval import ApprovalDecision
 from tmuxgate.models import ExecutionMode, RequestSpec
 from tmuxgate.operator_interface import (
     ActivityKind,
+    ConnectionPhase,
     ExecutionApprovalPrompt,
     OperationalActivity,
     OperatorInterfaceError,
+    RemoteMutationState,
+    RouteFallbackPrompt,
+    SshRetryPrompt,
 )
 from tmuxgate.textual_interface import (
     APPROVAL_ARM_SECONDS,
@@ -41,6 +45,8 @@ from tmuxgate.textual_interface import (
     MAX_DASHBOARD_MACHINES,
     MINIMUM_COLUMNS,
     MINIMUM_ROWS,
+    RouteFallbackScreen,
+    SshRetryScreen,
     TextualOperatorInterface,
     TmuxgateDashboardApp,
     flush_textual_input,
@@ -112,6 +118,21 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                     return screen
             await pilot.pause(0.02)
         raise AssertionError("matching execution approval modal did not open")
+
+    @staticmethod
+    async def _wait_for_recovery(app, pilot, screen_type, expected_prompt):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if isinstance(app.screen, screen_type):
+                screen = app.screen
+                if (
+                    screen.prompt.prompt_id == expected_prompt.prompt_id
+                    and len(list(screen.query("#recovery-views"))) == 1
+                    and len(list(screen.query("#recovery-cancel:focus"))) == 1
+                ):
+                    return screen
+            await pilot.pause(0.02)
+        raise AssertionError("matching recovery modal did not open")
 
     def test_terminal_ownership_validation_fails_closed(self):
         stdin = mock.Mock()
@@ -323,6 +344,157 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 self.assertTrue(app.query_one("#views", TabbedContent).display)
 
         asyncio.run(exercise())
+
+    def test_connection_progress_replaces_request_projection_in_place(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        for phase in (
+            ConnectionPhase.CONNECTING,
+            ConnectionPhase.RUNNING,
+            ConnectionPhase.COMPLETED,
+        ):
+            interface.publish_activity(
+                OperationalActivity.create(
+                    ActivityKind.CONNECTION,
+                    f"phase {phase.value}",
+                    request_id=REQUEST_ID,
+                    machine_name="app-server",
+                    endpoint_id="home-lan",
+                    connection_phase=phase,
+                    remote_mutation_state=(
+                        RemoteMutationState.NOT_STARTED
+                        if phase is ConnectionPhase.CONNECTING
+                        else RemoteMutationState.STARTED
+                    ),
+                )
+            )
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                dashboard = app.query_one("#dashboard-content", Static).render().plain
+                progress = next(
+                    line
+                    for line in dashboard.splitlines()
+                    if line.startswith("Request connection progress:")
+                )
+                self.assertIn("01234567=completed@home-lan", progress)
+                self.assertNotIn("connecting", progress)
+                self.assertNotIn("running", progress)
+                self.assertEqual(progress.count("01234567="), 1)
+
+        asyncio.run(exercise())
+
+    def test_retry_and_fallback_modals_are_exact_safe_and_separate(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        plan = build_plan()
+        request = RequestSpec(
+            "app-server",
+            ExecutionMode.ARGV,
+            "/srv/app",
+            argv=("true",),
+        )
+        diagnostics = b"[bold]literal[/bold]\x1b]8;;https://evil.invalid\x07\n"
+        retry = SshRetryPrompt.create(
+            REQUEST_ID,
+            request,
+            plan,
+            endpoint_id="home-lan",
+            failure_detail="OpenSSH exited with status 255\ninjected label",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+            openssh_diagnostics=diagnostics,
+        )
+        fallback = RouteFallbackPrompt.create(
+            REQUEST_ID,
+            request,
+            plan,
+            failed_endpoint_id="home-lan",
+            fallback_endpoint_id="wireguard",
+            failure_detail="same endpoint retry was cancelled",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+            openssh_diagnostics=diagnostics,
+        )
+        decisions: dict[str, ApprovalDecision] = {}
+
+        def decide(item):
+            method = (
+                interface.request_ssh_retry
+                if isinstance(item, SshRetryPrompt)
+                else interface.request_fallback
+            )
+            decisions[item.prompt_id] = method(item).decision
+
+        first = threading.Thread(target=decide, args=(retry,))
+        second = threading.Thread(target=decide, args=(fallback,))
+        first.start()
+        while interface.pending_prompt_count < 1:
+            time.sleep(0.01)
+        second.start()
+        while interface.pending_prompt_count < 2:
+            time.sleep(0.01)
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                retry_screen = await self._wait_for_recovery(
+                    app, pilot, SshRetryScreen, retry
+                )
+                self.assertTrue(
+                    retry_screen.query_one("#recovery-cancel", Button).has_focus
+                )
+                summary = retry_screen.query_one(
+                    "#recovery-summary-document", Static
+                ).render().plain
+                self.assertIn("Permitted retry: 1 of 1", summary)
+                self.assertIn("Remote command: not_started", summary)
+                self.assertIn(r"\x0ainjected label", summary)
+                diagnostics_text = retry_screen.query_one(
+                    "#recovery-diagnostics-document", Static
+                ).render().plain
+                binding = retry_screen.query_one(
+                    "#recovery-binding-document", Static
+                ).render().plain
+                self.assertNotIn("\x1b", diagnostics_text)
+                self.assertIn(r"\x1b", diagnostics_text)
+                self.assertIn(retry.retry_binding_sha256, binding)
+                await pilot.press("x")
+                await pilot.pause()
+                self.assertTrue(first.is_alive())
+                await pilot.press("enter")
+
+                fallback_screen = await self._wait_for_recovery(
+                    app, pilot, RouteFallbackScreen, fallback
+                )
+                fallback_summary = fallback_screen.query_one(
+                    "#recovery-summary-document", Static
+                ).render().plain
+                self.assertIn("Failed route: home-lan", fallback_summary)
+                self.assertIn(
+                    "Failed identity: operator@192.0.2.20:22",
+                    fallback_summary,
+                )
+                self.assertIn("Proposed route: wireguard", fallback_summary)
+                self.assertIn("original RUN approval", fallback_summary)
+                fallback_binding = fallback_screen.query_one(
+                    "#recovery-binding-document", Static
+                ).render().plain
+                self.assertIn(fallback.fallback_binding_sha256, fallback_binding)
+                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                self.assertTrue(await pilot.click("#recovery-approve"))
+
+        asyncio.run(exercise())
+        first.join(timeout=1)
+        second.join(timeout=1)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertIs(decisions[retry.prompt_id], ApprovalDecision.DENIED)
+        self.assertIs(decisions[fallback.prompt_id], ApprovalDecision.APPROVED)
 
     def test_execution_approval_views_resize_and_explicit_decisions(self):
         interface = TextualOperatorInterface(

@@ -24,7 +24,12 @@ from tmuxgate.operator_interface import (
     SecretInputRecipient,
     require_operator_decision,
 )
-from tmuxgate.transport import SshInvocation, SshMasterStartError, TransportError
+from tmuxgate.transport import (
+    MAX_OPENSSH_DIAGNOSTIC_BYTES,
+    SshInvocation,
+    SshMasterStartError,
+    TransportError,
+)
 
 
 MAX_BATCH_OUTPUT_BYTES = 300 * 1024 * 1024
@@ -150,32 +155,26 @@ class SubprocessMasterBackend:
             raise TransportError("master start has an invalid terminal policy")
         with self.terminal_lock:
             with self.terminal_opener("/dev/tty", "r+b", buffering=0) as terminal:
-                if expected_interactive:
-                    terminal.write(
-                        b"\r\n[tmuxgate] Establishing the approved enrollment "
-                        b"connection. Complete any OpenSSH prompt below; this "
-                        b"connection can only inspect or enroll the dedicated "
-                        b"tmuxgate key, and no requested command has started.\r\n"
-                    )
-                else:
-                    terminal.write(
-                        b"\r\n[tmuxgate] Establishing the public-key-only SSH "
-                        b"connection; no requested command has started.\r\n"
-                    )
-                terminal.flush()
                 completed = self.runner(
                     invocation.argv,
                     stdin=terminal,
                     stdout=terminal,
-                    stderr=terminal,
+                    stderr=subprocess.PIPE,
                     check=False,
                     env=_safe_environment(),
                 )
         returncode = getattr(completed, "returncode", None)
         if type(returncode) is not int:
             raise TransportError("interactive SSH master runner returned no exit status")
+        diagnostics = getattr(completed, "stderr", None)
+        if not isinstance(diagnostics, bytes):
+            raise TransportError("interactive SSH master returned invalid diagnostics")
+        if len(diagnostics) > MAX_OPENSSH_DIAGNOSTIC_BYTES:
+            raise TransportError(
+                "OpenSSH diagnostics exceeded the structured interface limit"
+            )
         if returncode != 0:
-            raise SshMasterStartError(returncode)
+            raise SshMasterStartError(returncode, diagnostics)
 
     def _control(self, invocation: SshInvocation, label: str) -> bool:
         completed = _run_completed(

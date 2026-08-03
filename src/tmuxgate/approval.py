@@ -29,6 +29,7 @@ CONTROLLING_TTY_PATH = "/dev/tty"
 DEFAULT_PAGER_THRESHOLD_BYTES = 64 * 1024
 SCRIPT_RENDER_CHUNK_BYTES = 256
 INLINE_SCRIPT_BYTES = 2048
+MAX_OPENSSH_DIAGNOSTIC_BYTES = 1024 * 1024
 _DEFAULT_PAGER = object()
 _LESS_PATHS = (Path("/usr/bin/less"), Path("/bin/less"))
 _PAGER_LOCALE_KEYS = ("COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TERM")
@@ -150,6 +151,37 @@ def _terminal_safe_document(lines: list[str]) -> str:
             "approval renderer produced a non-printable terminal character"
         )
     return document
+
+
+def render_openssh_diagnostics(diagnostics: bytes) -> str:
+    """Render every diagnostic byte inertly while retaining exact evidence."""
+
+    if not isinstance(diagnostics, bytes):
+        raise TypeError("OpenSSH diagnostics must be bytes")
+    if len(diagnostics) > MAX_OPENSSH_DIAGNOSTIC_BYTES:
+        raise ApprovalError(
+            f"OpenSSH diagnostics exceed {MAX_OPENSSH_DIAGNOSTIC_BYTES} bytes"
+        )
+    return "".join(
+        chr(value) if 0x20 <= value <= 0x7E else f"\\x{value:02x}"
+        for value in diagnostics
+    )
+
+
+def _require_hex_evidence(
+    value: str | None,
+    *,
+    field_name: str,
+    length: int,
+) -> None:
+    if value is None:
+        return
+    if (
+        not isinstance(value, str)
+        or len(value) != length
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ApprovalError(f"{field_name} is invalid")
 
 
 def _canonical_sha256(document: dict[str, object]) -> str:
@@ -882,12 +914,19 @@ def render_fallback_approval_document(
     fallback_endpoint_id: str,
     failure_detail: str,
     remote_mutation_started: bool,
+    openssh_diagnostics: bytes = b"",
+    openssh_diagnostics_sha256: str | None = None,
+    remote_command_state: str = "not_started",
+    fallback_binding_sha256: str | None = None,
+    prompt_id: str | None = None,
 ) -> str:
     """Render a new, exact fallback decision; never reuse the RUN approval."""
 
     request_id = validate_request_id(request_id)
     if remote_mutation_started:
         raise ApprovalError("fallback is forbidden after remote mutation has started")
+    if remote_command_state != "not_started":
+        raise ApprovalError("fallback is forbidden after the remote command may start")
     if not isinstance(failure_detail, str) or "\x00" in failure_detail:
         raise ApprovalError("fallback failure detail must be valid text")
     approval_binding_sha256(request_id, request, connection_plan)
@@ -905,6 +944,20 @@ def render_fallback_approval_document(
             "request_id": request_id,
         }
     )
+    diagnostic_digest = hashlib.sha256(openssh_diagnostics).hexdigest()
+    if (
+        openssh_diagnostics_sha256 is not None
+        and openssh_diagnostics_sha256 != diagnostic_digest
+    ):
+        raise ApprovalError("OpenSSH diagnostic digest does not match exact bytes")
+    _require_hex_evidence(
+        fallback_binding_sha256,
+        field_name="fallback binding digest",
+        length=64,
+    )
+    _require_hex_evidence(prompt_id, field_name="prompt ID", length=32)
+    if fallback_binding_sha256 is not None:
+        fallback_binding = fallback_binding_sha256
     old = failed.resolved
     new = fallback.resolved
     return _terminal_safe_document(
@@ -916,13 +969,22 @@ def render_fallback_approval_document(
             f"fallback_binding_sha256: {fallback_binding}",
             f"failed_endpoint_id: {_quoted_text(old.endpoint_id)}",
             f"failed_target: {_quoted_text(old.configured_address)}:{old.configured_port}",
+            "failed_resolved_identity: "
+            f"{_quoted_text(old.resolved_user)}@"
+            f"{_quoted_text(old.resolved_hostname)}:{old.resolved_port}",
             f"failure_detail: {_quoted_text(failure_detail)}",
+            f"remote_command_state: {remote_command_state}",
             "remote_mutation_started: false",
             f"fallback_endpoint_id: {_quoted_text(new.endpoint_id)}",
             f"fallback_target: {_quoted_text(new.configured_address)}:{new.configured_port}",
             f"fallback_resolved_identity: {_quoted_text(new.resolved_user)}@{_quoted_text(new.resolved_hostname)}:{new.resolved_port}",
             f"fallback_host_key_alias: {_quoted_text(new.host_key_alias)}",
             f"fallback_host_key_status: {new.host_key_evidence.status}",
+            f"openssh_diagnostics_sha256: {diagnostic_digest}",
+            "openssh_diagnostics_escaped: "
+            + _quoted_text(render_openssh_diagnostics(openssh_diagnostics)),
+            f"openssh_diagnostics_hex: {openssh_diagnostics.hex()}",
+            *((), (f"prompt_id: {prompt_id}",))[prompt_id is not None],
             "A new terminal confirmation is required; the original RUN approval is insufficient.",
             "=== end fallback request ===",
             "",
@@ -971,6 +1033,11 @@ def request_fallback_approval(
     fallback_endpoint_id: str,
     failure_detail: str,
     remote_mutation_started: bool,
+    openssh_diagnostics: bytes = b"",
+    openssh_diagnostics_sha256: str | None = None,
+    remote_command_state: str = "not_started",
+    fallback_binding_sha256: str | None = None,
+    prompt_id: str | None = None,
     terminal: ApprovalTerminal | None = None,
     pager: ApprovalPager | None | object = _DEFAULT_PAGER,
     pager_threshold_bytes: int = DEFAULT_PAGER_THRESHOLD_BYTES,
@@ -985,6 +1052,11 @@ def request_fallback_approval(
         fallback_endpoint_id=fallback_endpoint_id,
         failure_detail=failure_detail,
         remote_mutation_started=remote_mutation_started,
+        openssh_diagnostics=openssh_diagnostics,
+        openssh_diagnostics_sha256=openssh_diagnostics_sha256,
+        remote_command_state=remote_command_state,
+        fallback_binding_sha256=fallback_binding_sha256,
+        prompt_id=prompt_id,
     )
     selected_pager = secure_less_pager if pager is _DEFAULT_PAGER else pager
     if terminal is None:
@@ -1015,12 +1087,21 @@ def render_ssh_retry_document(
     endpoint_id: str,
     failure_detail: str,
     remote_mutation_started: bool,
+    openssh_diagnostics: bytes = b"",
+    openssh_diagnostics_sha256: str | None = None,
+    remote_command_state: str = "not_started",
+    retry_number: int = 1,
+    retry_limit: int = 1,
+    retry_binding_sha256: str | None = None,
+    prompt_id: str | None = None,
 ) -> str:
     """Render one bounded retry decision for the same approved SSH endpoint."""
 
     request_id = validate_request_id(request_id)
     if remote_mutation_started:
         raise ApprovalError("SSH setup retry is forbidden after remote mutation")
+    if remote_command_state != "not_started":
+        raise ApprovalError("SSH retry is forbidden after the remote command may start")
     if not isinstance(failure_detail, str) or "\x00" in failure_detail:
         raise ApprovalError("SSH setup failure detail must be valid text")
     approval_binding_sha256(request_id, request, connection_plan)
@@ -1045,6 +1126,22 @@ def render_ssh_retry_document(
             "ssh_retry_binding_version": 1,
         }
     )
+    diagnostic_digest = hashlib.sha256(openssh_diagnostics).hexdigest()
+    if (
+        openssh_diagnostics_sha256 is not None
+        and openssh_diagnostics_sha256 != diagnostic_digest
+    ):
+        raise ApprovalError("OpenSSH diagnostic digest does not match exact bytes")
+    if retry_number != 1 or retry_limit != 1:
+        raise ApprovalError("SSH retry document must expose the one-retry policy")
+    _require_hex_evidence(
+        retry_binding_sha256,
+        field_name="SSH retry binding digest",
+        length=64,
+    )
+    _require_hex_evidence(prompt_id, field_name="prompt ID", length=32)
+    if retry_binding_sha256 is not None:
+        retry_binding = retry_binding_sha256
     return _terminal_safe_document(
         [
             "=== tmuxgate SSH setup retry ===",
@@ -1061,9 +1158,15 @@ def render_ssh_retry_document(
             f"{resolved.resolved_port}",
             f"failure_detail: {_quoted_text(failure_detail)}",
             f"ssh_retry_binding_sha256: {retry_binding}",
+            f"remote_command_state: {remote_command_state}",
             "remote_mutation_started: false",
-            "No remote command started. OpenSSH printed its diagnostic "
-            "immediately above.",
+            f"permitted_retry: {retry_number} of {retry_limit}",
+            f"openssh_diagnostics_sha256: {diagnostic_digest}",
+            "openssh_diagnostics_escaped: "
+            + _quoted_text(render_openssh_diagnostics(openssh_diagnostics)),
+            f"openssh_diagnostics_hex: {openssh_diagnostics.hex()}",
+            *((), (f"prompt_id: {prompt_id}",))[prompt_id is not None],
+            "No remote command started. Cancel is the safe default.",
             "One broker-terminal-confirmed retry is allowed for this endpoint.",
             "=== end SSH setup retry ===",
             "",
@@ -1078,7 +1181,7 @@ def _read_ssh_retry_decision(
 ) -> ApprovalDecision:
     prompt = (
         "Retry SSH setup once for request "
-        f"{short_id} on endpoint {endpoint_id}? [Y/n] "
+        f"{short_id} on endpoint {endpoint_id}? [y/N] "
     )
     while True:
         _write_all(terminal.writer, prompt)
@@ -1094,10 +1197,10 @@ def _read_ssh_retry_decision(
             raise ApprovalInputError("broker terminal returned non-text retry input")
         response = _line_without_terminal_ending(raw_line).casefold()
         raw_line = ""
-        if response in {"", "y", "yes"}:
+        if response in {"y", "yes"}:
             response = ""
             return ApprovalDecision.APPROVED
-        if response in {"n", "no"}:
+        if response in {"", "n", "no", "cancel"}:
             response = ""
             return ApprovalDecision.DENIED
         response = ""
@@ -1115,6 +1218,13 @@ def request_ssh_retry(
     endpoint_id: str,
     failure_detail: str,
     remote_mutation_started: bool,
+    openssh_diagnostics: bytes = b"",
+    openssh_diagnostics_sha256: str | None = None,
+    remote_command_state: str = "not_started",
+    retry_number: int = 1,
+    retry_limit: int = 1,
+    retry_binding_sha256: str | None = None,
+    prompt_id: str | None = None,
     terminal: ApprovalTerminal | None = None,
 ) -> ApprovalDecision:
     """Ask only the broker terminal for one same-endpoint SSH setup retry."""
@@ -1126,6 +1236,13 @@ def request_ssh_retry(
         endpoint_id=endpoint_id,
         failure_detail=failure_detail,
         remote_mutation_started=remote_mutation_started,
+        openssh_diagnostics=openssh_diagnostics,
+        openssh_diagnostics_sha256=openssh_diagnostics_sha256,
+        remote_command_state=remote_command_state,
+        retry_number=retry_number,
+        retry_limit=retry_limit,
+        retry_binding_sha256=retry_binding_sha256,
+        prompt_id=prompt_id,
     )
     if terminal is None:
         with open_approval_terminal() as opened_terminal:

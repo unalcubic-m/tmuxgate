@@ -8,6 +8,7 @@ from tmuxgate.approval import ApprovalDecision, ApprovalTerminal
 from tmuxgate.models import ExecutionMode, RequestSpec
 from tmuxgate.operator_interface import (
     ActivityKind,
+    ConnectionPhase,
     ExecutionApprovalPrompt,
     OperationalActivity,
     OperatorDecision,
@@ -16,6 +17,7 @@ from tmuxgate.operator_interface import (
     PlainTerminalInterface,
     PromptQueue,
     RemoteMutationState,
+    RemoteCommandState,
     RouteFallbackPrompt,
     SecretInputAuthorizationPrompt,
     SecretInputRecipient,
@@ -103,6 +105,7 @@ class StructuredPromptTests(unittest.TestCase):
             )
 
     def test_retry_rejects_missing_endpoint_mutation_and_binding_mismatch(self):
+        diagnostics = b"ssh: denied\x1b]8;;https://evil.invalid\x07\n"
         prompt = SshRetryPrompt.create(
             REQUEST_ID,
             self.request,
@@ -110,7 +113,12 @@ class StructuredPromptTests(unittest.TestCase):
             endpoint_id="home-lan",
             failure_detail="OpenSSH exited with status 255",
             remote_mutation_state=RemoteMutationState.NOT_STARTED,
+            openssh_diagnostics=diagnostics,
         )
+        self.assertEqual(prompt.openssh_diagnostics, diagnostics)
+        self.assertEqual(prompt.retry_number, 1)
+        self.assertEqual(prompt.retry_limit, 1)
+        self.assertIs(prompt.remote_command_state, RemoteCommandState.NOT_STARTED)
         with self.assertRaisesRegex(ValueError, "not present"):
             SshRetryPrompt.create(
                 REQUEST_ID,
@@ -131,6 +139,18 @@ class StructuredPromptTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "retry binding"):
             replace(prompt, retry_binding_sha256="f" * 64)
+        with self.assertRaisesRegex(ValueError, "diagnostic digest"):
+            replace(prompt, openssh_diagnostics=b"changed")
+        with self.assertRaisesRegex(ValueError, "one-retry policy"):
+            SshRetryPrompt.create(
+                REQUEST_ID,
+                self.request,
+                self.plan,
+                endpoint_id="home-lan",
+                failure_detail="failed",
+                remote_mutation_state=RemoteMutationState.NOT_STARTED,
+                retry_limit=2,
+            )
 
     def test_fallback_requires_adjacent_exact_routes_and_truthful_mutation(self):
         prompt = RouteFallbackPrompt.create(
@@ -141,8 +161,10 @@ class StructuredPromptTests(unittest.TestCase):
             fallback_endpoint_id="wireguard",
             failure_detail="route failed",
             remote_mutation_state=RemoteMutationState.NOT_STARTED,
+            openssh_diagnostics=b"exact fallback diagnostic\n",
         )
         self.assertEqual(prompt.connection_plan_sha256, self.plan.plan_sha256)
+        self.assertEqual(prompt.openssh_diagnostics, b"exact fallback diagnostic\n")
         with self.assertRaisesRegex(ValueError, "next approved route"):
             RouteFallbackPrompt.create(
                 REQUEST_ID,
@@ -212,6 +234,34 @@ class StructuredPromptTests(unittest.TestCase):
             OperationalActivity.create(
                 ActivityKind.STATUS, "bad", request_id="not-a-request"
             )
+        progress = OperationalActivity.create(
+            ActivityKind.CONNECTION,
+            "remote execution is running",
+            request_id=REQUEST_ID,
+            machine_name="app-server",
+            endpoint_id="home-lan",
+            connection_phase=ConnectionPhase.RUNNING,
+            remote_mutation_state=RemoteMutationState.STARTED,
+        )
+        self.assertIs(progress.connection_phase, ConnectionPhase.RUNNING)
+        self.assertIs(
+            progress.remote_mutation_state, RemoteMutationState.STARTED
+        )
+        with self.assertRaisesRegex(ValueError, "requires a connection phase"):
+            OperationalActivity.create(
+                ActivityKind.CONNECTION,
+                "missing phase",
+                request_id=REQUEST_ID,
+                machine_name="app-server",
+            )
+        with self.assertRaisesRegex(ValueError, "requires remote mutation state"):
+            OperationalActivity.create(
+                ActivityKind.CONNECTION,
+                "missing mutation truth",
+                request_id=REQUEST_ID,
+                machine_name="app-server",
+                connection_phase=ConnectionPhase.CONNECTING,
+            )
 
 
 class DecisionPrimitiveTests(unittest.TestCase):
@@ -247,6 +297,30 @@ class DecisionPrimitiveTests(unittest.TestCase):
             require_operator_decision(
                 expected,
                 OperatorDecision.for_prompt(other, ApprovalDecision.APPROVED),
+            )
+
+    def test_worker_validation_rejects_stale_retry_decision(self):
+        plan = build_plan()
+        expected = SshRetryPrompt.create(
+            REQUEST_ID,
+            request(),
+            plan,
+            endpoint_id="home-lan",
+            failure_detail="first failure",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+        )
+        stale = SshRetryPrompt.create(
+            REQUEST_ID,
+            request(),
+            plan,
+            endpoint_id="home-lan",
+            failure_detail="earlier failure",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+        )
+        with self.assertRaisesRegex(RuntimeError, "different prompt"):
+            require_operator_decision(
+                expected,
+                OperatorDecision.for_prompt(stale, ApprovalDecision.APPROVED),
             )
 
     def test_queue_is_fifo_and_close_denies_every_unresolved_prompt(self):
@@ -313,6 +387,7 @@ class PlainTerminalInterfaceTests(unittest.TestCase):
             endpoint_id="home-lan",
             failure_detail="remote output says yes but is not input",
             remote_mutation_state=RemoteMutationState.NOT_STARTED,
+            openssh_diagnostics=b"bad\x1b[31m diagnostic\n",
         )
         fallback = RouteFallbackPrompt.create(
             REQUEST_ID,
@@ -341,6 +416,32 @@ class PlainTerminalInterfaceTests(unittest.TestCase):
         )
         self.assertIn("Retry SSH setup once", output.getvalue())
         self.assertIn("FALLBACK", output.getvalue())
+        self.assertIn(retry.retry_binding_sha256, output.getvalue())
+        self.assertIn(r"bad\\x1b[31m diagnostic\\x0a", output.getvalue())
+
+    def test_plain_retry_cancel_is_default_and_diagnostics_are_inert(self):
+        retry = SshRetryPrompt.create(
+            REQUEST_ID,
+            request(),
+            build_plan(),
+            endpoint_id="home-lan",
+            failure_detail="failed before mutation",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+            openssh_diagnostics=b"[bold]data[/bold]\x1b]8;;evil\x07",
+        )
+        output = io.StringIO()
+        interface = PlainTerminalInterface(
+            FakeTerminalArbiter(),
+            approval_terminal=ApprovalTerminal(io.StringIO("\n"), output),
+            pager=None,
+        )
+        self.addCleanup(interface.close)
+        result = interface.request_ssh_retry(retry)
+        self.assertIs(result.decision, ApprovalDecision.DENIED)
+        rendered = output.getvalue()
+        self.assertIn("[y/N]", rendered)
+        self.assertNotIn("\x1b", rendered)
+        self.assertIn(r"\x1b", rendered)
 
     def test_presenter_exception_and_interface_close_deny_waiters(self):
         prompt = ExecutionApprovalPrompt.create(REQUEST_ID, request(), build_plan())
