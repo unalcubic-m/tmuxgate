@@ -1276,6 +1276,109 @@ class TextualPtyLifecycleTests(unittest.TestCase):
             finally:
                 os.close(master)
 
+    def _run_real_tui(self, *, hold_refreshes: int = 4):
+        """Run the default TUI in real mode (no --fake) behind a poisoned SSH config.
+
+        The isolated HOME carries an SSH client config whose ProxyCommand touches
+        a marker for any configured host, so a host contact during startup is
+        observable.  Returns (output, contacted, status, sent_quit).
+        """
+        with tempfile.TemporaryDirectory(prefix="tmuxgate-real-tui-pty-") as directory:
+            root = Path(directory)
+            home = root / "home"
+            runtime = root / "runtime"
+            state = root / "state"
+            for path in (home, runtime, state):
+                path.mkdir(mode=0o700)
+            ssh_dir = home / ".ssh"
+            ssh_dir.mkdir(mode=0o700)
+            contact_marker = root / "configured-host-contact"
+            ssh_config = ssh_dir / "config"
+            ssh_config.write_text(
+                f"Host *\n    ProxyCommand /usr/bin/touch {contact_marker}\n"
+            )
+            ssh_config.chmod(0o600)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            data = valid_config()
+            data["version"] = 2
+            data["mcp"] = {"host": "127.0.0.1", "port": port}
+            config_path = root / "config.toml"
+            config_path.write_bytes(serialize_config(parse_config(data)))
+            config_path.chmod(0o600)
+            arguments = [
+                sys.executable,
+                "-m",
+                "tmuxgate",
+                "--config",
+                os.fspath(config_path),
+                "--state-dir",
+                os.fspath(state),
+                "--socket",
+                os.fspath(runtime / "broker.sock"),
+            ]
+            child, master = pty.fork()
+            if child == 0:
+                environment = dict(os.environ)
+                environment.update(
+                    {
+                        "HOME": os.fspath(home),
+                        "PYTHONPATH": os.pathsep.join(("src", "tests")),
+                        "TERM": "xterm-256color",
+                        "XDG_CACHE_HOME": os.fspath(home / "cache"),
+                        "XDG_CONFIG_HOME": os.fspath(home / "config"),
+                        "XDG_RUNTIME_DIR": os.fspath(runtime),
+                        "XDG_STATE_HOME": os.fspath(home / "state"),
+                    }
+                )
+                os.execve(sys.executable, arguments, environment)
+            output = bytearray()
+            sent_quit = False
+            status = None
+            try:
+                fcntl.ioctl(
+                    master,
+                    termios.TIOCSWINSZ,
+                    struct.pack("HHHH", 30, 100, 0, 0),
+                )
+                deadline = time.monotonic() + 15
+                alt_screen_at = None
+                while time.monotonic() < deadline:
+                    readable, _, _ = select.select([master], [], [], 0.05)
+                    if readable:
+                        try:
+                            chunk = os.read(master, 65536)
+                        except OSError:
+                            chunk = b""
+                        if chunk:
+                            output.extend(chunk)
+                    waited, status = os.waitpid(child, os.WNOHANG)
+                    if waited:
+                        break
+                    if alt_screen_at is None and b"\x1b[?1049h" in output:
+                        alt_screen_at = time.monotonic()
+                    elif (
+                        not sent_quit
+                        and alt_screen_at is not None
+                        and time.monotonic() - alt_screen_at
+                        >= REFRESH_SECONDS * hold_refreshes
+                    ):
+                        os.write(master, b"q")
+                        sent_quit = True
+                else:
+                    os.kill(child, signal.SIGKILL)
+                    os.waitpid(child, 0)
+                    self.fail(
+                        "real-mode default TUI PTY timed out:\n"
+                        + output.decode(errors="replace")
+                    )
+                if status is None:
+                    _, status = os.waitpid(child, 0)
+                return bytes(output), contact_marker.exists(), status, sent_quit
+            finally:
+                os.close(master)
+
     def _run_mode(self, mode: str) -> bytes:
         child, master = pty.fork()
         if child == 0:
@@ -1347,6 +1450,25 @@ class TextualPtyLifecycleTests(unittest.TestCase):
         plain_output = self._run_cli(plain=True)
         self.assertIn(b"TMUXGATE RUNNING", plain_output)
         self.assertNotIn(b"\x1b[?1049h", plain_output)
+
+    def test_real_mode_default_tui_survives_refreshes_without_host_contact(self):
+        # Regression coverage for issue #41: in real mode (no --fake) the
+        # dashboard provider receives a non-None transport pool whose
+        # retained_machine_names is a property, so the default TUI must keep
+        # running across multiple refresh intervals instead of exiting on a
+        # 'tuple object is not callable' snapshot failure.
+        output, contacted, status, sent_quit = self._run_real_tui()
+        self.assertIn(b"\x1b[?1049h", output)
+        self.assertTrue(sent_quit, output.decode(errors="replace"))
+        self.assertTrue(os.WIFEXITED(status), output.decode(errors="replace"))
+        self.assertEqual(
+            os.WEXITSTATUS(status), 0, output.decode(errors="replace")
+        )
+        self.assertIn(b"\x1b[?1049l", output)
+        self.assertNotIn(b"not callable", output)
+        self.assertFalse(
+            contacted, "real-mode startup contacted a configured host"
+        )
 
     def test_external_process_owns_bytes_while_textual_is_suspended(self):
         output = self._run_mode("handoff")
