@@ -61,7 +61,7 @@ The unified lifecycle starts resources in fail-closed order:
    presenter, executor, broker, and broker control service.
 7. Start the broker, then start and await readiness of the MCP HTTP listener.
 8. Report only sanitized listener/token-path information and enter the
-   selected dashboard loop. Plain mode is the default; the read-only Textual
+   selected dashboard loop. Plain mode is the default; the Textual operator
    preview is selected only by explicit `--tui`.
 
 Startup refuses to accept new approvals when durable recovery reports a
@@ -390,8 +390,8 @@ from the controlling `/dev/tty` under `TerminalArbiter`; stdin,
 MCP/Unix-socket frames, request content, remote output, viewer pane content,
 rendered diagnostics, and pager return values are never input sources.
 
-`TextualOperatorInterface`, selected only with `--tui`, is the phase-two
-read-only preview built on exactly pinned `textual==8.2.8`. Before entering
+`TextualOperatorInterface`, selected only with `--tui`, is the phase-three
+operator preview built on exactly pinned `textual==8.2.8`. Before entering
 application mode it verifies that Textual's real stdin and stdout are the same
 character terminal and that tmuxgate's process group owns that terminal in the
 foreground. Validation, driver initialization, snapshot refresh, or terminal
@@ -400,7 +400,7 @@ fallback and no approval-policy change. Textual's driver owns alternate-screen
 entry, resize/full redraw, signal/cancellation unwinding, and restoration of
 the prior terminal modes and contents.
 
-The Textual preview has one fixed widget tree with keyboard-accessible
+The Textual dashboard has one fixed widget tree with keyboard-accessible
 Dashboard, Jobs, Machines, Activity, queued-request, and Help views. Its
 runtime snapshot reports application/broker readiness, MCP listener and
 approval mode, configured/enabled machines, bounded recent durable jobs,
@@ -408,16 +408,29 @@ retained SSH state, pending prompts, bounded activity, and terminal ownership.
 Every externally derived string is passed as literal non-markup content after
 C0/C1, DEL, format, bidi, and surrogate controls are escaped. Job, machine,
 activity, and prompt rows are bounded without creating per-record widgets. A
-terminal below 72 columns by 20 rows shows only a resize/quit guard.
+terminal below 72 columns by 20 rows shows only a resize/quit guard when no
+security decision is active.
 
-Phase two deliberately implements no Textual decision modal. The preview
-therefore requires `approval_mode = "always"`, queues and displays structured
-prompts without resolving them, and denies every unresolved prompt on exit.
-Consequently no request can reach SSH or another direct terminal reader while
-Textual owns application mode. Operators must restart with `--plain` to make
-execution, retry, fallback, machine-disable, or secret-input decisions. This
-keeps the incomplete TUI from becoming the production default and prevents
-Textual and direct terminal readers from competing.
+Phase three adds only execution-approval decisions. The preview requires
+`approval_mode = "always"`. Its presenter thread remains the sole FIFO consumer,
+but it schedules each execution prompt through Textual's thread-safe
+`call_from_thread` boundary. The UI thread creates one modal for that exact
+immutable queued item and returns its result through a callback which retains
+the original object identity; no displayed label is parsed or used to select a
+slot. Retry, fallback, machine-disable, and secret-input prompts are denied in
+this TUI phase, so execution cannot advance into an unimplemented direct
+terminal interaction while Textual owns application mode.
+
+An execution modal exposes separate Summary, Code, and Technical Details tabs.
+The existing pure ASCII-safe renderers supply complete request, script,
+connection-plan, identity, evidence, diagnostic, and binding content to three
+fixed scrollable non-markup widgets; content size does not create additional
+widgets. The full request ID is independently visible in the modal heading.
+Deny receives initial focus and Enter therefore denies. Escape and modal close
+also deny. Approve has no single-key binding and remains disabled during a
+short opening fence, which consumes already-buffered activation input before a
+later deliberate button action can approve. Dashboard, remote, pane, protocol,
+ANSI, and rendered content remain data and cannot synthesize Textual events.
 
 Workers submit immutable structured objects rather than presentation
 arguments:
@@ -456,11 +469,13 @@ never parsed to reconstruct these identities.
 `PromptQueue` is a mutex-protected FIFO. Submission receives a monotonically
 increasing sequence number while holding that mutex, so concurrent worker
 requests have one deterministic presentation order. Each queued item owns its
-own `PendingDecision` condition variable. The plain interface has one daemon
+own `PendingDecision` condition variable. Each interface has one daemon
 presenter thread and is the sole queue consumer; workers wait only on the slot
-created for their exact prompt. The Textual preview's consumer records a
-bounded read-only projection while leaving each slot unresolved until
-fail-closed shutdown.
+created for their exact prompt. The Textual interface also records a bounded
+projection of every submission, schedules only the active execution item onto
+the UI thread, waits for that item's resolution, and then advances to the next
+FIFO item. Multiple worker requests therefore remain independent and only one
+security modal can be active.
 
 An immutable `OperatorDecision` repeats the prompt ID and canonical binding
 digest in addition to Approved or Denied. `PendingDecision.resolve()` checks
@@ -586,18 +601,21 @@ while idle. It acquires the lowest-priority lease only immediately before
 reading. Any intervening non-dashboard handoff increments a generation and
 makes that pending dashboard line stale.
 
-Non-dashboard claims reopen and revalidate `/dev/tty` and discard queued input
-before displaying their trusted interaction. Therefore pretyped dashboard text
-cannot become an approval, fallback acknowledgement, SSH password, or sudo
-secret. An active terminal transaction is not forcibly interrupted; priorities
+Non-dashboard plain-mode claims reopen and revalidate `/dev/tty` and discard
+queued input before displaying their trusted interaction. Therefore pretyped
+dashboard text cannot become an approval, fallback acknowledgement, SSH
+password, or sudo secret. In Textual mode the execution modal instead fences
+Approve while buffered UI input is drained and defaults every other close or
+activation path to Deny. An active terminal transaction is not forcibly
+interrupted; priorities
 choose the next owner. Reentrant ownership allows existing approval and SSH
 components to use the arbiter through their lock-compatible interface. Parallel
 execution never places two password prompts or an approval and password prompt
 on `/dev/tty` concurrently. This serialization applies only to human terminal
-interaction; the remote command leases continue independently. In the
-phase-two Textual preview, decision prompts cannot resolve and approval-disabled
-mode is rejected, so execution cannot advance to a direct terminal reader
-while Textual owns the full-screen driver.
+interaction; the remote command leases continue independently. The phase-three
+Textual preview rejects approval-disabled mode, handles execution approval
+inside the full-screen driver, and denies later decision kinds that do not yet
+have a TUI implementation.
 
 Separately, up to three authenticated `ssh -N` ControlMaster transports may
 remain idle. Reusing a transport never reuses request identity. Queued requests

@@ -1,4 +1,4 @@
-"""Headless and isolated-PTY tests for the read-only Textual foundation."""
+"""Headless and isolated-PTY tests for the Textual operator interface."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from textual.widgets import Static, TabbedContent
+from textual.widgets import Button, Static, TabbedContent
 
 from tmuxgate.approval import ApprovalDecision
 from tmuxgate.models import ExecutionMode, RequestSpec
@@ -32,17 +32,21 @@ from tmuxgate.operator_interface import (
     OperatorInterfaceError,
 )
 from tmuxgate.textual_interface import (
+    APPROVAL_ARM_SECONDS,
     DashboardJob,
     DashboardMachine,
     DashboardRuntimeSnapshot,
+    ExecutionApprovalScreen,
     MAX_DASHBOARD_JOBS,
     MAX_DASHBOARD_MACHINES,
     MINIMUM_COLUMNS,
     MINIMUM_ROWS,
     TextualOperatorInterface,
     TmuxgateDashboardApp,
+    flush_textual_input,
     validate_textual_terminal,
 )
+from test_connection_plan import build_plan
 
 
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
@@ -90,6 +94,25 @@ class TextualDependencyTests(unittest.TestCase):
 
 
 class TextualOperatorInterfaceTests(unittest.TestCase):
+    @staticmethod
+    async def _wait_for_approval(
+        app: TmuxgateDashboardApp,
+        pilot,
+        expected_prompt: ExecutionApprovalPrompt,
+    ) -> ExecutionApprovalScreen:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if isinstance(app.screen, ExecutionApprovalScreen):
+                screen = app.screen
+                if (
+                    screen.prompt.prompt_id == expected_prompt.prompt_id
+                    and len(list(screen.query("#approval-views"))) == 1
+                    and len(list(screen.query("#approval-deny:focus"))) == 1
+                ):
+                    return screen
+            await pilot.pause(0.02)
+        raise AssertionError("matching execution approval modal did not open")
+
     def test_terminal_ownership_validation_fails_closed(self):
         stdin = mock.Mock()
         stdout = mock.Mock()
@@ -129,6 +152,26 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
             self.assertRaisesRegex(OperatorInterfaceError, "foreground"),
         ):
             validate_textual_terminal(stdin, stdout)
+
+    def test_modal_boundary_flushes_kernel_input_or_fails_closed(self):
+        stream = mock.Mock()
+        stream.fileno.return_value = 12
+        with (
+            mock.patch("tmuxgate.textual_interface.os.isatty", return_value=True),
+            mock.patch("tmuxgate.textual_interface.termios.tcflush") as flushed,
+        ):
+            flush_textual_input(stream)
+        flushed.assert_called_once_with(12, termios.TCIFLUSH)
+
+        with (
+            mock.patch("tmuxgate.textual_interface.os.isatty", return_value=True),
+            mock.patch(
+                "tmuxgate.textual_interface.termios.tcflush",
+                side_effect=OSError("synthetic flush failure"),
+            ),
+            self.assertRaisesRegex(OperatorInterfaceError, "discard buffered"),
+        ):
+            flush_textual_input(stream)
 
     def test_disabled_approval_mode_fails_closed_without_plain_fallback(self):
         with self.assertRaisesRegex(OperatorInterfaceError, "--plain"):
@@ -280,6 +323,212 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 self.assertTrue(app.query_one("#views", TabbedContent).display)
 
         asyncio.run(exercise())
+
+    def test_execution_approval_views_resize_and_explicit_decisions(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        malicious = b"echo '[bold]literal[/bold]'\n\x1b]8;;https://evil.invalid\x07link\n"
+        request = RequestSpec(
+            "app-server",
+            ExecutionMode.SCRIPT,
+            "/srv/app",
+            script=malicious + b"printf '%s\\n' complete\n" * 2000,
+            purpose="Review [red]literal markup[/red]",
+        )
+        plan = build_plan()
+        approval = ExecutionApprovalPrompt.create(REQUEST_ID, request, plan)
+        denied = ExecutionApprovalPrompt.create(
+            "1" * 32, prompt().request, None, unbound_fake=True
+        )
+        decisions: dict[str, ApprovalDecision] = {}
+
+        def request_decision(item: ExecutionApprovalPrompt) -> None:
+            result = interface.request_execution_approval(item)
+            decisions[item.prompt_id] = result.decision
+
+        first = threading.Thread(target=request_decision, args=(approval,))
+        second = threading.Thread(target=request_decision, args=(denied,))
+        first.start()
+        while interface.pending_prompt_count < 1:
+            time.sleep(0.01)
+        second.start()
+        while interface.pending_prompt_count < 2:
+            time.sleep(0.01)
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                screen = await self._wait_for_approval(app, pilot, approval)
+                widget_count = len(list(screen.query("*")))
+                self.assertEqual(
+                    screen.query_one("#approval-views", TabbedContent).active,
+                    "approval-summary",
+                )
+                self.assertTrue(screen.query_one("#approval-deny", Button).has_focus)
+                self.assertTrue(screen.query_one("#approval-approve", Button).disabled)
+
+                await pilot.press("x")
+                await pilot.pause()
+                self.assertTrue(first.is_alive())
+                for key, expected in (
+                    ("c", "approval-code"),
+                    ("t", "approval-technical"),
+                    ("s", "approval-summary"),
+                ):
+                    await pilot.press(key)
+                    await pilot.pause()
+                    self.assertEqual(
+                        screen.query_one("#approval-views", TabbedContent).active,
+                        expected,
+                    )
+                code = screen.query_one("#approval-code-document", Static).render().plain
+                summary = screen.query_one(
+                    "#approval-summary-document", Static
+                ).render().plain
+                technical = screen.query_one(
+                    "#approval-technical-document", Static
+                ).render().plain
+                self.assertIn("home-lan", summary)
+                self.assertIn("192.0.2.20", summary)
+                self.assertIn(plan.plan_sha256, technical)
+                self.assertNotIn("\x1b", code)
+                self.assertIn(r"\x1b", code)
+                self.assertIn("complete", code)
+                self.assertIn("script_sha256:", technical)
+                self.assertEqual(len(list(screen.query("*"))), widget_count)
+
+                await pilot.resize_terminal(MINIMUM_COLUMNS, MINIMUM_ROWS)
+                await pilot.pause()
+                self.assertIs(app.screen, screen)
+                self.assertTrue(screen.query_one("#approval-deny", Button).display)
+                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                self.assertFalse(screen.query_one("#approval-approve", Button).disabled)
+                self.assertTrue(await pilot.click("#approval-approve"))
+
+                next_screen = await self._wait_for_approval(app, pilot, denied)
+                self.assertTrue(next_screen.query_one("#approval-deny", Button).has_focus)
+                await pilot.press("escape")
+                await pilot.pause()
+
+        asyncio.run(exercise())
+        first.join(timeout=1)
+        second.join(timeout=1)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertIs(decisions[approval.prompt_id], ApprovalDecision.APPROVED)
+        self.assertIs(decisions[denied.prompt_id], ApprovalDecision.DENIED)
+
+    def test_stale_input_and_modal_identity_cannot_approve_next_prompt(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        prompts = [
+            ExecutionApprovalPrompt.create(
+                f"{index:032x}", prompt().request, None, unbound_fake=True
+            )
+            for index in range(1, 4)
+        ]
+        decisions: dict[str, ApprovalDecision] = {}
+        workers = []
+        for index, item in enumerate(prompts, start=1):
+            worker = threading.Thread(
+                target=lambda value=item: decisions.__setitem__(
+                    value.prompt_id,
+                    interface.request_execution_approval(value).decision,
+                )
+            )
+            worker.start()
+            workers.append(worker)
+            deadline = time.monotonic() + 1
+            while interface.pending_prompt_count < index and time.monotonic() < deadline:
+                time.sleep(0.01)
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                first_screen = await self._wait_for_approval(app, pilot, prompts[0])
+                first_item = interface.queued_prompts[0]
+                # An activation aimed at Approve before this exact prompt is
+                # armed cannot resolve it. Enter then selects the focused safe
+                # default, Deny.
+                await pilot.click("#approval-approve")
+                await pilot.pause()
+                self.assertTrue(workers[0].is_alive())
+                await pilot.press("enter")
+                second_screen = await self._wait_for_approval(app, pilot, prompts[1])
+                self.assertIsNot(first_screen, second_screen)
+                second_item = interface.queued_prompts[1]
+                app._complete_execution_approval(
+                    first_item, ApprovalDecision.APPROVED
+                )
+                await pilot.pause()
+                self.assertTrue(workers[1].is_alive())
+                self.assertEqual(
+                    app._active_approval.prompt.prompt_id,
+                    second_item.prompt.prompt_id,
+                )
+                self.assertIs(app._active_approval.pending, second_item.pending)
+
+                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                self.assertTrue(await pilot.click("#approval-approve"))
+                await self._wait_for_approval(app, pilot, prompts[2])
+                await pilot.press("enter")
+                await pilot.pause()
+
+        asyncio.run(exercise())
+        for worker in workers:
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+        self.assertIs(decisions[prompts[0].prompt_id], ApprovalDecision.DENIED)
+        self.assertIs(decisions[prompts[1].prompt_id], ApprovalDecision.APPROVED)
+        self.assertIs(decisions[prompts[2].prompt_id], ApprovalDecision.DENIED)
+
+    def test_dashboard_close_denies_active_and_queued_prompts(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        prompts = [
+            ExecutionApprovalPrompt.create(
+                f"{index:032x}", prompt().request, None, unbound_fake=True
+            )
+            for index in range(10, 12)
+        ]
+        decisions = []
+        workers = [
+            threading.Thread(
+                target=lambda item=item: decisions.append(
+                    interface.request_execution_approval(item)
+                )
+            )
+            for item in prompts
+        ]
+        for index, worker in enumerate(workers, start=1):
+            worker.start()
+            deadline = time.monotonic() + 1
+            while interface.pending_prompt_count < index and time.monotonic() < deadline:
+                time.sleep(0.01)
+        stop = threading.Event()
+        app = TmuxgateDashboardApp(interface, stop, config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                await self._wait_for_approval(app, pilot, prompts[0])
+                await pilot.press("q")
+                await pilot.pause()
+
+        asyncio.run(exercise())
+        self.assertTrue(stop.is_set())
+        for worker in workers:
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(len(decisions), 2)
+        self.assertTrue(
+            all(item.decision is ApprovalDecision.DENIED for item in decisions)
+        )
 
 
 PTY_HELPER = r"""

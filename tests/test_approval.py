@@ -89,6 +89,24 @@ class ShortWriteBuffer:
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_execution_approval_defaults_to_deny_and_requires_explicit_yes(self):
+        request = RequestSpec("host", ExecutionMode.ARGV, "/", argv=("true",))
+        for response in ("\n", "n\n", "NO\n", "deny\n"):
+            with self.subTest(response=response):
+                terminal, output = terminal_with_input(response)
+                self.assertIs(
+                    request_approval(REQUEST_ID, request, terminal=terminal),
+                    ApprovalDecision.DENIED,
+                )
+                self.assertIn("Approve? [y/N]", output.getvalue())
+        for response in ("y\n", "YES\n", "approve\n"):
+            with self.subTest(response=response):
+                terminal, _output = terminal_with_input(response)
+                self.assertIs(
+                    request_approval(REQUEST_ID, request, terminal=terminal),
+                    ApprovalDecision.APPROVED,
+                )
+
     def test_secret_input_authorization_displays_exact_recipient_and_command(self):
         request = RequestSpec(
             "app-server",
@@ -283,7 +301,7 @@ class ApprovalTests(unittest.TestCase):
 
         self.assertEqual(decision, ApprovalDecision.APPROVED)
         self.assertEqual(
-            output.getvalue().count("Please press Enter/y to approve"),
+            output.getvalue().count("Please type y to approve"),
             len(invalid),
         )
 
@@ -378,15 +396,15 @@ raise SystemExit(9)
         try:
             # This is the untrusted client/process stdin.  The child must never
             # consume it as an approval response.
-            # Enter alone now approves, so place that strongest possible value
-            # on untrusted process stdin. It still must not reach /dev/tty.
+            # Even the safe default input remains untrusted process input and
+            # must not reach the broker's controlling /dev/tty.
             os.write(stdin_writer, b"\n")
             os.close(stdin_writer)
             stdin_writer = -1
 
             transcript = bytearray()
             deadline = time.monotonic() + 3
-            while b"Approve? [Y/n]" not in transcript:
+            while b"Approve? [y/N]" not in transcript:
                 remaining = deadline - time.monotonic()
                 self.assertGreater(remaining, 0, bytes(transcript))
                 readable, _, _ = select.select([master], [], [], remaining)
@@ -425,7 +443,7 @@ raise SystemExit(9)
             request_approval(REQUEST_ID, request, terminal=terminal)
 
         self.assertNotIn("DENY", str(caught.exception))
-        self.assertIn("Approve? [Y/n]", output.getvalue())
+        self.assertIn("Approve? [y/N]", output.getvalue())
 
     def test_exact_argv_cwd_environment_and_all_script_bytes_are_rendered_safely(self):
         script = bytes(range(256)) * 3 + b"final-byte:\xff"
@@ -573,7 +591,7 @@ raise SystemExit(9)
         self.assertIs(decision, ApprovalDecision.APPROVED)
         self.assertEqual(paged[0], render_code_document(REQUEST_ID, request))
         self.assertEqual(paged[1], render_approval_document(REQUEST_ID, request))
-        self.assertGreaterEqual(output.getvalue().count("Approve? [Y/n]"), 3)
+        self.assertGreaterEqual(output.getvalue().count("Approve? [y/N]"), 3)
 
     def test_compact_summary_labels_advisory_purpose_and_exact_command(self):
         request = RequestSpec(

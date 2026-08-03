@@ -247,7 +247,7 @@ class BoundApprovalTests(unittest.TestCase):
         self.assertIn(approval_binding_sha256(REQUEST_ID, self.request, self.plan), document)
 
     def test_bound_approval_comes_only_from_terminal(self):
-        terminal, output = self.terminal("\n")
+        terminal, output = self.terminal("y\n")
         decision = request_bound_approval(
             REQUEST_ID, self.request, self.plan, terminal=terminal, pager=None
         )

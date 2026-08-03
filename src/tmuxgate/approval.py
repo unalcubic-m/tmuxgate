@@ -444,7 +444,8 @@ def render_approval_summary(
                     f"{_quoted_text(selected.resolved_user)}@"
                     f"{_quoted_text(selected.resolved_hostname)}:"
                     f"{selected.resolved_port} via "
-                    f"{_quoted_text(selected.required_context)}"
+                    f"{_quoted_text(selected.required_context)} "
+                    f"(endpoint {_quoted_text(selected.endpoint_id)})"
                 ),
                 (
                     f"IDENTITY   Host key {selected.host_key_evidence.status}; "
@@ -476,7 +477,13 @@ def render_approval_summary(
         lines.extend(f"  - {_RISK_EXPLANATIONS[item]}" for item in risks)
     else:
         lines.append("SAFETY     No obvious advisory flags")
-    lines.extend(["", "Press d for technical identities, evidence, and binding hashes."])
+    lines.extend(
+        [
+            "",
+            "Code and complete technical identities, evidence, and binding hashes "
+            "remain available before deciding.",
+        ]
+    )
     return _terminal_safe_document(lines)
 
 
@@ -712,7 +719,7 @@ def _read_decision(
     pager: ApprovalPager | None,
 ) -> ApprovalDecision:
     instruction = (
-        "Approve? [Y/n]  Enter=yes, c=view code, d=technical details: "
+        "Approve? [y/N]  Enter=no, c=view code, d=technical details: "
     )
 
     while True:
@@ -732,10 +739,10 @@ def _read_decision(
         # Release the original terminal-input object before making a decision.
         # Invalid response content is neither repeated nor included in errors.
         raw_line = ""
-        if response in {"", "y", "yes", "approve"}:
+        if response in {"y", "yes", "approve"}:
             response = ""
             return ApprovalDecision.APPROVED
-        if response in {"n", "no", "deny"}:
+        if response in {"", "n", "no", "deny"}:
             response = ""
             return ApprovalDecision.DENIED
         if response in {"c", "code", "view code", "d", "details", "view details"}:
@@ -755,7 +762,7 @@ def _read_decision(
         response = ""
         _write_all(
             terminal.writer,
-            "Please press Enter/y to approve, n to deny, c for code, or d for details.\n",
+            "Please type y to approve, press Enter/n to deny, c for code, or d for details.\n",
         )
 
 
