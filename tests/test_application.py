@@ -17,10 +17,18 @@ from tmuxgate.application import RecoveryBlockedError, UnifiedApplication
 from tmuxgate.mcp_server import McpServerError
 from tmuxgate.runtime import RuntimeSecurityError, acquire_state_lock
 from tmuxgate.textual_interface import TextualOperatorInterface
+from tmuxgate.transport import MasterTransportPool
+
+from test_connection_plan import build_plan
+from test_transport import FakeMasterBackend, authorization
 
 
 def _write_config(
-    path: Path, *, mcp_port: int = 18765, approval_mode: str = "disabled"
+    path: Path,
+    *,
+    mcp_port: int = 18765,
+    approval_mode: str = "disabled",
+    machine_name: str = "local",
 ) -> None:
     path.write_text(
         f"""\
@@ -38,14 +46,14 @@ gateway = "192.0.2.1"
 source_cidr = "192.0.2.0/24"
 fingerprints = []
 
-[machines.local]
+[machines.{machine_name}]
 description = "Test machine"
-ssh_profile = "local"
+ssh_profile = "{machine_name}"
 user = "operator"
-host_key_alias = "tmuxgate-local"
+host_key_alias = "tmuxgate-{machine_name}"
 connect_timeout_seconds = 6
 
-[[machines.local.endpoints]]
+[[machines.{machine_name}.endpoints]]
 id = "home-lan"
 address = "192.0.2.20"
 port = 22
@@ -151,6 +159,68 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
         self.assertEqual(len(snapshot.machines), 1)
         self.assertEqual(snapshot.machines[0].alias, "local")
         self.assertEqual(snapshot.machines[0].ssh_state, "not used (fake)")
+
+    def test_real_mode_dashboard_provider_projects_retained_pool_machines(self):
+        # Regression coverage for the non-None transport-pool branch of the
+        # bound dashboard provider.  A real MasterTransportPool exposes
+        # ``retained_machine_names`` as a property returning a tuple, so the
+        # provider must read it without calling it.
+        _write_config(self.config_path, machine_name="app-server")
+        terminal = mock.Mock()
+        terminal.claim.return_value = nullcontext()
+        terminal.state = SimpleNamespace(busy=False, purpose=None)
+
+        class CapturingTextualInterface(TextualOperatorInterface):
+            snapshot = None
+
+            def run_dashboard(self, stop, config):
+                del stop
+                self.snapshot = self.dashboard_snapshot(config)
+
+        operator = CapturingTextualInterface(terminal, validate_terminal=False)
+        backend = FakeMasterBackend()
+        self.addCleanup(backend.close)
+        pool = MasterTransportPool(
+            self.root / "control",
+            backend=backend,
+            identity_revalidator=lambda endpoint: endpoint,
+            max_masters=3,
+            idle_timeout_seconds=600,
+        )
+        resolved = build_plan().selected.resolved
+        lease = pool.acquire(
+            authorization(resolved.machine_name, resolved), resolved
+        )
+        lease.release()
+        self.assertEqual(pool.retained_machine_names, ("app-server",))
+
+        broker = mock.Mock()
+        broker.stop.return_value = True
+        mcp_http = mock.Mock()
+        mcp_http.stop.return_value = True
+        app = UnifiedApplication(
+            config_path=self.config_path,
+            socket_path=self.socket_path,
+            state_dir=self.state_dir,
+            fake=False,
+            terminal=terminal,
+            operator_interface=operator,
+        )
+        with (
+            mock.patch.object(application, "MasterTransportPool", return_value=pool),
+            mock.patch.object(application, "BrokerServer", return_value=broker),
+            mock.patch.object(application, "create_mcp_server", return_value=object()),
+            mock.patch.object(
+                application, "EmbeddedMcpServer", return_value=mcp_http
+            ),
+        ):
+            self.assertEqual(app.run(), 0)
+
+        snapshot = operator.snapshot
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(len(snapshot.machines), 1)
+        self.assertEqual(snapshot.machines[0].alias, "app-server")
+        self.assertEqual(snapshot.machines[0].ssh_state, "retained")
 
     def test_textual_mode_accepts_disabled_execution_approval_policy(self):
         app = UnifiedApplication(

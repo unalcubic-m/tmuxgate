@@ -407,7 +407,7 @@ class UnifiedApplication:
                 }
 
                 def dashboard_snapshot() -> DashboardRuntimeSnapshot:
-                    retained = set(pool.retained_machine_names()) if pool else set()
+                    retained = set(pool.retained_machine_names) if pool else set()
                     records = store.load_all()
                     jobs = tuple(
                         DashboardJob(
