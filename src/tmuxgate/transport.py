@@ -1,8 +1,9 @@
 """Approval-bound OpenSSH master command plans and a three-transport pool.
 
-No backend is enabled by the public CLI yet.  Tests inject a fake backend; a
-future real backend must execute these broker-owned invocations in the broker
-terminal and never in the noninteractive client.
+The unified application's non-fake path supplies the real subprocess backend;
+tests may instead inject a fake backend through the same broker-owned boundary.
+OpenSSH invocations run from the broker application, never from a
+noninteractive client.
 """
 
 from __future__ import annotations
