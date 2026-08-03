@@ -390,7 +390,7 @@ from the controlling `/dev/tty` under `TerminalArbiter`; stdin,
 MCP/Unix-socket frames, request content, remote output, viewer pane content,
 rendered diagnostics, and pager return values are never input sources.
 
-`TextualOperatorInterface`, selected only with `--tui`, is the phase-three
+`TextualOperatorInterface`, selected only with `--tui`, is the phase-four
 operator preview built on exactly pinned `textual==8.2.8`. Before entering
 application mode it verifies that Textual's real stdin and stdout are the same
 character terminal and that tmuxgate's process group owns that terminal in the
@@ -411,15 +411,16 @@ activity, and prompt rows are bounded without creating per-record widgets. A
 terminal below 72 columns by 20 rows shows only a resize/quit guard when no
 security decision is active.
 
-Phase three adds only execution-approval decisions. The preview requires
+Phase four supports execution approval, bounded SSH retry, and separately
+authorized adjacent-route fallback decisions. The preview requires
 `approval_mode = "always"`. Its presenter thread remains the sole FIFO consumer,
-but it schedules each execution prompt through Textual's thread-safe
+but it schedules each supported prompt through Textual's thread-safe
 `call_from_thread` boundary. The UI thread creates one modal for that exact
 immutable queued item and returns its result through a callback which retains
 the original object identity; no displayed label is parsed or used to select a
-slot. Retry, fallback, machine-disable, and secret-input prompts are denied in
-this TUI phase, so execution cannot advance into an unimplemented direct
-terminal interaction while Textual owns application mode.
+slot. Machine-disable and secret-input prompts are still denied in this TUI
+phase, so execution cannot advance into an unimplemented direct terminal
+interaction while Textual owns application mode.
 
 An execution modal exposes separate Summary, Code, and Technical Details tabs.
 The existing pure ASCII-safe renderers supply complete request, script,
@@ -432,6 +433,16 @@ short opening fence, which consumes already-buffered activation input before a
 later deliberate button action can approve. Dashboard, remote, pane, protocol,
 ANSI, and rendered content remain data and cannot synthesize Textual events.
 
+SSH retry and fallback each have a distinct focused modal with Summary,
+Diagnostics, and Binding Evidence tabs. Cancel receives initial focus and is
+the Enter/Escape/default action. The positive action is fenced like execution
+approval. Retry shows the exact request, endpoint and resolved identity,
+failure summary, requested-command and mutation states, and the enforced
+`1 of 1` retry count. Fallback shows the failed and proposed routes and
+identities and explains why the original RUN decision is insufficient. Both
+retain the complete bounded OpenSSH stderr bytes, render a reversible inert
+spelling, and expose the exact byte length, SHA-256, and hexadecimal evidence.
+
 Workers submit immutable structured objects rather than presentation
 arguments:
 
@@ -440,11 +451,13 @@ arguments:
   digest, and the complete approved `ConnectionPlan` plus its digest. The
   plan-less form is restricted to the nonremote `--fake` test backend.
 - `SshRetryPrompt` additionally binds the exact endpoint, failure detail,
-  truthful remote-mutation state, and retry digest.
+  complete OpenSSH diagnostic digest, `1 of 1` retry policy, requested-command
+  state, truthful remote-mutation state, and retry digest.
 - `RouteFallbackPrompt` binds the failed endpoint, the immediately adjacent
-  approved fallback, failure detail, mutation state, and separate fallback
-  digest. Construction rejects a nonadjacent route or any state in which
-  remote mutation may have started.
+  approved fallback, failure detail, diagnostic digest, requested-command and
+  mutation states, and separate fallback digest. Construction rejects a
+  nonadjacent route or any state in which the command or remote mutation may
+  have started.
 - `MachineDisablePrompt` binds the local mutation decision to the originating
   request, approved plan, failure, machine, and proven pre-remote state.
 - `SecretInputAuthorizationPrompt` binds the exact request, machine/endpoint,
@@ -453,9 +466,13 @@ arguments:
   viewer is live and creates a fresh one-shot prompt for each new prompt
   episode.
 - `OperationalActivity` carries a typed activity kind and optional canonical
-  request, machine, endpoint, and detail identities. Broker audit transitions
-  enter the interface's bounded history; startup and error events use the same
-  boundary for plain-terminal reporting.
+  request, machine, endpoint, and detail identities. Connection events also
+  carry a typed phase and truthful mutation state. The Textual dashboard
+  replaces each request's connection projection with its latest phase, so
+  approval progresses through connecting, retry/fallback decision, remote
+  execution, completion, or failure in place. Plain mode consumes the same
+  structured transitions linearly. Broker audit transitions enter the
+  interface's bounded history; startup and error events use the same boundary.
 
 Every prompt constructor recalculates the established connection-plan digest
 and the exact client request/command identity. Missing, malformed, mismatched,
@@ -612,10 +629,10 @@ choose the next owner. Reentrant ownership allows existing approval and SSH
 components to use the arbiter through their lock-compatible interface. Parallel
 execution never places two password prompts or an approval and password prompt
 on `/dev/tty` concurrently. This serialization applies only to human terminal
-interaction; the remote command leases continue independently. The phase-three
-Textual preview rejects approval-disabled mode, handles execution approval
-inside the full-screen driver, and denies later decision kinds that do not yet
-have a TUI implementation.
+interaction; the remote command leases continue independently. The phase-four
+Textual preview rejects approval-disabled mode and handles execution approval,
+SSH retry, and fallback inside the full-screen driver while denying later
+decision kinds that do not yet have a TUI implementation.
 
 Separately, up to three authenticated `ssh -N` ControlMaster transports may
 remain idle. Reusing a transport never reuses request identity. Queued requests
@@ -681,15 +698,18 @@ enrollment verification followed by public-key-only replacement. The
 subprocess backend is enabled only inside
 the broker process.
 
-OpenSSH owns its normal password/passphrase attempts and writes its diagnostic
-only to the broker terminal. A nonzero initial-master exit becomes a typed
-pre-remote failure containing only the numeric exit status and guidance to
-review that terminal; the status alone is not classified as an authentication
-failure because it may also represent host-key, configuration, or reachability
-failure. tmuxgate does not capture or persist the terminal text.
+OpenSSH owns its normal password/passphrase attempts through the broker
+terminal. Its stderr is captured up to the structured-interface bound; an
+oversized or malformed result fails closed without retry. A nonzero
+initial-master exit becomes a typed pre-remote failure carrying the numeric
+exit status and exact diagnostic bytes. Those bytes remain operator evidence,
+are never copied to MCP or durable state, and render inertly with byte length,
+SHA-256, and hexadecimal access. The status alone is not classified as an
+authentication failure because it may also represent host-key, configuration,
+or reachability failure.
 Before considering an approved fallback, the executor may offer exactly one
-same-endpoint retry. It requires a broker-terminal yes/no confirmation, with
-yes as the displayed default, keeps the original request and connection-plan
+same-endpoint retry. It requires an exact operator decision with Cancel as the
+displayed and technical default, keeps the original request and connection-plan
 binding, recollects local network evidence, re-resolves SSH policy and host-key
 evidence, and requires the approved machine, ordered candidate eligibility,
 eligible endpoint order, and

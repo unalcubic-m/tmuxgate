@@ -9,7 +9,13 @@ from tmuxgate.scheduler import RequestState
 from tmuxgate.spool import ResultSpool
 from tmuxgate.state import DurableStateStore
 from tmuxgate.approval import ApprovalDecision
-from tmuxgate.operator_interface import OperatorDecision
+from tmuxgate.operator_interface import (
+    ConnectionPhase,
+    OperatorDecision,
+    RemoteMutationState,
+    RouteFallbackPrompt,
+    SshRetryPrompt,
+)
 from tmuxgate.transport import MasterTransportPool, SshMasterStartError
 from test_planning import PlannerHarness, request
 from test_remote_job import FakeRemoteBackend
@@ -39,8 +45,12 @@ class RetryMasterBackend(FakeMasterBackend):
     def start_master(self, invocation, control_path):
         if self.failures:
             self.starts.append(invocation)
+            attempt = len(self.starts)
             self.failures -= 1
-            raise SshMasterStartError(255)
+            raise SshMasterStartError(
+                255,
+                f"attempt {attempt}: malicious \x1b]8;;link\x07\n".encode(),
+            )
         super().start_master(invocation, control_path)
 
 
@@ -57,8 +67,11 @@ class CallbackOperatorInterface:
         self.fallback_approver = fallback_approver
         self.ssh_retry_approver = ssh_retry_approver
         self.machine_disable_approver = machine_disable_approver
+        self.prompts = []
+        self.activity = []
 
     def request_fallback(self, prompt):
+        self.prompts.append(prompt)
         decision = self.fallback_approver(
             prompt.request_id,
             prompt.request,
@@ -71,6 +84,7 @@ class CallbackOperatorInterface:
         return OperatorDecision.for_prompt(prompt, decision)
 
     def request_ssh_retry(self, prompt):
+        self.prompts.append(prompt)
         decision = self.ssh_retry_approver(
             prompt.request_id,
             prompt.request,
@@ -82,6 +96,7 @@ class CallbackOperatorInterface:
         return OperatorDecision.for_prompt(prompt, decision)
 
     def request_machine_disable(self, prompt):
+        self.prompts.append(prompt)
         decision = self.machine_disable_approver(
             prompt.request_id,
             prompt.request.machine_alias,
@@ -91,7 +106,7 @@ class CallbackOperatorInterface:
         return OperatorDecision.for_prompt(prompt, decision)
 
     def publish_activity(self, event):
-        del event
+        self.activity.append(event)
 
 
 class RealExecutorTests(unittest.TestCase):
@@ -136,6 +151,7 @@ class RealExecutorTests(unittest.TestCase):
                 lambda *args, **keywords: ApprovalDecision.DENIED,
             ),
         )
+        self.operator = operator
         return RealExecutor(
             planner=self.planner,
             transports=self.pool,
@@ -208,6 +224,11 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(durable.endpoint_id, "home-lan")
         self.assertIn("fallback were not attempted", durable.failure_detail)
         self.assertIsNone(self.pool.pinned_request_id)
+        failed = self.operator.activity[-1]
+        self.assertIs(failed.connection_phase, ConnectionPhase.FAILED)
+        self.assertIs(
+            failed.remote_mutation_state, RemoteMutationState.MAY_HAVE_STARTED
+        )
 
     def test_read_only_enrollment_failure_keeps_normal_approved_fallback(self):
         self.pool.key_manager = FakeKeyManager(["pre-failure", "present"])
@@ -290,6 +311,21 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(len(retry_calls), 1)
         self.assertEqual(retry_calls[0][1]["endpoint_id"], "home-lan")
         self.assertFalse(retry_calls[0][1]["remote_mutation_started"])
+        retry_prompt = next(
+            item for item in self.operator.prompts if isinstance(item, SshRetryPrompt)
+        )
+        self.assertEqual(retry_prompt.retry_number, 1)
+        self.assertEqual(retry_prompt.retry_limit, 1)
+        self.assertEqual(
+            retry_prompt.openssh_diagnostics,
+            b"attempt 1: malicious \x1b]8;;link\x07\n",
+        )
+        phases = [event.connection_phase for event in self.operator.activity]
+        self.assertIn(ConnectionPhase.CONNECTING, phases)
+        self.assertIn(ConnectionPhase.RETRY_DECISION, phases)
+        self.assertIn(ConnectionPhase.RETRYING, phases)
+        self.assertIn(ConnectionPhase.RUNNING, phases)
+        self.assertEqual(phases[-1], ConnectionPhase.COMPLETED)
 
     def test_broker_confirmed_ssh_retry_is_bounded_to_one_attempt(self):
         self.master_backend.close()
@@ -320,6 +356,15 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(len(retry_calls), 1)
         self.assertEqual(len(fallback_calls), 1)
         self.assertIn("retry also failed", fallback_calls[0][1]["failure_detail"])
+        fallback_prompt = next(
+            item
+            for item in self.operator.prompts
+            if isinstance(item, RouteFallbackPrompt)
+        )
+        self.assertEqual(
+            fallback_prompt.openssh_diagnostics,
+            b"attempt 2: malicious \x1b]8;;link\x07\n",
+        )
         self.assertEqual(self.state.load_all(), ())
 
     def test_cancelled_ssh_retry_requires_fallback_approval_without_state(self):

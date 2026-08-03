@@ -26,6 +26,7 @@ from .approval import (
     ApprovalDecision,
     ApprovalPager,
     ApprovalTerminal,
+    MAX_OPENSSH_DIAGNOSTIC_BYTES,
     request_approval,
     request_fallback_approval,
     request_machine_disable,
@@ -39,6 +40,7 @@ from .terminal import TerminalArbiter, TerminalPriority
 
 MAX_FAILURE_DETAIL_CHARACTERS = 4096
 MAX_ACTIVITY_MESSAGE_CHARACTERS = 4096
+SSH_RETRY_LIMIT = 1
 _HEX_DIGEST_LENGTH = 64
 _PROMPT_ID_LENGTH = 32
 _DEFAULT_PAGER = object()
@@ -57,6 +59,27 @@ class RemoteMutationState(StrEnum):
     STARTED = "started"
 
 
+class RemoteCommandState(StrEnum):
+    """Truthful requested-command state shown at recovery boundaries."""
+
+    NOT_STARTED = "not_started"
+    MAY_HAVE_STARTED = "may_have_started"
+    STARTED = "started"
+
+
+class ConnectionPhase(StrEnum):
+    """Structured request lifecycle projected in place by operator UIs."""
+
+    CONNECTING = "connecting"
+    RETRY_DECISION = "retry_decision"
+    RETRYING = "retrying"
+    FALLBACK_DECISION = "fallback_decision"
+    REMOTE_STARTING = "remote_starting"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class ActivityKind(StrEnum):
     """Presentation-independent categories for bounded operator activity."""
 
@@ -66,6 +89,7 @@ class ActivityKind(StrEnum):
     ERROR = "error"
     BROKER_AUDIT = "broker_audit"
     SSH_PROMPT = "ssh_prompt"
+    CONNECTION = "connection"
 
 
 def _canonical_sha256(domain: str, document: dict[str, object]) -> str:
@@ -170,6 +194,23 @@ def _require_mutation_state(value: RemoteMutationState) -> RemoteMutationState:
         return RemoteMutationState(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("invalid remote mutation state") from exc
+
+
+def _require_command_state(value: RemoteCommandState) -> RemoteCommandState:
+    try:
+        return RemoteCommandState(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid remote command state") from exc
+
+
+def _require_diagnostics(value: bytes) -> tuple[bytes, str]:
+    if not isinstance(value, bytes):
+        raise TypeError("OpenSSH diagnostics must be bytes")
+    if len(value) > MAX_OPENSSH_DIAGNOSTIC_BYTES:
+        raise ValueError(
+            f"OpenSSH diagnostics exceed {MAX_OPENSSH_DIAGNOSTIC_BYTES} bytes"
+        )
+    return value, hashlib.sha256(value).hexdigest()
 
 
 def _endpoint_index(plan: ConnectionPlan, endpoint_id: str) -> int:
@@ -293,6 +334,11 @@ class SshRetryPrompt:
     connection_plan: ConnectionPlan
     endpoint_id: str
     failure_detail: str
+    openssh_diagnostics: bytes
+    openssh_diagnostics_sha256: str
+    retry_number: int
+    retry_limit: int
+    remote_command_state: RemoteCommandState
     remote_mutation_state: RemoteMutationState
     client_request_sha256: str
     command_identity_sha256: str
@@ -307,6 +353,20 @@ class SshRetryPrompt:
         plan_digest = _require_plan(self.request, self.connection_plan)
         _endpoint_index(self.connection_plan, self.endpoint_id)
         failure = _require_failure_detail(self.failure_detail)
+        diagnostics, diagnostic_digest = _require_diagnostics(
+            self.openssh_diagnostics
+        )
+        _require_digest(
+            self.openssh_diagnostics_sha256,
+            field_name="openssh_diagnostics_sha256",
+        )
+        if self.openssh_diagnostics_sha256 != diagnostic_digest:
+            raise ValueError("OpenSSH diagnostic digest does not match exact bytes")
+        if self.retry_number != 1 or self.retry_limit != SSH_RETRY_LIMIT:
+            raise ValueError("SSH retry prompt must expose the one-retry policy")
+        command_state = _require_command_state(self.remote_command_state)
+        if command_state is not RemoteCommandState.NOT_STARTED:
+            raise ValueError("SSH retry is forbidden after the remote command may start")
         mutation = _require_mutation_state(self.remote_mutation_state)
         if mutation is not RemoteMutationState.NOT_STARTED:
             raise ValueError("SSH retry is forbidden after remote mutation may have started")
@@ -326,9 +386,13 @@ class SshRetryPrompt:
                 "connection_plan_sha256": plan_digest,
                 "endpoint_id": self.endpoint_id,
                 "failure_detail": failure,
+                "openssh_diagnostics_sha256": diagnostic_digest,
                 "prompt_id": self.prompt_id,
+                "remote_command_state": command_state.value,
                 "remote_mutation_state": mutation.value,
                 "request_id": request_id,
+                "retry_limit": self.retry_limit,
+                "retry_number": self.retry_number,
             },
         )
         _require_digest(self.retry_binding_sha256, field_name="retry_binding_sha256")
@@ -349,6 +413,10 @@ class SshRetryPrompt:
         endpoint_id: str,
         failure_detail: str,
         remote_mutation_state: RemoteMutationState,
+        openssh_diagnostics: bytes = b"",
+        retry_number: int = 1,
+        retry_limit: int = SSH_RETRY_LIMIT,
+        remote_command_state: RemoteCommandState = RemoteCommandState.NOT_STARTED,
         prompt_id: str | None = None,
     ) -> "SshRetryPrompt":
         request_id, request_digest, command_digest = _require_request(
@@ -357,6 +425,12 @@ class SshRetryPrompt:
         plan_digest = _require_plan(request, connection_plan)
         _endpoint_index(connection_plan, endpoint_id)
         failure_detail = _require_failure_detail(failure_detail)
+        diagnostics, diagnostic_digest = _require_diagnostics(openssh_diagnostics)
+        if retry_number != 1 or retry_limit != SSH_RETRY_LIMIT:
+            raise ValueError("SSH retry prompt must expose the one-retry policy")
+        command_state = _require_command_state(remote_command_state)
+        if command_state is not RemoteCommandState.NOT_STARTED:
+            raise ValueError("SSH retry is forbidden after the remote command may start")
         mutation = _require_mutation_state(remote_mutation_state)
         if mutation is not RemoteMutationState.NOT_STARTED:
             raise ValueError("SSH retry is forbidden after remote mutation may have started")
@@ -369,9 +443,13 @@ class SshRetryPrompt:
                 "connection_plan_sha256": plan_digest,
                 "endpoint_id": endpoint_id,
                 "failure_detail": failure_detail,
+                "openssh_diagnostics_sha256": diagnostic_digest,
                 "prompt_id": prompt_id,
+                "remote_command_state": command_state.value,
                 "remote_mutation_state": mutation.value,
                 "request_id": request_id,
+                "retry_limit": retry_limit,
+                "retry_number": retry_number,
             },
         )
         return cls(
@@ -381,6 +459,11 @@ class SshRetryPrompt:
             connection_plan,
             endpoint_id,
             failure_detail,
+            diagnostics,
+            diagnostic_digest,
+            retry_number,
+            retry_limit,
+            command_state,
             mutation,
             request_digest,
             command_digest,
@@ -398,6 +481,9 @@ class RouteFallbackPrompt:
     failed_endpoint_id: str
     fallback_endpoint_id: str
     failure_detail: str
+    openssh_diagnostics: bytes
+    openssh_diagnostics_sha256: str
+    remote_command_state: RemoteCommandState
     remote_mutation_state: RemoteMutationState
     client_request_sha256: str
     command_identity_sha256: str
@@ -417,6 +503,18 @@ class RouteFallbackPrompt:
         if fallback_index != failed_index + 1:
             raise ValueError("fallback endpoint is not the next approved route")
         failure = _require_failure_detail(self.failure_detail)
+        diagnostics, diagnostic_digest = _require_diagnostics(
+            self.openssh_diagnostics
+        )
+        _require_digest(
+            self.openssh_diagnostics_sha256,
+            field_name="openssh_diagnostics_sha256",
+        )
+        if self.openssh_diagnostics_sha256 != diagnostic_digest:
+            raise ValueError("OpenSSH diagnostic digest does not match exact bytes")
+        command_state = _require_command_state(self.remote_command_state)
+        if command_state is not RemoteCommandState.NOT_STARTED:
+            raise ValueError("fallback is forbidden after the remote command may start")
         mutation = _require_mutation_state(self.remote_mutation_state)
         if mutation is not RemoteMutationState.NOT_STARTED:
             raise ValueError("fallback is forbidden after remote mutation may have started")
@@ -437,7 +535,9 @@ class RouteFallbackPrompt:
                 "failed_endpoint_id": self.failed_endpoint_id,
                 "failure_detail": failure,
                 "fallback_endpoint_id": self.fallback_endpoint_id,
+                "openssh_diagnostics_sha256": diagnostic_digest,
                 "prompt_id": self.prompt_id,
+                "remote_command_state": command_state.value,
                 "remote_mutation_state": mutation.value,
                 "request_id": request_id,
             },
@@ -463,6 +563,8 @@ class RouteFallbackPrompt:
         fallback_endpoint_id: str,
         failure_detail: str,
         remote_mutation_state: RemoteMutationState,
+        openssh_diagnostics: bytes = b"",
+        remote_command_state: RemoteCommandState = RemoteCommandState.NOT_STARTED,
         prompt_id: str | None = None,
     ) -> "RouteFallbackPrompt":
         request_id, request_digest, command_digest = _require_request(
@@ -473,6 +575,10 @@ class RouteFallbackPrompt:
         if _endpoint_index(connection_plan, fallback_endpoint_id) != failed_index + 1:
             raise ValueError("fallback endpoint is not the next approved route")
         failure_detail = _require_failure_detail(failure_detail)
+        diagnostics, diagnostic_digest = _require_diagnostics(openssh_diagnostics)
+        command_state = _require_command_state(remote_command_state)
+        if command_state is not RemoteCommandState.NOT_STARTED:
+            raise ValueError("fallback is forbidden after the remote command may start")
         mutation = _require_mutation_state(remote_mutation_state)
         if mutation is not RemoteMutationState.NOT_STARTED:
             raise ValueError("fallback is forbidden after remote mutation may have started")
@@ -486,7 +592,9 @@ class RouteFallbackPrompt:
                 "failed_endpoint_id": failed_endpoint_id,
                 "failure_detail": failure_detail,
                 "fallback_endpoint_id": fallback_endpoint_id,
+                "openssh_diagnostics_sha256": diagnostic_digest,
                 "prompt_id": prompt_id,
+                "remote_command_state": command_state.value,
                 "remote_mutation_state": mutation.value,
                 "request_id": request_id,
             },
@@ -499,6 +607,9 @@ class RouteFallbackPrompt:
             failed_endpoint_id,
             fallback_endpoint_id,
             failure_detail,
+            diagnostics,
+            diagnostic_digest,
+            command_state,
             mutation,
             request_digest,
             command_digest,
@@ -766,6 +877,8 @@ class OperationalActivity:
     machine_name: str | None = None
     endpoint_id: str | None = None
     details: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    connection_phase: ConnectionPhase | None = None
+    remote_mutation_state: RemoteMutationState | None = None
 
     def __post_init__(self) -> None:
         _require_prompt_id(self.event_id)
@@ -795,6 +908,26 @@ class OperationalActivity:
         ):
             raise ValueError("activity details must contain non-empty string keys")
         object.__setattr__(self, "details", details)
+        if self.connection_phase is None:
+            if kind is ActivityKind.CONNECTION:
+                raise ValueError("connection activity requires a connection phase")
+        else:
+            try:
+                phase = ConnectionPhase(self.connection_phase)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid connection phase") from exc
+            if kind is not ActivityKind.CONNECTION:
+                raise ValueError("connection phase requires connection activity")
+            if self.request_id is None or self.machine_name is None:
+                raise ValueError("connection activity requires request and machine")
+            object.__setattr__(self, "connection_phase", phase)
+        if self.remote_mutation_state is not None:
+            mutation = _require_mutation_state(self.remote_mutation_state)
+            if kind is not ActivityKind.CONNECTION:
+                raise ValueError("remote mutation state requires connection activity")
+            object.__setattr__(self, "remote_mutation_state", mutation)
+        elif kind is ActivityKind.CONNECTION:
+            raise ValueError("connection activity requires remote mutation state")
 
     @classmethod
     def create(
@@ -806,6 +939,8 @@ class OperationalActivity:
         machine_name: str | None = None,
         endpoint_id: str | None = None,
         details: tuple[tuple[str, str], ...] = (),
+        connection_phase: ConnectionPhase | None = None,
+        remote_mutation_state: RemoteMutationState | None = None,
     ) -> "OperationalActivity":
         return cls(
             _new_prompt_id(),
@@ -815,6 +950,8 @@ class OperationalActivity:
             machine_name,
             endpoint_id,
             details,
+            connection_phase,
+            remote_mutation_state,
         )
 
 
@@ -1166,6 +1303,15 @@ class PlainTerminalInterface:
                     endpoint_id=prompt.endpoint_id,
                     failure_detail=prompt.failure_detail,
                     remote_mutation_started=False,
+                    openssh_diagnostics=prompt.openssh_diagnostics,
+                    openssh_diagnostics_sha256=(
+                        prompt.openssh_diagnostics_sha256
+                    ),
+                    remote_command_state=prompt.remote_command_state.value,
+                    retry_number=prompt.retry_number,
+                    retry_limit=prompt.retry_limit,
+                    retry_binding_sha256=prompt.retry_binding_sha256,
+                    prompt_id=prompt.prompt_id,
                     terminal=self._approval_terminal,
                 )
             if isinstance(prompt, RouteFallbackPrompt):
@@ -1174,6 +1320,13 @@ class PlainTerminalInterface:
                     "fallback_endpoint_id": prompt.fallback_endpoint_id,
                     "failure_detail": prompt.failure_detail,
                     "remote_mutation_started": False,
+                    "openssh_diagnostics": prompt.openssh_diagnostics,
+                    "openssh_diagnostics_sha256": (
+                        prompt.openssh_diagnostics_sha256
+                    ),
+                    "remote_command_state": prompt.remote_command_state.value,
+                    "fallback_binding_sha256": prompt.fallback_binding_sha256,
+                    "prompt_id": prompt.prompt_id,
                     "terminal": self._approval_terminal,
                 }
                 if self._pager is not _DEFAULT_PAGER:
@@ -1242,6 +1395,7 @@ class PlainTerminalInterface:
 
 __all__ = [
     "ActivityKind",
+    "ConnectionPhase",
     "ExecutionApprovalPrompt",
     "MachineDisablePrompt",
     "OperationalActivity",
@@ -1254,6 +1408,7 @@ __all__ = [
     "QueuedPrompt",
     "require_operator_decision",
     "RemoteMutationState",
+    "RemoteCommandState",
     "RouteFallbackPrompt",
     "SecretInputAuthorizationPrompt",
     "SecretInputRecipient",

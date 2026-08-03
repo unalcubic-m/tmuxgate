@@ -448,9 +448,9 @@ class RealSshProcessTests(unittest.TestCase):
         kwargs = calls[0][1]
         self.assertIs(kwargs["stdin"], terminal)
         self.assertIs(kwargs["stdout"], terminal)
-        self.assertIs(kwargs["stderr"], terminal)
+        self.assertIs(kwargs["stderr"], subprocess.PIPE)
         self.assertNotIn("SSH_AUTH_SOCK", kwargs["env"])
-        self.assertIn(b"no requested command has started", terminal.getvalue())
+        self.assertEqual(terminal.getvalue(), b"")
 
     def test_post_enrollment_master_cannot_be_prompt_capable(self):
         terminal = FakeTerminal()
@@ -464,7 +464,7 @@ class RealSshProcessTests(unittest.TestCase):
             SshInvocation("start-master", ("/usr/bin/ssh",), False),
             Path("/tmp/master.sock"),
         )
-        self.assertIn(b"public-key-only", terminal.getvalue())
+        self.assertEqual(terminal.getvalue(), b"")
 
         with self.assertRaisesRegex(TransportError, "terminal policy"):
             backend.start_master(
@@ -472,7 +472,7 @@ class RealSshProcessTests(unittest.TestCase):
                 Path("/tmp/master.sock"),
             )
 
-    def test_master_failure_reports_status_without_copying_terminal_output(self):
+    def test_master_failure_captures_exact_structured_diagnostics(self):
         terminal = FakeTerminal()
 
         def run(argv, **kwargs):
@@ -495,12 +495,15 @@ class RealSshProcessTests(unittest.TestCase):
             backend.start_master(invocation, Path("/tmp/master.sock"))
 
         self.assertEqual(raised.exception.returncode, 255)
+        self.assertEqual(
+            raised.exception.diagnostics,
+            b"secret-like stderr that must remain terminal-only",
+        )
         detail = str(raised.exception)
         self.assertIn("status 255", detail)
         self.assertIn("before remote execution", detail)
-        self.assertIn("broker terminal", detail)
         self.assertNotIn("secret-like", detail)
-        self.assertIn(b"Complete any OpenSSH prompt", terminal.getvalue())
+        self.assertEqual(terminal.getvalue(), b"")
 
     def test_master_stop_failure_is_observable(self):
         def run(argv, **kwargs):

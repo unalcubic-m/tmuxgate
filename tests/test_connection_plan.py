@@ -345,7 +345,7 @@ class BoundApprovalTests(unittest.TestCase):
         )
         self.assertIs(decision, ApprovalDecision.DENIED)
 
-    def test_ssh_retry_uses_yes_no_prompt_with_yes_default(self):
+    def test_ssh_retry_uses_yes_no_prompt_with_cancel_default(self):
         terminal, output = self.terminal("do-not-echo-this\n\n")
         detail = "OpenSSH failed\n\x1b[31mterminal text"
         decision = request_ssh_retry(
@@ -358,11 +358,11 @@ class BoundApprovalTests(unittest.TestCase):
             terminal=terminal,
         )
         rendered = output.getvalue()
-        self.assertIs(decision, ApprovalDecision.APPROVED)
+        self.assertIs(decision, ApprovalDecision.DENIED)
         self.assertIn("Please answer y or n.", rendered)
         self.assertIn(
             f"Retry SSH setup once for request {REQUEST_ID[:8]} "
-            "on endpoint home-lan? [Y/n]",
+            "on endpoint home-lan? [y/N]",
             rendered,
         )
         self.assertNotIn("do-not-echo-this", rendered)
@@ -407,6 +407,26 @@ class BoundApprovalTests(unittest.TestCase):
                 endpoint_id="home-lan",
                 failure_detail="late failure",
                 remote_mutation_started=True,
+            )
+        with self.assertRaisesRegex(ApprovalError, "remote command"):
+            render_ssh_retry_document(
+                REQUEST_ID,
+                self.request,
+                self.plan,
+                endpoint_id="home-lan",
+                failure_detail="late failure",
+                remote_mutation_started=False,
+                remote_command_state="may_have_started",
+            )
+        with self.assertRaisesRegex(ApprovalError, "binding digest"):
+            render_ssh_retry_document(
+                REQUEST_ID,
+                self.request,
+                self.plan,
+                endpoint_id="home-lan",
+                failure_detail="status 255",
+                remote_mutation_started=False,
+                retry_binding_sha256="not-a-digest",
             )
 
 

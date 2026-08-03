@@ -10,7 +10,10 @@ from tmuxgate.approval import ApprovalDecision
 from tmuxgate.connection_plan import ConnectionPlan, PlannedEndpoint
 from tmuxgate.models import RequestSpec
 from tmuxgate.operator_interface import (
+    ActivityKind,
+    ConnectionPhase,
     MachineDisablePrompt,
+    OperationalActivity,
     OperatorInterface,
     RemoteMutationState,
     RouteFallbackPrompt,
@@ -216,6 +219,30 @@ class RealExecutor:
         with self._records_lock:
             return tuple(sorted(self._recovery_jobs))
 
+    def _publish_connection(
+        self,
+        request_id: str,
+        request: RequestSpec,
+        phase: ConnectionPhase,
+        message: str,
+        *,
+        endpoint_id: str | None = None,
+        remote_mutation_state: RemoteMutationState = RemoteMutationState.NOT_STARTED,
+        details: tuple[tuple[str, str], ...] = (),
+    ) -> None:
+        self.operator_interface.publish_activity(
+            OperationalActivity.create(
+                ActivityKind.CONNECTION,
+                message,
+                request_id=request_id,
+                machine_name=request.machine_alias,
+                endpoint_id=endpoint_id,
+                details=details,
+                connection_phase=phase,
+                remote_mutation_state=remote_mutation_state,
+            )
+        )
+
     def _acquire_transport(
         self,
         request_id: str,
@@ -223,6 +250,7 @@ class RealExecutor:
         plan: ConnectionPlan,
     ) -> tuple[TransportLease, PlannedEndpoint, DurableJobRecord | None]:
         failure: BaseException | None = None
+        failure_diagnostics = b""
         all_endpoints_exhausted = True
         for index, endpoint in enumerate(plan.endpoints):
             if index == 0:
@@ -234,6 +262,14 @@ class RealExecutor:
                 )
             else:
                 previous = plan.endpoints[index - 1]
+                self._publish_connection(
+                    request_id,
+                    request,
+                    ConnectionPhase.FALLBACK_DECISION,
+                    "SSH setup failed before remote mutation; a separate route "
+                    "fallback decision is required.",
+                    endpoint_id=previous.resolved.endpoint_id,
+                )
                 prompt = RouteFallbackPrompt.create(
                         request_id,
                         request,
@@ -242,6 +278,7 @@ class RealExecutor:
                         fallback_endpoint_id=endpoint.resolved.endpoint_id,
                         failure_detail=str(failure)[:500],
                         remote_mutation_state=RemoteMutationState.NOT_STARTED,
+                        openssh_diagnostics=failure_diagnostics,
                     )
                 decision = require_operator_decision(
                     prompt,
@@ -249,6 +286,14 @@ class RealExecutor:
                 )
                 if decision is not ApprovalDecision.APPROVED:
                     raise TransportError("human denied the next approved fallback")
+                self._publish_connection(
+                    request_id,
+                    request,
+                    ConnectionPhase.CONNECTING,
+                    "Connecting through the separately approved fallback route; "
+                    "the remote command has not started.",
+                    endpoint_id=endpoint.resolved.endpoint_id,
+                )
                 authorization = issue_fallback_transport_authorization(
                     request_id,
                     request,
@@ -258,7 +303,17 @@ class RealExecutor:
                     fallback_decision=decision,
                 )
             ssh_attempt = 0
+            failure_diagnostics = b""
             while True:
+                if ssh_attempt == 0:
+                    self._publish_connection(
+                        request_id,
+                        request,
+                        ConnectionPhase.CONNECTING,
+                        "Establishing the approved SSH connection; remote setup "
+                        "is occurring and the requested command has not started.",
+                        endpoint_id=endpoint.resolved.endpoint_id,
+                    )
                 enrollment = _DurableKeyEnrollmentLifecycle(
                     self.state,
                     request_id,
@@ -281,10 +336,28 @@ class RealExecutor:
                         "retry and route fallback were not attempted"
                     )
                     record = enrollment.fail_after_remote_mutation(detail)
+                    self._publish_connection(
+                        request_id,
+                        request,
+                        ConnectionPhase.FAILED,
+                        detail,
+                        endpoint_id=endpoint.resolved.endpoint_id,
+                        remote_mutation_state=RemoteMutationState.MAY_HAVE_STARTED,
+                    )
                     raise RemoteSetupFailure(detail, record) from exc
                 except SshMasterStartError as exc:
                     failure = exc
+                    failure_diagnostics = exc.diagnostics
                     if ssh_attempt == 0:
+                        self._publish_connection(
+                            request_id,
+                            request,
+                            ConnectionPhase.RETRY_DECISION,
+                            "OpenSSH setup failed before remote mutation; one "
+                            "same-endpoint retry is available.",
+                            endpoint_id=endpoint.resolved.endpoint_id,
+                            details=(("retry_limit", "1"),),
+                        )
                         prompt = SshRetryPrompt.create(
                                 request_id,
                                 request,
@@ -294,6 +367,7 @@ class RealExecutor:
                                 remote_mutation_state=(
                                     RemoteMutationState.NOT_STARTED
                                 ),
+                                openssh_diagnostics=failure_diagnostics,
                             )
                         decision = require_operator_decision(
                             prompt,
@@ -307,6 +381,15 @@ class RealExecutor:
                                 retried_endpoint_id=endpoint.resolved.endpoint_id,
                             )
                             ssh_attempt += 1
+                            self._publish_connection(
+                                request_id,
+                                request,
+                                ConnectionPhase.RETRYING,
+                                "Retrying approved SSH setup once; the remote "
+                                "command has not started.",
+                                endpoint_id=endpoint.resolved.endpoint_id,
+                                details=(("retry", "1 of 1"),),
+                            )
                             continue
                         all_endpoints_exhausted = False
                         failure = TransportError(
@@ -328,6 +411,14 @@ class RealExecutor:
                             "fallback were not attempted"
                         )
                         record = enrollment.fail_after_remote_mutation(detail)
+                        self._publish_connection(
+                            request_id,
+                            request,
+                            ConnectionPhase.FAILED,
+                            detail,
+                            endpoint_id=endpoint.resolved.endpoint_id,
+                            remote_mutation_state=RemoteMutationState.STARTED,
+                        )
                         raise RemoteSetupFailure(detail, record) from exc
                     all_endpoints_exhausted = False
                     failure = exc
@@ -389,6 +480,13 @@ class RealExecutor:
             # boundary exists.
             context = self.planner.take(request_id, request)
         except BaseException as exc:
+            self._publish_connection(
+                request_id,
+                request,
+                ConnectionPhase.FAILED,
+                "The approved connection plan was unusable; no remote command "
+                "or mutation started.",
+            )
             return ExecutionResult(
                 request_id,
                 TransportStatus.PRE_REMOTE_FAILURE,
@@ -440,12 +538,24 @@ class RealExecutor:
                     "; machine remains enabled because disabling failed: "
                     f"{str(disable_exc)[:500]}"
                 )
+            self._publish_connection(
+                request_id,
+                request,
+                ConnectionPhase.FAILED,
+                "All approved SSH setup attempts ended before remote execution.",
+            )
             return ExecutionResult(
                 request_id,
                 TransportStatus.PRE_REMOTE_FAILURE,
                 detail=f"SSH transport was not established: {exc}{disable_detail}",
             )
         except BaseException as exc:
+            self._publish_connection(
+                request_id,
+                request,
+                ConnectionPhase.FAILED,
+                "SSH transport was not established; no requested command started.",
+            )
             return ExecutionResult(
                 request_id,
                 TransportStatus.PRE_REMOTE_FAILURE,
@@ -462,6 +572,19 @@ class RealExecutor:
                 )
                 approved = self.state.write(approved)
             armed, permit = self.state.arm_remote_start(approved)
+            self._publish_connection(
+                request_id,
+                request,
+                ConnectionPhase.REMOTE_STARTING,
+                "SSH setup is complete; the durable remote-execution boundary "
+                "is armed and the requested command is starting.",
+                endpoint_id=endpoint.resolved.endpoint_id,
+                remote_mutation_state=(
+                    RemoteMutationState.STARTED
+                    if approved.remote_mutation_started
+                    else RemoteMutationState.NOT_STARTED
+                ),
+            )
         except BaseException as exc:
             try:
                 if (
@@ -484,6 +607,15 @@ class RealExecutor:
                 approved is not None
                 and approved.remote_mutation_started
             ):
+                self._publish_connection(
+                    request_id,
+                    request,
+                    ConnectionPhase.FAILED,
+                    "Remote setup mutation is durable, but the requested command "
+                    "did not cross its start boundary.",
+                    endpoint_id=endpoint.resolved.endpoint_id,
+                    remote_mutation_state=RemoteMutationState.STARTED,
+                )
                 return ExecutionResult(
                     request_id,
                     TransportStatus.REMOTE_SETUP_FAILURE,
@@ -492,6 +624,13 @@ class RealExecutor:
                         f"boundary failed: {exc}; no route fallback was attempted"
                     ),
                 )
+            self._publish_connection(
+                request_id,
+                request,
+                ConnectionPhase.FAILED,
+                "The durable remote-start boundary failed before remote execution.",
+                endpoint_id=endpoint.resolved.endpoint_id,
+            )
             return ExecutionResult(
                 request_id,
                 TransportStatus.PRE_REMOTE_FAILURE,
@@ -511,6 +650,14 @@ class RealExecutor:
             coordinator = RemoteJobCoordinator(backend)
             job = coordinator.prepare(request_id, request, permit)
             coordinator.attach_and_start(job)
+            self._publish_connection(
+                request_id,
+                request,
+                ConnectionPhase.RUNNING,
+                "Remote execution is running; SSH setup has completed.",
+                endpoint_id=endpoint.resolved.endpoint_id,
+                remote_mutation_state=RemoteMutationState.STARTED,
+            )
             self._monitor(request_id, coordinator, job)
 
             observation = backend.observe(job.identity)
@@ -563,6 +710,14 @@ class RealExecutor:
             armed = self.state.begin_result_delivery(armed)
             with self._records_lock:
                 self._delivery_records[request_id] = armed
+            self._publish_connection(
+                request_id,
+                request,
+                ConnectionPhase.COMPLETED,
+                "Remote execution completed and its result was verified locally.",
+                endpoint_id=endpoint.resolved.endpoint_id,
+                remote_mutation_state=RemoteMutationState.STARTED,
+            )
             return ExecutionResult(
                 request_id,
                 TransportStatus.COMPLETE,
@@ -571,6 +726,14 @@ class RealExecutor:
                 remote_exit_status=spooled.exit_status,
             )
         except BaseException as exc:
+            self._publish_connection(
+                request_id,
+                request,
+                ConnectionPhase.FAILED,
+                "Remote execution is incomplete; recovery evidence was retained.",
+                endpoint_id=endpoint.resolved.endpoint_id,
+                remote_mutation_state=RemoteMutationState.STARTED,
+            )
             return self._retain_recovery(
                 request_id,
                 armed,
