@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import StrEnum
 import os
@@ -146,6 +147,31 @@ def flush_textual_input(stream: object | None = None) -> None:
         raise OperatorInterfaceError(
             "Textual could not discard buffered approval input"
         ) from exc
+
+
+def _resume_after(
+    suspension: AbstractContextManager[None],
+    session: Callable[[], None],
+) -> None:
+    """Run one suspended session, always resuming before propagating failure.
+
+    ``App.suspend`` resumes application mode in the statement *after* its
+    ``yield``, unguarded by ``try``/``finally``, so an exception raised by the
+    suspended body skips the resume entirely.  The driver is then left stopped
+    with a stopped writer thread that its bounded queue still accepts writes
+    into, and the next repaint blocks the app permanently.  Capturing the
+    failure keeps the ``with`` block exiting normally so the resume always runs;
+    the original exception is re-raised once the app owns the terminal again.
+    """
+
+    session_error: BaseException | None = None
+    with suspension:
+        try:
+            session()
+        except BaseException as exc:
+            session_error = exc
+    if session_error is not None:
+        raise session_error
 
 
 @dataclass(frozen=True, slots=True)
@@ -1008,8 +1034,7 @@ class TmuxgateDashboardApp(App[None]):
                 purpose=f"secret input for request {prompt.request_id}",
                 flush_input=False,
             ):
-                with self.suspend():
-                    session()
+                _resume_after(self.suspend(), session)
         finally:
             self.interface._finish_external_session(prompt)
             self.refresh(repaint=True, layout=True)
@@ -1039,8 +1064,7 @@ class TmuxgateDashboardApp(App[None]):
                 purpose=purpose,
                 flush_input=False,
             ):
-                with self.suspend():
-                    session()
+                _resume_after(self.suspend(), session)
         finally:
             self.interface._finish_external_token(token)
             self.refresh(repaint=True, layout=True)
