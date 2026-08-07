@@ -173,6 +173,166 @@ class SuspendResumeTests(unittest.TestCase):
         self.assertEqual(events, ["suspend", "resume"])
 
 
+class ArmedFocusTests(unittest.TestCase):
+    """Routine decisions focus the positive action only once it is armed."""
+
+    def _drive(self, screen_type, request, size=(100, 30), arm=True):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        decisions = []
+        asking = threading.Thread(
+            target=lambda: decisions.append(request(interface))
+        )
+        asking.start()
+        self.addCleanup(lambda: asking.join(timeout=1))
+        while interface.pending_prompt_count < 1:
+            time.sleep(0.01)
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+        focused = []
+
+        async def exercise() -> None:
+            async with app.run_test(size=size) as pilot:
+                deadline = time.monotonic() + 2
+                while not isinstance(app.screen, screen_type):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("decision modal did not open")
+                    await pilot.pause(0.02)
+                screen = app.screen
+                if arm:
+                    await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                else:
+                    await pilot.pause()
+                focused.append(screen.focused.id if screen.focused else None)
+                await pilot.press("escape")
+                await pilot.pause()
+
+        asyncio.run(exercise())
+        return focused[0]
+
+    @staticmethod
+    def _execution(interface):
+        return interface.request_execution_approval(prompt()).decision
+
+    @staticmethod
+    def _secret(interface):
+        return interface.request_secret_input_authorization(secret_prompt()).decision
+
+    def test_execution_approval_focuses_approve_once_armed(self):
+        self.assertEqual(self._drive(ExecutionApprovalScreen, self._execution),
+                         "approval-approve")
+
+    def test_secret_authorization_focuses_approve_once_armed(self):
+        self.assertEqual(self._drive(SecretInputAuthorizationScreen, self._secret),
+                         "secret-approve")
+
+    def test_execution_approval_keeps_deny_focused_before_arming(self):
+        # The arm window must stay unfocused as well as disabled, so buffered
+        # input cannot commit the positive action.
+        self.assertEqual(
+            self._drive(ExecutionApprovalScreen, self._execution, arm=False),
+            "approval-deny",
+        )
+
+    def test_compact_terminal_keeps_deny_focused_after_arming(self):
+        # Too small to display the evidence means the operator cannot have
+        # reviewed it, so the safe action keeps focus however long it is open.
+        self.assertEqual(
+            self._drive(
+                ExecutionApprovalScreen,
+                self._execution,
+                size=(MINIMUM_COLUMNS - 1, MINIMUM_ROWS - 1),
+            ),
+            "approval-deny",
+        )
+
+    def test_return_alone_approves_an_armed_execution_request(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        decisions = []
+        asking = threading.Thread(
+            target=lambda: decisions.append(
+                interface.request_execution_approval(prompt()).decision
+            )
+        )
+        asking.start()
+        self.addCleanup(lambda: asking.join(timeout=1))
+        while interface.pending_prompt_count < 1:
+            time.sleep(0.01)
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                deadline = time.monotonic() + 2
+                while not isinstance(app.screen, ExecutionApprovalScreen):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("approval modal did not open")
+                    await pilot.pause(0.02)
+                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                await pilot.press("enter")
+                deadline = time.monotonic() + 2
+                while asking.is_alive() and time.monotonic() < deadline:
+                    await pilot.pause(0.02)
+
+        asyncio.run(exercise())
+        asking.join(timeout=1)
+        self.assertEqual(decisions, [ApprovalDecision.APPROVED])
+
+    def test_return_before_arming_takes_the_safe_action(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        decisions = []
+        asking = threading.Thread(
+            target=lambda: decisions.append(
+                interface.request_execution_approval(prompt()).decision
+            )
+        )
+        asking.start()
+        self.addCleanup(lambda: asking.join(timeout=1))
+        while interface.pending_prompt_count < 1:
+            time.sleep(0.01)
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                deadline = time.monotonic() + 2
+                while not isinstance(app.screen, ExecutionApprovalScreen):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("approval modal did not open")
+                    await pilot.pause(0.02)
+                # Deny still holds focus inside the arm window, so a Return
+                # that beats the timer denies rather than approving.
+                await pilot.press("enter")
+                deadline = time.monotonic() + 2
+                while asking.is_alive() and time.monotonic() < deadline:
+                    await pilot.pause(0.02)
+
+        asyncio.run(exercise())
+        asking.join(timeout=1)
+        self.assertEqual(decisions, [ApprovalDecision.DENIED])
+
+    def test_machine_disable_keeps_the_safe_action_focused(self):
+        def request(interface):
+            return interface.request_machine_disable(
+                MachineDisablePrompt.create(
+                    REQUEST_ID,
+                    prompt().request,
+                    build_plan(),
+                    failure_detail="all routes failed",
+                    remote_mutation_state=RemoteMutationState.NOT_STARTED,
+                )
+            ).decision
+
+        self.assertEqual(
+            self._drive(MachineDisableScreen, request), "disable-cancel"
+        )
+
+
 class TextualOperatorInterfaceTests(unittest.TestCase):
     @staticmethod
     async def _wait_for_approval(

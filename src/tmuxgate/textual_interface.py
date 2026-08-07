@@ -218,6 +218,13 @@ class _FailClosedDecisionScreen(ModalScreen[ApprovalDecision]):
 
     SAFE_BUTTON_ID = ""
     POSITIVE_BUTTON_ID = ""
+    # Screens that opt in move focus to the positive action once it arms, so a
+    # single Return commits the routine decision.  The fences that make that
+    # safe are unchanged: buffered input is still discarded before the modal
+    # accepts anything, the positive action stays disabled and unfocused for
+    # APPROVAL_ARM_SECONDS, and a terminal too small to show the evidence keeps
+    # the safe action focused.  Escape always takes the safe action.
+    FOCUS_POSITIVE_WHEN_ARMED = False
 
     def __init__(self) -> None:
         super().__init__()
@@ -273,6 +280,8 @@ class _FailClosedDecisionScreen(ModalScreen[ApprovalDecision]):
         positive.disabled = not self._arm_ready or self._compact
         if self._compact or not self._arm_ready:
             safe.focus()
+        elif self.FOCUS_POSITIVE_WHEN_ARMED and not self._finished:
+            positive.focus()
 
     def action_safe_default(self) -> None:
         self._finish(ApprovalDecision.DENIED)
@@ -335,6 +344,7 @@ class ExecutionApprovalScreen(_FailClosedDecisionScreen):
     ]
     SAFE_BUTTON_ID = "approval-deny"
     POSITIVE_BUTTON_ID = "approval-approve"
+    FOCUS_POSITIVE_WHEN_ARMED = True
 
     def __init__(self, prompt: ExecutionApprovalPrompt) -> None:
         if not isinstance(prompt, ExecutionApprovalPrompt):
@@ -783,6 +793,7 @@ class SecretInputAuthorizationScreen(_FailClosedDecisionScreen):
     BINDINGS = [Binding("escape", "safe_default", "Deny", priority=True)]
     SAFE_BUTTON_ID = "secret-deny"
     POSITIVE_BUTTON_ID = "secret-approve"
+    FOCUS_POSITIVE_WHEN_ARMED = True
 
     def __init__(self, prompt: SecretInputAuthorizationPrompt) -> None:
         if not isinstance(prompt, SecretInputAuthorizationPrompt):

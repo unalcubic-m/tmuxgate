@@ -439,6 +439,14 @@ slot. The machine-disable modal shows the exhausted request, complete approved
 request/plan evidence, and exact disable binding; Keep enabled is its fenced
 safe default.
 
+Focus follows the same fence. Every decision modal opens with its safe action
+focused and its positive action disabled. When the fence elapses on execution
+approval and secret-input authorization, focus moves to the positive action so
+one Return commits the routine decision; SSH retry, adjacent-route fallback, and
+machine-disable keep the safe action focused because their positive action is
+not the routine outcome. A compact terminal keeps the safe action focused in
+every modal, and Escape always takes the safe action.
+
 Besides the request-bound secret handoff, the interface exposes
 `run_terminal_session(purpose, session)` for a trusted session that exists
 before any request-bound secret can: SSH enrollment authentication. It is named

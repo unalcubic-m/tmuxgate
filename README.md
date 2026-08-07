@@ -253,9 +253,12 @@ Pending prompts: 0                  Terminal ownership: tui
 
 When a decision is pending, one exact modal replaces dashboard interaction.
 Summary, complete code or diagnostics, and binding evidence remain scrollable;
-Enter and Escape select the focused safe action. Positive actions are disabled
-until the modal's stale-input fence has elapsed and require a deliberate button
-activation.
+Escape always selects the safe action. Positive actions are disabled and
+unfocused until the modal's stale-input fence has elapsed, so Enter inside that
+window selects the safe action. Once the fence elapses, execution approval and
+secret-input authorization focus their positive action and Enter commits the
+decision; bounded SSH retry, adjacent-route fallback, and machine-disable keep
+the safe action focused and require a deliberate button activation.
 
 The Textual interface is the default in a supported interactive terminal.
 `tmuxgate --plain` explicitly selects the supported line-oriented fail-safe;
