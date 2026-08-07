@@ -20,6 +20,40 @@ class RequestSpecTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             RequestSpec("host", ExecutionMode.ARGV, "/", argv=("true",), purpose="bad\nline")
 
+    def test_interactive_defaults_to_false_and_is_bound_to_the_digest(self):
+        default = RequestSpec("host", ExecutionMode.ARGV, "/", argv=("true",))
+        interactive = RequestSpec(
+            "host", ExecutionMode.ARGV, "/", argv=("true",), interactive=True
+        )
+        self.assertIs(default.interactive, False)
+        self.assertIs(interactive.interactive, True)
+        self.assertIs(default.to_wire_header()["interactive"], False)
+        self.assertIs(interactive.to_wire_header()["interactive"], True)
+        for request in (default, interactive):
+            rebuilt = RequestSpec.from_wire(request.to_wire_header(), b"")
+            self.assertIs(rebuilt.interactive, request.interactive)
+        # Interactive execution is part of what the operator approves, so it
+        # must change the request identity that binds every later decision.
+        self.assertNotEqual(
+            default.client_request_sha256(),
+            interactive.client_request_sha256(),
+        )
+
+    def test_interactive_must_be_an_exact_bool_on_the_wire(self):
+        for value in (1, 0, "true", "1", None, [], 1.0):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                RequestSpec(
+                    "host", ExecutionMode.ARGV, "/", argv=("true",), interactive=value
+                )
+        request = RequestSpec("host", ExecutionMode.ARGV, "/", argv=("true",))
+        header = request.to_wire_header()
+        header["interactive"] = 1
+        with self.assertRaises(ValidationError):
+            RequestSpec.from_wire(header, b"")
+        del header["interactive"]
+        with self.assertRaises(ValidationError):
+            RequestSpec.from_wire(header, b"")
+
     def test_argv_is_preserved_as_structured_unicode_data(self):
         argv = (
             "printf",

@@ -53,7 +53,7 @@ fi
 
 case "$operation" in
     validate)
-        for required in mode cwd.bin environment.bin timeout result-limits remote_runner.sh remote_control.sh; do
+        for required in mode cwd.bin environment.bin timeout interactive result-limits remote_runner.sh remote_control.sh; do
             safe_file "$required" || {
                 echo "tmuxgate control refused unsafe $required" >&2
                 exit 125
@@ -172,7 +172,7 @@ case "$operation" in
             [ -e "$entry" ] || continue
             name=${entry##*/}
             case "$name" in
-                mode|cwd.bin|environment.bin|timeout|result-limits|argv.bin|payload.sh|remote_runner.sh|remote_control.sh|stdout.raw|stderr.raw|state|exit-code|gate-released)
+                mode|cwd.bin|environment.bin|timeout|interactive|result-limits|argv.bin|payload.sh|remote_runner.sh|remote_control.sh|stdout.raw|stderr.raw|state|exit-code|gate-released)
                     [ -f "$entry" ] && [ ! -L "$entry" ] || exit 125
                     ;;
                 *)
@@ -183,7 +183,7 @@ case "$operation" in
         done
         rm -f -- \
             "$job_dir/mode" "$job_dir/cwd.bin" "$job_dir/environment.bin" \
-            "$job_dir/timeout" "$job_dir/result-limits" \
+            "$job_dir/timeout" "$job_dir/interactive" "$job_dir/result-limits" \
             "$job_dir/argv.bin" "$job_dir/payload.sh" \
             "$job_dir/remote_runner.sh" "$job_dir/remote_control.sh" \
             "$job_dir/stdout.raw" "$job_dir/stderr.raw" "$job_dir/state" \

@@ -1,5 +1,6 @@
 from io import BytesIO
 import os
+import socket
 from pathlib import Path
 import pty
 import select
@@ -117,15 +118,22 @@ _SECRET_REQUEST = RequestSpec(
     ExecutionMode.ARGV,
     "/opt/docker",
     argv=("sudo", "--", "/bin/true"),
+    interactive=True,
+)
+_NON_INTERACTIVE_SECRET_REQUEST = RequestSpec(
+    "app-server",
+    ExecutionMode.ARGV,
+    "/opt/docker",
+    argv=("sudo", "--", "/bin/true"),
 )
 _SECRET_PLAN = build_plan()
 
 
-def secret_input_recipient(viewer):
+def secret_input_recipient(viewer, request=_SECRET_REQUEST):
     suffix = viewer.session_name.removeprefix("tmuxgate-")
     return SecretInputRecipient(
         suffix + ("0" * 20),
-        _SECRET_REQUEST,
+        request,
         _SECRET_PLAN,
         "home-lan",
     )
@@ -137,6 +145,67 @@ def approve_secret_input(prompt):
 
 def approved_presenter(**kwargs):
     return SecretPromptPresenter(authorizer=approve_secret_input, **kwargs)
+
+
+class InteractiveHandoffScopeTests(unittest.TestCase):
+    """Terminal handoff exists only for explicitly interactive requests."""
+
+    def _presenter(self, watched):
+        presenter = SecretPromptPresenter(authorizer=approve_secret_input)
+        presenter.watch = lambda viewer, recipient: watched.append(
+            (viewer, recipient)
+        )
+        return presenter
+
+    def test_watching_a_non_interactive_request_is_refused(self):
+        viewer = ScriptedDetachedViewer("aaaaaaaaaaaa")
+        presenter = approved_presenter(poll_seconds=0.005)
+        try:
+            with self.assertRaises(TransportError) as raised:
+                presenter.watch(
+                    viewer,
+                    secret_input_recipient(
+                        viewer, _NON_INTERACTIVE_SECRET_REQUEST
+                    ),
+                )
+            self.assertIn("explicitly interactive", str(raised.exception))
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_detached_viewer_watches_only_an_interactive_request(self):
+        for interactive, request in (
+            (True, _SECRET_REQUEST),
+            (False, _NON_INTERACTIVE_SECRET_REQUEST),
+        ):
+            with self.subTest(interactive=interactive), tempfile.TemporaryDirectory() as directory:
+                watched = []
+                presenter = self._presenter(watched)
+                listener = socket.socket(socket.AF_UNIX)
+                try:
+                    socket_path = Path(directory) / "viewer.sock"
+
+                    def start_viewer(argv, **kwargs):
+                        # Stand in for the private local tmux server: it is the
+                        # start command that creates the owner-only socket.
+                        listener.bind(os.fspath(socket_path))
+                        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+                    channels = SshChannelRunner(
+                        runner=start_viewer, prompt_presenter=presenter
+                    )
+                    request_id = "b" * 12 + "0" * 20
+                    channels.detached_viewer(
+                        ("ssh", "host"),
+                        socket_path=socket_path,
+                        session_name=f"tmuxgate-{request_id[:12]}",
+                        secret_input_recipient=SecretInputRecipient(
+                            request_id, request, _SECRET_PLAN, "home-lan"
+                        ),
+                    )
+                    self.assertEqual(len(watched), 1 if interactive else 0)
+                finally:
+                    listener.close()
+                    self.assertTrue(presenter.close())
 
 
 class RealSshProcessTests(unittest.TestCase):

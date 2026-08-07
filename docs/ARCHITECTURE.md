@@ -267,11 +267,12 @@ The MCP surface contains exactly five tools:
 - `list_machines()` returns only logical aliases, descriptions, and the boolean
   enabled state; endpoints, addresses, SSH identities/options, routes, keys,
   and host-key evidence remain private to the broker.
-- `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?)`
-  validates and creates `RequestSpec(mode=ARGV)` without shell-joining argv.
+- `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?,
+  interactive?)` validates and creates `RequestSpec(mode=ARGV)` without
+  shell-joining argv.
 - `run_script(machine, cwd, purpose, script?, script_base64?, environment?,
-  timeout_seconds?)` requires exactly one UTF-8 text script or canonical base64
-  exact-byte script and creates `RequestSpec(mode=SCRIPT)`.
+  timeout_seconds?, interactive?)` requires exactly one UTF-8 text script or
+  canonical base64 exact-byte script and creates `RequestSpec(mode=SCRIPT)`.
 - `list_jobs(states?, limit=50, cursor?)` exposes sanitized durable metadata in
   newest-first pages. Page size is from 1 through 100 and cursors are opaque.
 - `read_verified_result(request_id, stream, offset=0, limit=65536)` reads only
@@ -324,6 +325,14 @@ Execution responses may contain multiple status/result frames. The three MCP
 control requests (`list_machines`, `list_jobs`, and `read_verified_result`) use
 the same one-frame, EOF-terminated, same-UID-validated socket boundary and one
 strictly decoded response.
+
+The request header is protocol version 3. It adds one required boolean member,
+`interactive`, to the exact key set the broker accepts, and that member is
+inside `client_request_sha256`. A version-2 frame therefore fails closed rather
+than being treated as a non-interactive request by default, and an approval or
+handoff digest cannot be reused across the two spellings. Client and broker
+ship in the same package, so this affects only a deliberately mixed
+installation.
 
 The broker composes that local socket boundary, one-shot bound planner, real
 broker-owned OpenSSH master/channels, durable state, dedicated remote tmux jobs,
@@ -790,6 +799,64 @@ B: authorize -> connect/reuse -> private viewer -> run -> complete -> collect
 C: authorize -> connect/reuse -> private viewer -> run -> complete -> collect
 ```
 
+## Interactive execution and terminal handoff
+
+`RequestSpec.interactive` is a strict `bool` that the client states explicitly.
+It is never inferred from argv, script bytes, environment, or remote output, it
+is rendered in all three operator documents, and it participates in
+`client_request_sha256`, so it binds the execution approval and every later
+secret-input authorization for the same request.
+
+A controlling terminal is a property of a session, not of a process group. The
+two execution paths therefore differ only in their session boundary:
+
+- **Non-interactive (default).** The command-group program is started under
+  `setsid --fork --wait`, giving it a new session with no controlling terminal.
+  `sudo` and comparable programs correctly fail with *"a terminal is
+  required"*, and nothing in the job can reach `/dev/tty`.
+- **Interactive.** The runner keeps its own session, which is the remote tmux
+  pane's, and enables Bash job control (`set -m`) instead. The command still
+  becomes the leader of its own dedicated process group, and that group becomes
+  the pane's foreground group, so it inherits the pane's controlling terminal,
+  can open `/dev/tty`, and reads without stopping on `SIGTTIN`. The runner
+  refuses the job with a diagnostic and no command start when the pane has no
+  terminal, and it refuses any `interactive` value other than `0` or `1`.
+
+The descendant-lifecycle contract from the non-interactive path is unchanged:
+the runner is never a member of the command's group, so the same
+`kill -- -<pgid>` TERM/KILL boundary, `/usr/bin/timeout` supervision, capture
+quota monitor, and drain sealing apply. Two consequences of job control are
+handled explicitly. The runner blocks inside the foreground job and cannot read
+the process-group FIFOs while the command runs, so each inner program publishes
+its group ID twice: the capture-quota monitor consumes one copy during the run
+and the runner consumes the other afterwards. Reading those IDs before the
+command starts would deadlock, because the tee subshells block on opening their
+FIFOs until the command opens the write end. Separately, a foreground job killed
+by a terminal `SIGINT` under job control unwinds Bash out of the enclosing
+compound command, so the interactive command-group leader does not `exec` the
+command: it traps `INT`, runs the command, and exits with its exact status. Its
+children keep the default disposition, so a viewer Ctrl-C still interrupts only
+the submitted command, which then completes normally with status 130.
+
+stdout and stderr are not merged onto a PTY in either path. The prompt and the
+reply travel over `/dev/tty` only, while the two canonical streams keep their
+separate mode-`0600` FIFOs, bounded capture pipelines, byte-exact raw files,
+sizes, and digests. Neither the prompt nor the typed bytes can enter
+`stdout.raw`, `stderr.raw`, the verified spool, or durable state.
+
+Prompt detection is offered only for an interactive request. `SshChannelRunner`
+watches a viewer only when the bound recipient's request asked for it, and
+`SecretPromptPresenter.watch` independently refuses a non-interactive recipient,
+so prompt-like text produced by a command that has no controlling terminal can
+never propose a handoff. Detection remains notification only: attaching the
+broker terminal requires the separate `SecretInputAuthorizationPrompt` decision
+described under the operator-interface boundary, which names the full request,
+machine, endpoint, approved command identity, and viewer session, is mandatory
+even when `approval_mode = "disabled"`, applies to that one request, and is
+never recorded as a durable credential. tmuxgate does not read, buffer,
+transform, retain, or log the typed bytes, and echo suppression is the remote
+program's own responsibility.
+
 ## Request state machine
 
 ```text
@@ -916,7 +983,10 @@ capture, state-publication, hashing, or cleanup tools. Runner control-plane
 utilities use fixed absolute paths where practical.
 
 The primary argv process or script shell starts as the leader of a dedicated
-session and process group; configured `/usr/bin/timeout` supervision runs
+process group, and by default also of a dedicated session with no controlling
+terminal; an explicitly interactive request keeps the pane's session so it can
+reach `/dev/tty`, as described under interactive execution above. Configured
+`/usr/bin/timeout` supervision runs
 inside that same boundary. After the primary process exits, the runner sends
 `TERM` to every remaining member, allows one second for orderly shutdown, and
 then sends `KILL` to the group. Timeout, capture-quota termination, viewer
@@ -985,9 +1055,13 @@ Bash runner retains pane stdin, uses separate mode-`0600` FIFOs and bounded
 capture pipelines, writes the exit status only after both collectors finish,
 terminates inherited-descriptor holders at the process-group boundary, seals an
 ambiguous drain as incomplete, and cleans up failed-gate FIFOs without
-manufacturing completion. Tests also execute the exact staging shell and
-lifecycle in a private real local tmux server, including a background child
-that retains stdout. The first approved remote job completed successfully on
+manufacturing completion. The staged job directory carries the `interactive`
+flag as its own validated file, which the control script requires, allowlists,
+and removes with the rest of the job. Tests also execute the exact staging shell
+and lifecycle in a private real local tmux server, including a background child
+that retains stdout and an interactive job whose sentinel reply is typed into a
+real attached viewer and then proved absent from both captured streams, every
+pane capture, and every collected file. The first approved remote job completed successfully on
 July 19, 2026.
 
 Broker/SSH failure does not rerun the command. State is reported as incomplete

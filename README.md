@@ -39,6 +39,10 @@ being given a reusable interactive SSH shell. tmuxgate narrows that workflow:
   forwarding controlling-terminal input requires a separate exact
   request-bound authorization, and tmuxgate does not read or store entered
   secret bytes.
+- A request may explicitly ask for `interactive` execution when the command
+  genuinely needs a remote controlling terminal, such as `sudo` reading a
+  password. Prompt detection and terminal handoff are offered only for those
+  requests.
 
 ```text
 Codex -> bearer-authenticated loopback HTTP -> embedded MCP server
@@ -325,11 +329,11 @@ The embedded server exposes five typed tools:
 
 - `list_machines()` returns logical aliases, descriptions, and enabled status
   only.
-- `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?)`
-  submits exact structured argv and waits for the broker result.
+- `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?,
+  interactive?)` submits exact structured argv and waits for the broker result.
 - `run_script(machine, cwd, purpose, script?, script_base64?, environment?,
-  timeout_seconds?)` requires exactly one UTF-8 script or canonical base64 byte
-  payload and waits for the broker result.
+  timeout_seconds?, interactive?)` requires exactly one UTF-8 script or
+  canonical base64 byte payload and waits for the broker result.
 - `list_jobs(states?, limit?, cursor?)` returns sanitized durable records with
   bounded, opaque-cursor pagination.
 - `read_verified_result(request_id, stream, offset?, limit?)` reads `stdout` or
@@ -367,6 +371,90 @@ removed. Their structured request and exact-byte client functionality remains
 internal to the MCP adapter and tests. `tmuxgate jobs`, `attach`, `collect`,
 `recover`, configuration commands, and fail-closed administrative surfaces
 remain available.
+
+### Interactive commands and remote sudo
+
+Most requests need no terminal. `run_argv` and `run_script` therefore default to
+`interactive = false`, and a non-interactive command is started in a dedicated
+remote session with **no controlling terminal**, so `sudo` correctly refuses it
+with *"a terminal is required to read the password"*.
+
+Pass `interactive = true` when the command genuinely needs one:
+
+```json
+{
+  "machine": "app-server",
+  "cwd": "/srv/app",
+  "argv": ["/usr/bin/sudo", "/usr/bin/systemctl", "restart", "app"],
+  "purpose": "Restart the app service after the config change",
+  "interactive": true
+}
+```
+
+The flag is part of the request, never inferred from the command text or from
+remote output. It is covered by `client_request_sha256`, so it binds the
+approval decision and every later handoff decision for the same request.
+
+**What changes remotely.** An interactive command keeps the session of its own
+remote tmux pane and therefore inherits that pane's controlling terminal, while
+Bash job control still places it in its own foreground process group. It gets
+`/dev/tty`, the descendant-termination boundary is unchanged, and a Ctrl-C in
+the viewer interrupts only the submitted command. If the pane has no terminal,
+the runner refuses to start the command instead of running it without one.
+
+**stdout and stderr stay separate.** tmuxgate does not merge the two streams
+onto a PTY. Only `/dev/tty` carries the prompt and the reply, so the canonical
+`stdout` and `stderr` remain byte-exact, independently captured, and free of
+prompt and password bytes. Their limits, digests, and collection rules are
+identical to a non-interactive job.
+
+**Approval and handoff are two separate decisions.** An interactive request is
+labelled in the approval summary (`TERMINAL`), carries the
+`INTERACTIVE_TERMINAL` safety indicator, and shows `interactive: true` in the
+full evidence document. Approving execution does *not* authorize typing into
+the command. When a password-like prompt is then detected in the viewer pane,
+tmuxgate raises a second, request-bound authorization that names the full
+request ID, machine, endpoint, approved argv or script digest, and viewer
+session:
+
+- in plain mode, type `forward <full-request-id>` on the trusted terminal;
+- in the Textual interface, use the Deny-default modal's deliberately armed
+  Forward Input action.
+
+This authorization is mandatory even when `approval_mode = "disabled"`. Denying
+it leaves the command detached and still running; `tmuxgate attach REQUEST_ID`
+remains available for deliberate manual interaction. While attached, the tmux
+prefix followed by `d` ends the handoff at any time. Prompt detection is
+notification only, and it is offered only for requests that asked for
+`interactive` execution.
+
+**What is and is not recorded.** Typed bytes go to the remote controlling
+terminal only. tmuxgate does not read, buffer, transform, log, or store them:
+they do not enter the captured `stdout`/`stderr`, the verified result spool,
+durable job state, or the operator interface, and `capture-pane` is never a
+canonical result source. `sudo` disables terminal echo while reading, so the
+password does not appear in the pane either.
+
+**Remote `sudo` prerequisites.** The remote account needs its own working sudo
+rule; tmuxgate never becomes root itself and never supplies a password. The
+command runs under `env -i` with the fixed `/usr/bin:/bin` path, so invoke
+`/usr/bin/sudo` by absolute path. Every request gets a fresh remote tmux session
+and terminal, so with sudo's usual per-terminal timestamp policy a credential
+cached by another session does not apply and the prompt appears again.
+
+**Rejected alternatives.** tmuxgate does not support `sudo -S`, piped or
+environment-supplied passwords, or any stored credential: those route the secret
+through the broker and the captured streams, which is exactly what the
+`/dev/tty` handoff avoids. It also does not encourage root SSH login or broad
+`NOPASSWD` rules as a way to avoid the prompt; both replace a per-command
+decision with standing privilege.
+
+> [!WARNING]
+> A terminal handoff gives the remote program your keystrokes. Suppressing echo
+> is the program's responsibility — `sudo` does it, and tmuxgate cannot
+> guarantee it for an arbitrary command. Anything a program does echo becomes
+> visible pane text. Authorize a handoff only for a command you have reviewed
+> and trust with whatever you are about to type.
 
 ### Recovering after an intentional whole-host reboot
 
@@ -475,7 +563,9 @@ policy and resolved-identity digests shown in approval evidence.
 
 tmuxgate is designed to fail closed around route evidence, effective SSH
 configuration, host-key validation, request binding, remote-start state,
-result collection, and cleanup. It never stores SSH or sudo passwords. Normal
+result collection, and cleanup. It never stores SSH or sudo passwords: an
+interactive command reads them from the remote controlling terminal after a
+separate, single-request operator authorization. Normal
 successful jobs are collected and remotely cleaned automatically; the
 standalone remote-cleanup surface remains disabled until it can provide the
 same durable guarantees.

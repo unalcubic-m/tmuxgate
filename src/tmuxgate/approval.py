@@ -339,6 +339,8 @@ def _script_lines(script: bytes) -> list[str]:
 
 def _risk_indicators(request: RequestSpec) -> tuple[str, ...]:
     indicators: list[str] = []
+    if request.interactive:
+        indicators.append("INTERACTIVE_TERMINAL")
     if request.mode.value == "script":
         indicators.append("SCRIPT_MODE")
     if request.timeout_seconds is None:
@@ -362,6 +364,9 @@ def _risk_indicators(request: RequestSpec) -> tuple[str, ...]:
 
 
 _RISK_EXPLANATIONS = {
+    "INTERACTIVE_TERMINAL": (
+        "Runs with a controlling terminal and may ask for your keyboard input"
+    ),
     "SCRIPT_MODE": "Runs a script rather than one structured program argv",
     "NO_TIMEOUT_REQUESTED": "No timeout; interrupt a stuck command manually",
     "ADDED_ENVIRONMENT": "Adds environment variables to the remote command",
@@ -504,6 +509,13 @@ def render_approval_summary(
         )
     timeout = "none" if request.timeout_seconds is None else f"{request.timeout_seconds}s"
     lines.extend(["", f"TIMEOUT    {timeout}"])
+    if request.interactive:
+        lines.append(
+            "TERMINAL   Interactive: the command gets a remote controlling "
+            "terminal and may later request a separate handoff decision"
+        )
+    else:
+        lines.append("TERMINAL   Non-interactive: no controlling terminal")
     if risks:
         lines.append("SAFETY")
         lines.extend(f"  - {_RISK_EXPLANATIONS[item]}" for item in risks)
@@ -571,6 +583,7 @@ def render_approval_document(
     lines.extend(
         [
             f"timeout_seconds: {timeout}",
+            f"interactive: {'true' if request.interactive else 'false'}",
             f"result_format: {request.result_format.value}",
             f"client_request_sha256: {request.client_request_sha256()}",
             f"script_bytes: {len(request.script)}",
@@ -1339,6 +1352,7 @@ def render_secret_input_authorization_document(
         f"endpoint_id: {_quoted_text(endpoint_id)}",
         f"viewer_session_id: {_quoted_text(viewer_session_id)}",
         f"mode: {request.mode.value}",
+        f"interactive: {'true' if request.interactive else 'false'}",
     ]
     if request.argv:
         lines.append("approved_argv:")
@@ -1362,6 +1376,15 @@ def render_secret_input_authorization_document(
             "action: attach the broker-owned terminal to this remote process",
             "warning: every byte typed while attached is sent to the remote process",
             "prompt detection is notification only and does not authorize this action",
+            (
+                "this decision is separate from the execution approval above and "
+                "authorizes only this one request"
+            ),
+            (
+                "typed bytes reach the remote controlling terminal only; tmuxgate "
+                "does not read, log, or record them in the durable job result"
+            ),
+            "detach with the tmux prefix and d to end the handoff at any time",
             "=== end secret-input authorization ===",
             "",
         ]

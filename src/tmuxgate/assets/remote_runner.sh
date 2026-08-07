@@ -29,7 +29,7 @@ if [ "$(/usr/bin/stat -c '%a:%u' "$job_dir")" != "700:$(/usr/bin/id -u)" ]; then
 fi
 cd "$job_dir" || exit 125
 
-for required in mode cwd.bin environment.bin timeout result-limits; do
+for required in mode cwd.bin environment.bin timeout interactive result-limits; do
     if [ ! -f "$required" ] || [ -L "$required" ]; then
         echo "tmuxgate runner missing $required" >&2
         exit 125
@@ -78,6 +78,14 @@ if [ -n "$timeout_seconds" ] && [[ ! $timeout_seconds =~ ^[1-9][0-9]*$ ]]; then
     exit 125
 fi
 
+# Interactive execution is requested explicitly by the approved request. It is
+# never inferred from the command text or from remote output.
+interactive=$(/usr/bin/tr -d '\n' < interactive)
+case "$interactive" in
+    0|1) ;;
+    *) echo 'tmuxgate runner refused interactive flag' >&2; exit 125 ;;
+esac
+
 mapfile -t result_limits < result-limits
 if [ "${#result_limits[@]}" -ne 3 ]; then
     echo 'tmuxgate runner refused result limits' >&2
@@ -94,11 +102,17 @@ for limit in "$stdout_limit" "$stderr_limit" "$remote_capture_limit"; do
 done
 unset result_limits limit
 
-# The submitted command runs in a dedicated session/process group. Once its
-# primary process exits, every process that remains in that group gets TERM,
-# one second to exit, and then KILL. A process that deliberately escapes the
-# group can never turn an open capture descriptor into successful completion:
-# collectors have a separate two-second drain bound below.
+# The submitted command runs in a dedicated process group. Once its primary
+# process exits, every process that remains in that group gets TERM, one second
+# to exit, and then KILL. A process that deliberately escapes the group can
+# never turn an open capture descriptor into successful completion: collectors
+# have a separate two-second drain bound below.
+#
+# A non-interactive command additionally gets a dedicated session with no
+# controlling terminal. An interactive command must keep this runner's session
+# so that it inherits the pane's controlling terminal and programs such as sudo
+# can open /dev/tty; bash job control still gives it its own process group and
+# makes that group the pane's foreground group.
 descendant_term_attempts=20
 capture_drain_seconds=2
 group_start_seconds=5
@@ -183,7 +197,7 @@ exec {stderr_group_fd}<>stderr-group.fifo || exit 125
     limit=$1
     output=$2
     shift 2
-    printf "%s\n" "$$" >&4 || exit 125
+    printf "%s\n%s\n" "$$" "$$" >&4 || exit 125
     exec 4>&-
     for inherited_descriptor in "$@"; do
         [[ $inherited_descriptor =~ ^[1-9][0-9]*$ ]] || exit 125
@@ -200,7 +214,7 @@ stdout_tee=$!
     limit=$1
     output=$2
     shift 2
-    printf "%s\n" "$$" >&4 || exit 125
+    printf "%s\n%s\n" "$$" "$$" >&4 || exit 125
     exec 4>&-
     for inherited_descriptor in "$@"; do
         [[ $inherited_descriptor =~ ^[1-9][0-9]*$ ]] || exit 125
@@ -236,6 +250,21 @@ monitor_capture_limit() {
     done
 }
 
+# Interactive execution blocks this runner inside the foreground job that owns
+# the pane, so the monitor learns every process group from the shared
+# descriptors instead of from the runner. Each group ID is published twice, so
+# the runner still reads its own copy once the command has finished. Under job
+# control the command group leader is also the command process, so one value
+# serves both roles.
+monitor_interactive_capture_limit() {
+    read_group_id "$stdout_group_fd" "$group_start_seconds" || return 0
+    stdout_group=$process_group
+    read_group_id "$stderr_group_fd" "$group_start_seconds" || return 0
+    stderr_group=$process_group
+    read_group_id "$command_group_fd" "$group_start_seconds" || return 0
+    monitor_capture_limit "$process_group" "$process_group"
+}
+
 "$tmux_bin" wait-for "$wait_channel" || exit 125
 printf '%s\n' running > state
 set +e
@@ -267,13 +296,20 @@ else
     supervised_command=("${submitted_command[@]}")
 fi
 
-/usr/bin/setsid --fork --wait /bin/bash --noprofile --norc -c '
+# Both execution paths run byte-identical command-group code. The group ID is
+# published twice so an interactive run can serve the capture-limit monitor and
+# the runner without either consuming the other's copy.
+command_group_program='
     requested_cwd=$1
-    command_descriptor=$2
-    stdout_descriptor=$3
-    stderr_descriptor=$4
-    shift 4
-    printf "%s\n" "$$" >&4 || exit 125
+    interactive_group=$2
+    command_descriptor=$3
+    stdout_descriptor=$4
+    stderr_descriptor=$5
+    shift 5
+    IFS= read -r process_status < /proc/self/stat || exit 125
+    process_fields=(${process_status#*") "})
+    [ "${process_fields[2]}" = "$$" ] || exit 125
+    printf "%s\n%s\n" "$$" "$$" >&4 || exit 125
     exec 4>&-
     for inherited_descriptor in \
         "$command_descriptor" "$stdout_descriptor" "$stderr_descriptor"; do
@@ -282,28 +318,77 @@ fi
         exec {fd_to_close}>&-
     done
     cd "$requested_cwd" || exit 125
+    if [ "$interactive_group" = 1 ]; then
+        # A foreground job that dies from a terminal interrupt would unwind the
+        # runner out of its own supervision block, so this group leader stays
+        # alive across SIGINT and reports the exact status instead. Children
+        # still receive the default disposition, so the operator can interrupt
+        # the submitted command from the pane.
+        trap "tmuxgate_interrupted=1" INT
+        "$@"
+        exit $?
+    fi
     exec "$@"
-' tmuxgate-command-group "$cwd" \
-    "$command_group_fd" "$stdout_group_fd" "$stderr_group_fd" \
-    "${supervised_command[@]}" \
-    > stdout.fifo 2> stderr.fifo 4>&${command_group_fd} &
-command_pid=$!
+'
 command_group=''
-read_group_id "$command_group_fd" "$group_start_seconds" || exit 125
-command_group=$process_group
-read_group_id "$stdout_group_fd" "$group_start_seconds" || exit 125
-stdout_group=$process_group
-read_group_id "$stderr_group_fd" "$group_start_seconds" || exit 125
-stderr_group=$process_group
-exec {command_group_fd}>&-
-exec {stdout_group_fd}>&-
-exec {stderr_group_fd}>&-
-monitor_capture_limit "$command_pid" "$command_group" & quota_monitor=$!
-wait "$command_pid"
-command_rc=$?
-command_pid=''
-wait "$quota_monitor" 2>/dev/null
-quota_monitor=''
+if [ "$interactive" -eq 1 ]; then
+    if [ ! -t 0 ]; then
+        echo 'tmuxgate runner refused interactive execution without a terminal' >&2
+        exit 125
+    fi
+    # Job control keeps this runner's session, and therefore the pane's
+    # controlling terminal, while still isolating the command in its own
+    # process group and making that group the pane's foreground group.
+    set -m
+    case $- in
+        *m*) ;;
+        *)
+            echo 'tmuxgate runner could not enable interactive job control' >&2
+            exit 125
+            ;;
+    esac
+    monitor_interactive_capture_limit & quota_monitor=$!
+    /bin/bash --noprofile --norc -c "$command_group_program" \
+        tmuxgate-command-group "$cwd" 1 \
+        "$command_group_fd" "$stdout_group_fd" "$stderr_group_fd" \
+        "${supervised_command[@]}" \
+        > stdout.fifo 2> stderr.fifo 4>&${command_group_fd}
+    command_rc=$?
+    set +m
+    wait "$quota_monitor" 2>/dev/null
+    quota_monitor=''
+    read_group_id "$command_group_fd" "$group_start_seconds" || exit 125
+    command_group=$process_group
+    read_group_id "$stdout_group_fd" "$group_start_seconds" || exit 125
+    stdout_group=$process_group
+    read_group_id "$stderr_group_fd" "$group_start_seconds" || exit 125
+    stderr_group=$process_group
+    exec {command_group_fd}>&-
+    exec {stdout_group_fd}>&-
+    exec {stderr_group_fd}>&-
+else
+    /usr/bin/setsid --fork --wait /bin/bash --noprofile --norc \
+        -c "$command_group_program" tmuxgate-command-group "$cwd" 0 \
+        "$command_group_fd" "$stdout_group_fd" "$stderr_group_fd" \
+        "${supervised_command[@]}" \
+        > stdout.fifo 2> stderr.fifo 4>&${command_group_fd} &
+    command_pid=$!
+    read_group_id "$command_group_fd" "$group_start_seconds" || exit 125
+    command_group=$process_group
+    read_group_id "$stdout_group_fd" "$group_start_seconds" || exit 125
+    stdout_group=$process_group
+    read_group_id "$stderr_group_fd" "$group_start_seconds" || exit 125
+    stderr_group=$process_group
+    exec {command_group_fd}>&-
+    exec {stdout_group_fd}>&-
+    exec {stderr_group_fd}>&-
+    monitor_capture_limit "$command_pid" "$command_group" & quota_monitor=$!
+    wait "$command_pid"
+    command_rc=$?
+    command_pid=''
+    wait "$quota_monitor" 2>/dev/null
+    quota_monitor=''
+fi
 terminate_command_group "$command_group"
 command_group=''
 

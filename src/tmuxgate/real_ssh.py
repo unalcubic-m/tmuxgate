@@ -474,9 +474,14 @@ class SshChannelRunner:
         viewer = DetachedTmuxViewerProcess(
             self.runner, socket_path, session_name
         )
+        # Prompt detection is offered only for a request whose approved wire
+        # form asked for interactive execution.  A non-interactive command has
+        # no controlling terminal, so prompt-like output from it can never be a
+        # real secret request and must not be able to propose a handoff.
         if self.prompt_presenter is not None:
             assert secret_input_recipient is not None
-            self.prompt_presenter.watch(viewer, secret_input_recipient)
+            if secret_input_recipient.request.interactive:
+                self.prompt_presenter.watch(viewer, secret_input_recipient)
         return viewer
 
 
@@ -696,6 +701,10 @@ class SecretPromptPresenter:
             raise TypeError("prompt presenter requires a detached tmux viewer")
         if not isinstance(recipient, SecretInputRecipient):
             raise TypeError("prompt presenter requires an exact secret-input recipient")
+        if not recipient.request.interactive:
+            raise TransportError(
+                "terminal handoff is limited to explicitly interactive requests"
+            )
         if viewer.session_name != f"tmuxgate-{recipient.request_id[:12]}":
             raise TransportError("viewer session does not match its exact request")
         key = (os.fspath(viewer.socket_path), viewer.session_name)
@@ -822,8 +831,11 @@ class SecretPromptPresenter:
             self.terminal_input_flusher(terminal, client_tty)
             terminal.write(
                 (
-                    "\r\n[tmuxgate] Password/passphrase input required for "
-                    f"{viewer.session_name}. It stays attached through "
+                    "\r\n[tmuxgate] Password/passphrase input required by the "
+                    f"already approved request {recipient.request_id} on "
+                    f"{recipient.request.machine_alias} ({viewer.session_name}). "
+                    "Typed bytes reach only the remote controlling terminal and "
+                    "are not added to the job record. It stays attached through "
                     "typing and retries; use Ctrl-b d if the command does "
                     "not emit its authentication-complete marker.\r\n"
                 ).encode("utf-8")

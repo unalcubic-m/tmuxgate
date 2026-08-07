@@ -72,6 +72,35 @@ the terminal before the trusted external viewer receives `/dev/tty`. The TUI
 does not inspect, buffer, transform, retain, or log those bytes and must restore
 the previous screen and terminal modes on every return path.
 
+## Interactive remote execution
+
+A remote command has a controlling terminal only when the approved request set
+`interactive = true`. That flag is stated by the client, never inferred from the
+command text or from remote output, and it is inside the client-request digest,
+so it binds the execution approval and each later handoff authorization. A
+non-interactive command runs in a session with no controlling terminal and
+cannot open `/dev/tty` at all; prompt detection and terminal handoff are not
+offered for it.
+
+Approving execution never authorizes typing into the command. The handoff is a
+second, single-request decision that remains mandatory when
+`approval_mode = "disabled"`, and denying it leaves the command running and
+detached. Typed bytes reach the remote controlling terminal only: they are not
+read, stored, or logged by tmuxgate and never enter the captured stdout/stderr,
+the verified result spool, durable state, or the operator interface. tmuxgate
+never stores a sudo or SSH password and does not support `sudo -S`, piped, or
+environment-supplied passwords, which would route the secret through the broker
+and the captured streams.
+
+The residual risk is inherent to a handoff: while attached, the remote program
+receives the operator's keystrokes, and suppressing echo is that program's
+responsibility. `sudo` does it; tmuxgate cannot guarantee it for an arbitrary
+command, and anything a program echoes becomes pane text. Reports that show
+prompt detection authorizing input on its own, a handoff reaching a request that
+did not ask for interactive execution, typed bytes appearing in any recorded
+stream or durable record, or an interactive job escaping its process-group
+termination boundary are security-boundary reports.
+
 ## Installer security boundary
 
 Run `./install.sh` only from source you have reviewed and as the target user,

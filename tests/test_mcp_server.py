@@ -226,8 +226,15 @@ class McpToolSchemaTests(unittest.TestCase):
                 "script_base64",
                 "environment",
                 "timeout_seconds",
+                "interactive",
             },
         )
+        # Interactive execution must be an explicit, typed, non-default choice.
+        for name in ("run_argv", "run_script"):
+            schema = tools[name].input_schema["properties"]["interactive"]
+            self.assertEqual(schema["type"], "boolean")
+            self.assertIs(schema["default"], False)
+            self.assertNotIn("interactive", tools[name].input_schema["required"])
         self.assertEqual(
             set(tools["read_verified_result"].input_schema["required"]),
             {"request_id", "stream"},
