@@ -593,6 +593,74 @@ raise SystemExit(9)
         self.assertEqual(paged[1], render_approval_document(REQUEST_ID, request))
         self.assertGreaterEqual(output.getvalue().count("Approve? [y/N]"), 3)
 
+    def test_interactive_execution_is_visible_in_every_decision_document(self):
+        non_interactive = RequestSpec(
+            "app-server",
+            ExecutionMode.ARGV,
+            "/opt/docker",
+            argv=("sudo", "--", "/bin/true"),
+        )
+        interactive = RequestSpec(
+            "app-server",
+            ExecutionMode.ARGV,
+            "/opt/docker",
+            argv=("sudo", "--", "/bin/true"),
+            interactive=True,
+        )
+        plan = build_plan()
+
+        summary = render_approval_summary(REQUEST_ID, interactive, plan)
+        self.assertIn("TERMINAL   Interactive:", summary)
+        self.assertIn(
+            "may ask for your keyboard input",
+            summary,
+        )
+        self.assertIn(
+            "TERMINAL   Non-interactive: no controlling terminal",
+            render_approval_summary(REQUEST_ID, non_interactive, plan),
+        )
+
+        self.assertIn(
+            "interactive: true",
+            render_approval_document(REQUEST_ID, interactive, plan),
+        )
+        self.assertIn(
+            "interactive: false",
+            render_approval_document(REQUEST_ID, non_interactive, plan),
+        )
+
+    def test_secret_input_authorization_separates_it_from_the_approval(self):
+        request = RequestSpec(
+            "app-server",
+            ExecutionMode.ARGV,
+            "/opt/docker",
+            argv=("sudo", "--", "/bin/true"),
+            interactive=True,
+        )
+        plan = build_plan()
+        prompt = SecretInputAuthorizationPrompt.create(
+            REQUEST_ID,
+            request,
+            plan,
+            endpoint_id="home-lan",
+            viewer_session_id=f"tmuxgate-{REQUEST_ID[:12]}",
+        )
+        document = render_secret_input_authorization_document(
+            REQUEST_ID,
+            request,
+            plan,
+            prompt_id=prompt.prompt_id,
+            endpoint_id=prompt.endpoint_id,
+            viewer_session_id=prompt.viewer_session_id,
+            command_identity_sha256=prompt.command_identity_sha256,
+            secret_input_binding_sha256=prompt.secret_input_binding_sha256,
+        )
+        self.assertIn("interactive: true", document)
+        self.assertIn("separate from the execution approval", document)
+        self.assertIn("authorizes only this one request", document)
+        self.assertIn("not read, log, or record them", document)
+        self.assertIn("detach with the tmux prefix and d", document)
+
     def test_compact_summary_labels_advisory_purpose_and_exact_command(self):
         request = RequestSpec(
             "host",

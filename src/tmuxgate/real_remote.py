@@ -106,6 +106,11 @@ def build_stage_archive(
         _tar_add(archive, "timeout", timeout)
         _tar_add(
             archive,
+            "interactive",
+            b"1\n" if request.interactive else b"0\n",
+        )
+        _tar_add(
+            archive,
             "result-limits",
             (
                 f"{limits.max_stdout_bytes}\n"

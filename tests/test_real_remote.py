@@ -53,6 +53,19 @@ class StageArchiveTests(unittest.TestCase):
         self.assertEqual(members["mode"], b"exec\n")
         self.assertIn(b"wait-for", members["remote_runner.sh"])
 
+    def test_interactive_flag_is_staged_as_an_exact_structured_value(self):
+        for interactive, expected in ((False, b"0\n"), (True, b"1\n")):
+            with self.subTest(interactive=interactive):
+                request = RequestSpec(
+                    machine_alias="app-server",
+                    mode=ExecutionMode.ARGV,
+                    cwd="/tmp",
+                    argv=("sudo", "whoami"),
+                    interactive=interactive,
+                )
+                members = self._members(build_stage_archive(request))
+                self.assertEqual(members["interactive"], expected)
+
     def test_script_bytes_are_not_decoded_or_requoted(self):
         script = b"#!/bin/bash\nprintf '\xff\\n'\nexit 7\n"
         request = RequestSpec(

@@ -18,7 +18,7 @@ import secrets
 from typing import Any
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_SCRIPT_BYTES = 16 * 1024 * 1024
 MAX_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 MAX_PURPOSE_CHARACTERS = 500
@@ -127,6 +127,7 @@ class RequestSpec:
     timeout_seconds: int | None = None
     result_format: ResultFormat = ResultFormat.TRANSPARENT
     purpose: str | None = None
+    interactive: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "machine_alias", validate_alias(self.machine_alias))
@@ -185,6 +186,12 @@ class RequestSpec:
             if any(ord(character) < 0x20 or ord(character) == 0x7F for character in purpose):
                 raise ValidationError("purpose must be one line without control characters")
 
+        # Interactive execution is a deliberate, separately rendered property of
+        # the request.  It is never inferred from the command text, so a plain
+        # bool is the only accepted encoding.
+        if type(self.interactive) is not bool:
+            raise ValidationError("interactive must be a bool")
+
         if mode is ExecutionMode.ARGV:
             if not argv:
                 raise ValidationError("exec mode requires at least one argv element")
@@ -201,6 +208,7 @@ class RequestSpec:
                 {"name": name, "value_b64": _encode_filesystem_text(value)}
                 for name, value in self.environment
             ],
+            "interactive": self.interactive,
             "machine": self.machine_alias,
             "mode": self.mode.value,
             "protocol": PROTOCOL_VERSION,
@@ -216,6 +224,7 @@ class RequestSpec:
             "argv_b64",
             "cwd_b64",
             "environment_b64",
+            "interactive",
             "machine",
             "mode",
             "protocol",
@@ -266,6 +275,7 @@ class RequestSpec:
             timeout_seconds=header["timeout_seconds"],
             result_format=header["result_format"],
             purpose=header["purpose"],
+            interactive=header["interactive"],
         )
 
     @property
