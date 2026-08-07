@@ -42,6 +42,7 @@ from tmuxgate.operator_interface import (
     SecretInputRecipient,
     SshRetryPrompt,
 )
+from tmuxgate import textual_interface as textual_interface_module
 from tmuxgate.textual_interface import (
     APPROVAL_ARM_SECONDS,
     DashboardJob,
@@ -176,6 +177,30 @@ class SuspendResumeTests(unittest.TestCase):
 class ArmedFocusTests(unittest.TestCase):
     """Routine decisions focus the positive action only once it is armed."""
 
+    @staticmethod
+    async def _settle_armed(screen, pilot) -> None:
+        """Wait for the arm timer itself, never for a wall-clock estimate.
+
+        A loaded runner can take longer than APPROVAL_ARM_SECONDS to deliver
+        the timer, so pausing for that duration and assuming the screen armed
+        races the very fence under test.
+        """
+
+        deadline = time.monotonic() + 5
+        while not screen._arm_ready:
+            if time.monotonic() >= deadline:
+                raise AssertionError("the decision never armed")
+            await pilot.pause(0.02)
+        await pilot.pause()
+
+    @staticmethod
+    def _never_arms():
+        """Hold the arm fence open so the pre-arm state cannot elapse."""
+
+        return mock.patch.object(
+            textual_interface_module, "APPROVAL_ARM_SECONDS", 3600.0
+        )
+
     def _drive(self, screen_type, request, size=(100, 30), arm=True):
         interface = TextualOperatorInterface(
             FakeTerminalArbiter(), validate_terminal=False
@@ -201,7 +226,7 @@ class ArmedFocusTests(unittest.TestCase):
                     await pilot.pause(0.02)
                 screen = app.screen
                 if arm:
-                    await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                    await self._settle_armed(screen, pilot)
                 else:
                     await pilot.pause()
                 focused.append(screen.focused.id if screen.focused else None)
@@ -230,10 +255,11 @@ class ArmedFocusTests(unittest.TestCase):
     def test_execution_approval_keeps_deny_focused_before_arming(self):
         # The arm window must stay unfocused as well as disabled, so buffered
         # input cannot commit the positive action.
-        self.assertEqual(
-            self._drive(ExecutionApprovalScreen, self._execution, arm=False),
-            "approval-deny",
-        )
+        with self._never_arms():
+            focused = self._drive(
+                ExecutionApprovalScreen, self._execution, arm=False
+            )
+        self.assertEqual(focused, "approval-deny")
 
     def test_compact_terminal_keeps_deny_focused_after_arming(self):
         # Too small to display the evidence means the operator cannot have
@@ -271,7 +297,9 @@ class ArmedFocusTests(unittest.TestCase):
                     if time.monotonic() >= deadline:
                         raise AssertionError("approval modal did not open")
                     await pilot.pause(0.02)
-                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                screen = app.screen
+                await self._settle_armed(screen, pilot)
+                self.assertEqual(screen.focused.id, "approval-approve")
                 await pilot.press("enter")
                 deadline = time.monotonic() + 2
                 while asking.is_alive() and time.monotonic() < deadline:
@@ -312,7 +340,8 @@ class ArmedFocusTests(unittest.TestCase):
                 while asking.is_alive() and time.monotonic() < deadline:
                     await pilot.pause(0.02)
 
-        asyncio.run(exercise())
+        with self._never_arms():
+            asyncio.run(exercise())
         asking.join(timeout=1)
         self.assertEqual(decisions, [ApprovalDecision.DENIED])
 
