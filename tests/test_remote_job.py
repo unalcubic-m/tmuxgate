@@ -760,7 +760,7 @@ SENTINEL_SECRET = "tmuxgate-sentinel-secret-8f21c4"
 # Read the exact prompt from the controlling terminal the way sudo does: the
 # prompt and the reply both use /dev/tty with echo disabled, so neither can
 # reach the captured stdout/stderr streams.
-_TTY_SECRET_READER = (
+_TTY_PROMPT_READER = (
     "exec 9<>/dev/tty || exit 90; "
     "/usr/bin/stty -echo <&9; "
     "printf '[sudo] password for tester: ' >&9; "
@@ -888,7 +888,7 @@ class InteractiveRemoteRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home, job, fake_tmux = self._stage(
                 Path(directory),
-                _TTY_SECRET_READER
+                _TTY_PROMPT_READER
                 + "printf 'tty=%s\\n' \"$(tty)\"; "
                 "printf 'secret_length=%s\\n' \"${#reply}\"; "
                 "printf 'stderr-line\\n' >&2; exit 7",

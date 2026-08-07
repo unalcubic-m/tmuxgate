@@ -23,7 +23,7 @@ SENTINEL_SECRET = "tmuxgate-sentinel-secret-8f21c4"
 # Read the reply exactly the way sudo does: prompt and reply both travel over
 # the controlling terminal with echo disabled, so neither can enter the
 # separately captured stdout/stderr streams.
-_TTY_SECRET_READER = (
+_TTY_PROMPT_READER = (
     "exec 9<>/dev/tty || exit 90; "
     "/usr/bin/stty -echo <&9; "
     "printf '[sudo] password for tester: ' >&9; "
@@ -182,6 +182,7 @@ class LocalRealTmuxIntegrationTests(unittest.TestCase):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+
     def test_interactive_job_takes_its_secret_from_the_real_viewer_terminal(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -197,7 +198,7 @@ class LocalRealTmuxIntegrationTests(unittest.TestCase):
                 argv=(
                     "/bin/bash",
                     "-c",
-                    _TTY_SECRET_READER
+                    _TTY_PROMPT_READER
                     + "printf 'secret_length=%s\\n' \"${#reply}\"; "
                     "printf 'stderr-line\\n' >&2; exit 7",
                 ),
