@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 import os
+import secrets
 import stat
 import sys
 import termios
@@ -1013,6 +1014,37 @@ class TmuxgateDashboardApp(App[None]):
             self.interface._finish_external_session(prompt)
             self.refresh(repaint=True, layout=True)
 
+    def run_terminal_session(
+        self,
+        token: str,
+        purpose: str,
+        session: Callable[[], None],
+    ) -> None:
+        """Suspend Textual and run one trusted non-secret terminal session.
+
+        ``flush_input=False`` is required for the same reason the secret path
+        needs it: this application holds the controlling terminal in
+        noncanonical mode, so the validating flush cannot pass until
+        :meth:`suspend` has restored the pre-TUI terminal settings.
+        """
+
+        if self._active_decision is not None:
+            raise OperatorInterfaceError(
+                "cannot hand off the terminal while a modal owns the UI"
+            )
+        self.interface._validate_external_token(token)
+        try:
+            with self.interface.terminal.claim(
+                priority=TerminalPriority.INTERACTIVE,
+                purpose=purpose,
+                flush_input=False,
+            ):
+                with self.suspend():
+                    session()
+        finally:
+            self.interface._finish_external_token(token)
+            self.refresh(repaint=True, layout=True)
+
     def refresh_snapshot(self) -> None:
         if self.external_stop.is_set():
             self.exit()
@@ -1188,7 +1220,7 @@ class TextualOperatorInterface(PlainTerminalInterface):
         self._active_app: TmuxgateDashboardApp | None = None
         self._ownership_lock = threading.Lock()
         self._ownership_state = TerminalOwnershipState.TUI
-        self._external_prompt_id: str | None = None
+        self._external_token: str | None = None
         self._ui_available = threading.Event()
         self._ui_available.set()
         super().__init__(
@@ -1239,7 +1271,7 @@ class TextualOperatorInterface(PlainTerminalInterface):
                 and decision is ApprovalDecision.APPROVED
             ):
                 self._ownership_state = TerminalOwnershipState.EXTERNAL
-                self._external_prompt_id = prompt.prompt_id
+                self._external_token = prompt.prompt_id
                 return
             self._ownership_state = TerminalOwnershipState.TUI
             self._ui_available.set()
@@ -1260,40 +1292,62 @@ class TextualOperatorInterface(PlainTerminalInterface):
             )
             if reserve:
                 self._ownership_state = TerminalOwnershipState.EXTERNAL
-                self._external_prompt_id = queued.prompt.prompt_id
+                self._external_token = queued.prompt.prompt_id
             else:
                 self._ownership_state = TerminalOwnershipState.TUI
             resolved = queued.pending.resolve(
                 OperatorDecision.for_prompt(queued.prompt, decision)
             )
             if not resolved:
-                self._external_prompt_id = None
+                self._external_token = None
                 self._ownership_state = TerminalOwnershipState.TUI
             if self._ownership_state is TerminalOwnershipState.TUI:
                 self._ui_available.set()
             return resolved
 
-    def _validate_external_reservation(
-        self, prompt: SecretInputAuthorizationPrompt
-    ) -> None:
+    def _reserve_external_token(self, token: str) -> bool:
+        """Reserve external ownership for a session that no modal authorized.
+
+        Secret input reaches EXTERNAL through an approved modal.  SSH
+        authentication has no such modal, so it reserves the same single slot
+        directly and can therefore never overlap one.
+        """
+
+        with self._ownership_lock:
+            if self._ownership_state is not TerminalOwnershipState.TUI:
+                return False
+            self._ownership_state = TerminalOwnershipState.EXTERNAL
+            self._external_token = token
+            self._ui_available.clear()
+            return True
+
+    def _validate_external_token(self, token: str) -> None:
         with self._ownership_lock:
             if (
                 self._ownership_state is not TerminalOwnershipState.EXTERNAL
-                or self._external_prompt_id != prompt.prompt_id
+                or self._external_token != token
             ):
                 raise OperatorInterfaceError(
                     "external terminal session lacks exact authorization"
                 )
 
-    def _finish_external_session(self, prompt: SecretInputAuthorizationPrompt) -> None:
+    def _finish_external_token(self, token: str) -> None:
         with self._ownership_lock:
-            if self._external_prompt_id != prompt.prompt_id:
+            if self._external_token != token:
                 raise OperatorInterfaceError(
                     "external terminal reservation identity changed"
                 )
-            self._external_prompt_id = None
+            self._external_token = None
             self._ownership_state = TerminalOwnershipState.TUI
             self._ui_available.set()
+
+    def _validate_external_reservation(
+        self, prompt: SecretInputAuthorizationPrompt
+    ) -> None:
+        self._validate_external_token(prompt.prompt_id)
+
+    def _finish_external_session(self, prompt: SecretInputAuthorizationPrompt) -> None:
+        self._finish_external_token(prompt.prompt_id)
 
     def bind_dashboard_provider(self, provider: DashboardProvider) -> None:
         if not callable(provider):
@@ -1461,6 +1515,35 @@ class TextualOperatorInterface(PlainTerminalInterface):
             app.call_from_thread(app.run_external_terminal_session, prompt, session)
             return
         self._finish_external_session(prompt)
+        raise OperatorInterfaceError("dashboard closed before terminal handoff")
+
+    def run_terminal_session(
+        self, purpose: str, session: Callable[[], None]
+    ) -> None:
+        """Hand the terminal to SSH authentication with Textual suspended.
+
+        This has no authorizing modal and no request binding, so it reserves
+        the one external-ownership slot itself and waits for the interface to
+        be idle rather than competing with an open decision.
+        """
+
+        if not isinstance(purpose, str):
+            raise TypeError("terminal session purpose must be a string")
+        if not callable(session):
+            raise TypeError("external terminal session must be callable")
+        token = secrets.token_hex(16)
+        while not self._prompts.closed:
+            if not self._app_ready.wait(0.10) or not self._ui_available.wait(0.10):
+                continue
+            if not self._reserve_external_token(token):
+                continue
+            with self._app_lock:
+                app = self._active_app
+            if app is None:
+                self._finish_external_token(token)
+                continue
+            app.call_from_thread(app.run_terminal_session, token, purpose, session)
+            return
         raise OperatorInterfaceError("dashboard closed before terminal handoff")
 
     def publish_activity(self, event: OperationalActivity) -> None:

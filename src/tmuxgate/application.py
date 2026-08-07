@@ -275,7 +275,10 @@ class UnifiedApplication:
 
                 pool = MasterTransportPool(
                     paths.control_dir,
-                    backend=SubprocessMasterBackend(terminal_lock=self._terminal),
+                    backend=SubprocessMasterBackend(
+                        terminal_lock=self._terminal,
+                        terminal_handoff=operator.run_terminal_session,
+                    ),
                     identity_revalidator=revalidate,
                     max_masters=config.broker.max_open_ssh_masters,
                     idle_timeout_seconds=(

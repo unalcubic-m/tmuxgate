@@ -63,6 +63,7 @@ from tmuxgate.textual_interface import (
     flush_textual_input,
     validate_textual_terminal,
 )
+from tmuxgate.terminal import TerminalPriority
 from tmuxgate.settings import serialize_config
 from test_config import valid_config
 from test_connection_plan import build_plan
@@ -408,6 +409,99 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 ("release", 40),
             ],
         )
+
+    def test_ssh_terminal_session_suspends_without_an_authorizing_modal(self):
+        # Regression for SSH master creation being impossible under the default
+        # interface: this application holds the terminal noncanonical, so the
+        # handoff must claim without the validating flush and suspend Textual
+        # before OpenSSH reads.
+        events = []
+
+        class RecordingTerminal(FakeTerminalArbiter):
+            @contextmanager
+            def claim(self, **keywords):
+                events.append(
+                    ("claim", keywords["priority"], keywords["flush_input"])
+                )
+                yield
+                events.append(("release", keywords["priority"]))
+
+        class RecordingApp(TmuxgateDashboardApp):
+            @contextmanager
+            def suspend(self):
+                events.append("suspend")
+                yield
+                events.append("resume")
+
+        interface = TextualOperatorInterface(
+            RecordingTerminal(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        app = RecordingApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                self.assertIs(
+                    interface.terminal_ownership_state,
+                    TerminalOwnershipState.TUI,
+                )
+                handoff = threading.Thread(
+                    target=lambda: interface.run_terminal_session(
+                        "SSH enrollment authentication",
+                        lambda: events.append("ssh-authentication"),
+                    )
+                )
+                handoff.start()
+                deadline = time.monotonic() + 2
+                while handoff.is_alive() and time.monotonic() < deadline:
+                    await pilot.pause(0.02)
+                handoff.join(timeout=0)
+                self.assertFalse(handoff.is_alive())
+                self.assertIs(
+                    interface.terminal_ownership_state,
+                    TerminalOwnershipState.TUI,
+                )
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            events,
+            [
+                ("claim", TerminalPriority.INTERACTIVE, False),
+                "suspend",
+                "ssh-authentication",
+                "resume",
+                ("release", TerminalPriority.INTERACTIVE),
+            ],
+        )
+
+    def test_terminal_session_shares_one_exclusive_external_slot(self):
+        # Secret input and SSH authentication reserve the same single slot, so
+        # neither can run while the other owns the terminal.
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+
+        self.assertTrue(interface._reserve_external_token("token-a"))
+        self.assertIs(
+            interface.terminal_ownership_state, TerminalOwnershipState.EXTERNAL
+        )
+        self.assertFalse(interface._reserve_external_token("token-b"))
+        with self.assertRaisesRegex(
+            OperatorInterfaceError, "lacks exact authorization"
+        ):
+            interface._validate_external_token("token-b")
+        with self.assertRaisesRegex(
+            OperatorInterfaceError, "reservation identity changed"
+        ):
+            interface._finish_external_token("token-b")
+
+        interface._finish_external_token("token-a")
+        self.assertIs(
+            interface.terminal_ownership_state, TerminalOwnershipState.TUI
+        )
+        self.assertTrue(interface._reserve_external_token("token-b"))
+        interface._finish_external_token("token-b")
 
     def test_external_failure_restores_tui_and_rejects_stale_authority(self):
         class RecordingApp(TmuxgateDashboardApp):

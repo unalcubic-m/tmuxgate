@@ -1131,6 +1131,10 @@ class OperatorInterface(Protocol):
         session: Callable[[], None],
     ) -> None: ...
 
+    def run_terminal_session(
+        self, purpose: str, session: Callable[[], None]
+    ) -> None: ...
+
     def request_machine_disable(
         self, prompt: MachineDisablePrompt
     ) -> OperatorDecision: ...
@@ -1276,6 +1280,26 @@ class PlainTerminalInterface:
         with self.terminal.claim(
             priority=TerminalPriority.SECRET,
             purpose=f"secret input for request {prompt.request_id}",
+        ):
+            session()
+
+    def run_terminal_session(
+        self, purpose: str, session: Callable[[], None]
+    ) -> None:
+        """Give a trusted process the terminal outside any request binding.
+
+        SSH authentication has to reach the operator before a request-bound
+        secret recipient can exist, so this handoff is named by purpose rather
+        than by prompt.  A line-oriented owner leaves the terminal canonical,
+        so the ordinary validating claim is already correct here.
+        """
+
+        if not isinstance(purpose, str):
+            raise TypeError("terminal session purpose must be a string")
+        if not callable(session):
+            raise TypeError("external terminal session must be callable")
+        with self.terminal.claim(
+            priority=TerminalPriority.INTERACTIVE, purpose=purpose
         ):
             session()
 

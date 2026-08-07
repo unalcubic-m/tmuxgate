@@ -32,6 +32,7 @@ from tmuxgate.transport import (
 )
 
 
+SSH_ENROLLMENT_TERMINAL_PURPOSE = "SSH enrollment authentication"
 MAX_BATCH_OUTPUT_BYTES = 300 * 1024 * 1024
 MAX_BATCH_DIAGNOSTIC_BYTES = 64 * 1024
 STREAM_CHUNK_BYTES = 64 * 1024
@@ -142,10 +143,14 @@ class SubprocessMasterBackend:
         runner: Callable[..., object] = subprocess.run,
         terminal_opener: Callable[..., BinaryIO] = open,
         terminal_lock: object | None = None,
+        terminal_handoff: Callable[[str, Callable[[], None]], None] | None = None,
     ) -> None:
         self.runner = runner
         self.terminal_opener = terminal_opener
         self.terminal_lock = threading.RLock() if terminal_lock is None else terminal_lock
+        if terminal_handoff is not None and not callable(terminal_handoff):
+            raise TypeError("master backend terminal handoff must be callable")
+        self.terminal_handoff = terminal_handoff
 
     def start_master(self, invocation: SshInvocation, control_path: Path) -> None:
         expected_interactive = invocation.kind == "start-enrollment-master"
@@ -153,16 +158,16 @@ class SubprocessMasterBackend:
             raise TransportError("master start requires a start invocation")
         if invocation.interactive_terminal != expected_interactive:
             raise TransportError("master start has an invalid terminal policy")
-        with self.terminal_lock:
-            with self.terminal_opener("/dev/tty", "r+b", buffering=0) as terminal:
-                completed = self.runner(
-                    invocation.argv,
-                    stdin=terminal,
-                    stdout=terminal,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                    env=_safe_environment(),
-                )
+        # Only the enrollment master may prompt.  The post-enrollment command
+        # master runs under BatchMode=yes with public-key-only authentication
+        # and a passphrase-less dedicated key, so it can never read the
+        # operator's terminal and must not claim it.  Claiming it anyway made
+        # every connection fail under the default full-screen interface, which
+        # holds the controlling terminal in noncanonical mode.
+        if invocation.interactive_terminal:
+            completed = self._start_on_terminal(invocation)
+        else:
+            completed = self._start_without_terminal(invocation)
         returncode = getattr(completed, "returncode", None)
         if type(returncode) is not int:
             raise TransportError("interactive SSH master runner returned no exit status")
@@ -175,6 +180,53 @@ class SubprocessMasterBackend:
             )
         if returncode != 0:
             raise SshMasterStartError(returncode, diagnostics)
+
+    def _start_without_terminal(self, invocation: SshInvocation) -> object:
+        """Start a master that provably cannot prompt, with no terminal at all."""
+
+        return self.runner(
+            invocation.argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=_safe_environment(),
+        )
+
+    def _start_on_terminal(self, invocation: SshInvocation) -> object:
+        """Run the prompt-capable enrollment master on the operator's terminal.
+
+        The handoff, when one is configured, is what lets a full-screen
+        interface leave application mode and restore canonical terminal modes
+        before OpenSSH reads.  Without one this keeps the historical direct
+        claim, which remains correct for a line-oriented terminal owner.
+        """
+
+        completed: list[object] = []
+
+        def session() -> None:
+            with self.terminal_opener("/dev/tty", "r+b", buffering=0) as terminal:
+                completed.append(
+                    self.runner(
+                        invocation.argv,
+                        stdin=terminal,
+                        stdout=terminal,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        env=_safe_environment(),
+                    )
+                )
+
+        if self.terminal_handoff is None:
+            with self.terminal_lock:
+                session()
+        else:
+            self.terminal_handoff(SSH_ENROLLMENT_TERMINAL_PURPOSE, session)
+        if len(completed) != 1:
+            raise TransportError(
+                "interactive SSH master did not run on the operator terminal"
+            )
+        return completed[0]
 
     def _control(self, invocation: SshInvocation, label: str) -> bool:
         completed = _run_completed(

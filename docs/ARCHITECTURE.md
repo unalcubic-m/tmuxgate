@@ -439,10 +439,19 @@ slot. The machine-disable modal shows the exhausted request, complete approved
 request/plan evidence, and exact disable binding; Keep enabled is its fenced
 safe default.
 
+Besides the request-bound secret handoff, the interface exposes
+`run_terminal_session(purpose, session)` for a trusted session that exists
+before any request-bound secret can: SSH enrollment authentication. It is named
+by purpose rather than by prompt, has no authorizing modal, waits for the
+interface to be idle instead of competing with an open decision, and otherwise
+uses the identical claim-then-suspend sequence.
+
 The interface tracks three synchronized foreground ownership states: `tui`,
 `modal`, and `external`. A positive secret-input modal result atomically reserves
 `external` ownership for that exact prompt ID before its waiting worker is
-released. No later modal can open during that reservation, and a stale or
+released. The SSH handoff reserves that same single slot under its own
+one-shot token, so an authentication session and a secret session can never
+own the terminal at once. No later modal can open during that reservation, and a stale or
 different prompt cannot consume it. The trusted presenter then asks the
 interface to run the already-bound viewer session. On the UI thread, the
 interface acquires the highest-priority `TerminalArbiter` lease and enters
@@ -706,6 +715,27 @@ falling back to another workstation identity or password. Passwords and sudo
 credentials are never stored. Automatic viewer presentation forwards terminal
 input directly through tmux and SSH; tmuxgate does not read or retain those
 bytes.
+
+Only the enrollment master reaches the operator's terminal. The backend selects
+its start path from the invocation's own `interactive_terminal` policy: a
+`start-enrollment-master` runs with the controlling terminal on its standard
+input and output, while a `start-master` runs with `stdin` and `stdout` closed
+to `/dev/null` and never opens, claims, or hands off the terminal at all. That
+is sound because the post-enrollment master carries `BatchMode=yes`,
+public-key-only authentication, `IdentityAgent=none`, and a passphrase-less
+dedicated key, so it cannot prompt. Claiming the terminal for it regardless
+previously made every connection fail under the default full-screen interface,
+which holds the controlling terminal in noncanonical mode.
+
+The enrollment master's terminal acquisition goes through the operator
+interface's `run_terminal_session` handoff rather than a direct arbiter claim.
+A line-oriented owner takes the ordinary validating claim; the full-screen
+interface reserves exclusive external ownership, claims without the validating
+flush, and suspends Textual so the pre-TUI canonical settings are restored
+before OpenSSH reads. Secret input and SSH authentication reserve the same
+single external slot, so the two can never overlap. Without a configured
+handoff the backend keeps the historical direct claim, which remains correct
+for any caller whose terminal owner leaves it canonical.
 
 The transport implementation enforces the retention policy and
 exact broker-owned OpenSSH invocation plans. Enrollment authentication is
