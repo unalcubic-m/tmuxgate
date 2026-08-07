@@ -521,6 +521,42 @@ class MasterTransportPool:
             raise TransportError("refusing to remove an unsafe control path")
         path.unlink()
 
+    def _reconcile_unowned_control_path(
+        self, endpoint: ResolvedSshEndpoint, path: Path
+    ) -> None:
+        """Clear a control path this pool does not own before starting a master.
+
+        Masters are started detached with ``ControlPersist``, so one outlives
+        the process that created it and no shutdown-side cleanup can cover a
+        crash or a kill.  The derived path is deterministic, so the next process
+        collides with that survivor and could never recover on its own.
+
+        Ownership is proven before the socket is addressed: anything that is not
+        a socket owned by this user with the expected mode is still refused and
+        never removed.  A surviving master is shut down through its own control
+        channel rather than by unlinking the path, so it cannot be left running
+        and invisible, and the path must be gone afterwards to be reused.
+        """
+
+        if not path.exists() and not path.is_symlink():
+            return
+        try:
+            present = self._control_socket_present(path)
+        except TransportError as exc:
+            raise TransportError(
+                "refusing a pre-existing master control path"
+            ) from exc
+        if not present:
+            # It vanished between the two probes, so the path is free.
+            return
+        check = build_master_control_invocation(endpoint, path, "check")
+        if self.backend.check_master(check, path):
+            stop = build_master_control_invocation(endpoint, path, "exit")
+            self.backend.stop_master(stop, path)
+        self._remove_socket_if_safe(path)
+        if path.exists() or path.is_symlink():
+            raise TransportError("refusing a pre-existing master control path")
+
     def _stop(self, transport: MasterTransport) -> None:
         if transport.pinned_request_ids:
             raise TransportBusyError("cannot close a pinned SSH master")
@@ -603,8 +639,7 @@ class MasterTransportPool:
                 if self.key_manager is not None:
                     self.key_manager.prepare_local_key(current)
                 path = self._control_path(authorization.machine_name, identity_digest)
-                if path.exists() or path.is_symlink():
-                    raise TransportError("refusing a pre-existing master control path")
+                self._reconcile_unowned_control_path(current, path)
                 start_builder = (
                     build_enrollment_master_start_invocation
                     if self.key_manager is not None

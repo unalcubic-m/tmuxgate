@@ -314,6 +314,82 @@ class MasterPoolTests(unittest.TestCase):
             endpoint,
         )
 
+    def _successor_pool(self):
+        """A pool standing in for the next broker process over the same dir."""
+
+        return MasterTransportPool(
+            self.pool.control_dir,
+            backend=self.backend,
+            identity_revalidator=lambda endpoint: self.current.get(
+                endpoint.ssh_profile, endpoint
+            ),
+            clock=lambda: self.now,
+            max_masters=3,
+            idle_timeout_seconds=600,
+        )
+
+    def _acquire_from(self, pool, index, request_id=SECOND_ID):
+        endpoint = self.endpoints[index]
+        return pool.acquire(
+            authorization(
+                endpoint.ssh_profile,
+                endpoint,
+                request_id=request_id,
+                plan_digest="d" * 64,
+            ),
+            endpoint,
+        )
+
+    def test_master_surviving_a_previous_process_is_stopped_and_replaced(self):
+        # Regression: masters are detached with ControlPersist, so one outlives
+        # the process that started it. The next process derives the same path,
+        # has no record of the survivor, and could never recover on its own.
+        lease = self.acquire(0)
+        path = lease.transport.control_path
+        lease.release()
+        successor = self._successor_pool()
+        starts_before = len(self.backend.starts)
+
+        replacement = self._acquire_from(successor, 0)
+
+        self.assertEqual(replacement.transport.control_path, path)
+        self.assertEqual([item.kind for item in self.backend.stops], ["master-exit"])
+        self.assertEqual(len(self.backend.starts), starts_before + 1)
+        self.assertTrue(stat.S_ISSOCK(path.stat().st_mode))
+        replacement.release()
+
+    def test_socket_left_by_a_dead_master_is_removed_without_a_stop(self):
+        lease = self.acquire(0)
+        path = lease.transport.control_path
+        lease.release()
+        # The master died without cleaning up; the path outlives it.
+        self.backend.expire(path, leave_path=True)
+        successor = self._successor_pool()
+
+        replacement = self._acquire_from(successor, 0)
+
+        self.assertEqual(replacement.transport.control_path, path)
+        self.assertEqual(self.backend.stops, [])
+        replacement.release()
+
+    def test_a_pre_existing_non_socket_is_refused_and_never_removed(self):
+        lease = self.acquire(0)
+        path = lease.transport.control_path
+        lease.release()
+        self.backend.expire(path, leave_path=False)
+        path.write_bytes(b"not a control socket")
+        path.chmod(0o600)
+        successor = self._successor_pool()
+
+        with self.assertRaisesRegex(
+            TransportError, "refusing a pre-existing master control path"
+        ):
+            self._acquire_from(successor, 0)
+
+        self.assertTrue(path.exists())
+        self.assertEqual(path.read_bytes(), b"not a control socket")
+        self.assertEqual(self.backend.stops, [])
+
     def test_private_socket_is_created_reused_and_left_idle_after_release(self):
         lease = self.acquire(0)
         path = lease.transport.control_path

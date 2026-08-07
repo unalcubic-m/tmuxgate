@@ -795,7 +795,18 @@ and requires a fresh request and approval. A subsequently approved fallback
 endpoint has its own single-retry bound. Failed-start cleanup removes an owned
 control socket only after master shutdown is confirmed; if shutdown fails, the
 socket is retained in cleanup-only pool state and shutdown is retried during
-the broker lifecycle. Declining or failing the bounded retry starts no remote
+the broker lifecycle.
+
+Masters are started detached with `ControlPersist`, so one outlives the process
+that created it and no shutdown-side cleanup can cover a crash or a kill. Since
+the control path is derived deterministically, the next process would collide
+with that survivor and could never recover. Before starting a master, the pool
+therefore reconciles a control path it does not own: ownership is proven first,
+and anything that is not a socket owned by this user with mode 0600 is still
+refused and never removed. A survivor that answers a control check is shut down
+through its own control channel rather than by unlinking its path, so it cannot
+be left running and invisible, and the path must be proven gone before a new
+master may use it. Declining or failing the bounded retry starts no remote
 command and cannot create durable remote-job state. No local transport,
 identity-validation, or control-path error is retried; a typed nonzero OpenSSH
 start exit remains opaque except for the terminal diagnostic and numeric
