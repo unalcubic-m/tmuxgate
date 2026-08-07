@@ -7,6 +7,7 @@ import select
 import signal
 import subprocess
 import tempfile
+import termios
 import threading
 import time
 import tty
@@ -19,6 +20,7 @@ from tmuxgate.operator_interface import (
     SecretInputRecipient,
 )
 from tmuxgate.real_ssh import (
+    SSH_ENROLLMENT_TERMINAL_PURPOSE,
     DetachedTmuxViewerProcess,
     SecretPromptPresenter,
     SshChannelRunner,
@@ -26,6 +28,7 @@ from tmuxgate.real_ssh import (
     _discard_pending_terminal_input,
     secret_prompt_signature,
 )
+from tmuxgate.terminal import TerminalArbiter, TerminalUnavailableError
 from tmuxgate.transport import SshInvocation, SshMasterStartError, TransportError
 from test_connection_plan import build_plan
 
@@ -1016,6 +1019,169 @@ class RealSshProcessTests(unittest.TestCase):
             self.assertEqual(viewer.detach_count, 1)
         finally:
             self.assertTrue(presenter.close())
+
+
+class MasterStartTerminalBoundaryTests(unittest.TestCase):
+    """Only a master that can actually prompt may reach the terminal."""
+
+    @staticmethod
+    def _invocation(interactive):
+        kind = "start-enrollment-master" if interactive else "start-master"
+        return SshInvocation(kind, ("/usr/bin/ssh",), interactive)
+
+    def test_post_enrollment_master_never_reaches_the_terminal(self):
+        calls = []
+        terminal_lock = FlagLock()
+        opened = []
+        handoffs = []
+
+        def run(argv, **kwargs):
+            self.assertFalse(terminal_lock.held)
+            calls.append(kwargs)
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        def opener(*args, **kwargs):
+            opened.append(args)
+            raise AssertionError("post-enrollment master opened the terminal")
+
+        backend = SubprocessMasterBackend(
+            runner=run,
+            terminal_opener=opener,
+            terminal_lock=terminal_lock,
+            terminal_handoff=lambda purpose, session: handoffs.append(purpose),
+        )
+
+        backend.start_master(self._invocation(False), Path("/tmp/master.sock"))
+
+        # BatchMode=yes with public-key-only authentication and a
+        # passphrase-less key cannot prompt, so the operator's terminal is
+        # neither opened, claimed, nor handed off.
+        self.assertEqual(
+            (opened, handoffs, terminal_lock.held),
+            ([], [], False),
+        )
+        self.assertEqual(
+            (calls[0]["stdin"], calls[0]["stdout"], calls[0]["stderr"]),
+            (subprocess.DEVNULL, subprocess.DEVNULL, subprocess.PIPE),
+        )
+
+    def test_enrollment_master_runs_inside_the_configured_handoff(self):
+        terminal = FakeTerminal()
+        terminal_lock = FlagLock()
+        observed = []
+
+        def run(argv, **kwargs):
+            observed.append(("run", kwargs["stdin"], kwargs["stdout"]))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        def handoff(purpose, session):
+            observed.append(("handoff", purpose))
+            session()
+
+        backend = SubprocessMasterBackend(
+            runner=run,
+            terminal_opener=lambda *args, **kwargs: terminal,
+            terminal_lock=terminal_lock,
+            terminal_handoff=handoff,
+        )
+
+        backend.start_master(self._invocation(True), Path("/tmp/master.sock"))
+
+        # The prompt-capable master still gets the terminal, but only from
+        # inside the handoff, and never through the direct claim that a
+        # full-screen interface cannot satisfy.
+        self.assertEqual(
+            observed,
+            [
+                ("handoff", SSH_ENROLLMENT_TERMINAL_PURPOSE),
+                ("run", terminal, terminal),
+            ],
+        )
+        self.assertFalse(terminal_lock.held)
+
+    def test_enrollment_master_without_a_handoff_keeps_the_direct_claim(self):
+        terminal = FakeTerminal()
+        terminal_lock = FlagLock()
+        held = []
+
+        def run(argv, **kwargs):
+            held.append(terminal_lock.held)
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        backend = SubprocessMasterBackend(
+            runner=run,
+            terminal_opener=lambda *args, **kwargs: terminal,
+            terminal_lock=terminal_lock,
+        )
+
+        backend.start_master(self._invocation(True), Path("/tmp/master.sock"))
+
+        self.assertEqual((held, terminal_lock.held), ([True], False))
+
+    def test_handoff_that_skips_the_session_fails_closed(self):
+        backend = SubprocessMasterBackend(
+            runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv, 0, b"", b""
+            ),
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            terminal_handoff=lambda purpose, session: None,
+        )
+
+        with self.assertRaisesRegex(TransportError, "operator terminal"):
+            backend.start_master(self._invocation(True), Path("/tmp/master.sock"))
+
+    def test_handoff_must_be_callable(self):
+        with self.assertRaisesRegex(TypeError, "terminal handoff must be callable"):
+            SubprocessMasterBackend(terminal_handoff="not-callable")
+
+    def test_noncanonical_terminal_no_longer_blocks_every_connection(self):
+        """Regression for the default interface holding the terminal raw.
+
+        A real arbiter over a real PTY in noncanonical mode rejects the
+        validating interactive claim.  The post-enrollment master must not
+        depend on that claim, and the enrollment master must reach the terminal
+        through a handoff that restores canonical mode first.
+        """
+
+        primary, secondary = pty.openpty()
+        self.addCleanup(os.close, primary)
+        self.addCleanup(os.close, secondary)
+        canonical = termios.tcgetattr(secondary)
+        tty.setraw(secondary)
+        arbiter = TerminalArbiter(
+            terminal_opener=lambda *args, **kwargs: os.fdopen(
+                os.dup(secondary), "rb", buffering=0
+            )
+        )
+
+        # The exact failure from the report: a validating claim cannot be
+        # taken while the interface holds the terminal noncanonical.
+        with self.assertRaisesRegex(
+            TerminalUnavailableError, "canonical character terminal"
+        ):
+            with arbiter:
+                pass
+
+        started = []
+        backend = SubprocessMasterBackend(
+            runner=lambda argv, **kwargs: started.append(kwargs["stdin"])
+            or subprocess.CompletedProcess(argv, 0, b"", b""),
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            terminal_lock=arbiter,
+        )
+        backend.start_master(self._invocation(False), Path("/tmp/master.sock"))
+        self.assertEqual(started, [subprocess.DEVNULL])
+
+        def suspending_handoff(purpose, session):
+            # What the real full-screen interface does before yielding: leave
+            # application mode, restoring the pre-TUI canonical settings.
+            termios.tcsetattr(secondary, termios.TCSADRAIN, canonical)
+            with arbiter.claim(purpose=purpose, flush_input=False):
+                session()
+
+        backend.terminal_handoff = suspending_handoff
+        backend.start_master(self._invocation(True), Path("/tmp/master.sock"))
+        self.assertEqual(len(started), 2)
 
 
 if __name__ == "__main__":

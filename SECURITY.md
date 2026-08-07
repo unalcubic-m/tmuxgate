@@ -65,6 +65,14 @@ closed and never changes approval policy or starts a plain replacement;
 documented 72×20 minimum keeps the safe action visible and disables positive
 actions until complete evidence is visible again.
 
+Terminal access follows the connection's own declared policy. Only the
+prompt-capable enrollment master is given the controlling terminal; the
+post-enrollment command master runs with `BatchMode=yes`, public-key-only
+authentication, and a passphrase-less dedicated key, so it cannot prompt and is
+started with no terminal at all. Both handoffs — SSH authentication and secret
+input — reserve the same single exclusive ownership slot and suspend the
+full-screen interface before a trusted process reads.
+
 Secret input is a separate ownership boundary. Prompt-like remote output is
 notification only. After an exact request-, command-, route-, endpoint-, and
 viewer-bound authorization, Textual leaves application mode and stops reading

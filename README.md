@@ -553,7 +553,10 @@ but it sets `IdentityAgent=none`, uses `IdentitiesOnly=yes`, disables GSSAPI and
 host-based authentication, and is used only for the enrollment protocol. Once
 the exact key is verified, tmuxgate closes that master and creates the command
 master with public-key authentication only: password and keyboard-interactive
-fallback are disabled before any requested command can start. SSH subprocesses
+fallback are disabled before any requested command can start. Only the
+enrollment master is given the controlling terminal, through the same
+suspend-aware handoff the default interface uses for secret input; the command
+master cannot prompt and is started with no terminal at all. SSH subprocesses
 also receive no `SSH_AUTH_SOCK`. Profile-added `IdentityFile` or
 `CertificateFile` entries make SSH planning fail closed. The complete
 enrollment and post-enrollment authentication policy is included in the SSH

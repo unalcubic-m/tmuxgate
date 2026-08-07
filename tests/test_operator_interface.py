@@ -384,6 +384,38 @@ class PlainTerminalInterfaceTests(unittest.TestCase):
         self.assertEqual(claims[0]["priority"].name, "SECRET")
         self.assertIn(REQUEST_ID, claims[0]["purpose"])
 
+    def test_plain_terminal_session_claims_by_purpose_without_a_prompt(self):
+        # SSH authentication needs the terminal before any request-bound secret
+        # recipient exists, so this handoff is named by purpose instead.
+        claims = []
+
+        class RecordingTerminal(FakeTerminalArbiter):
+            def claim(self, **keywords):
+                claims.append(keywords)
+                return nullcontext()
+
+        interface = PlainTerminalInterface(RecordingTerminal())
+        self.addCleanup(interface.close)
+        sessions = []
+
+        interface.run_terminal_session(
+            "SSH enrollment authentication", lambda: sessions.append("ran")
+        )
+
+        self.assertEqual(sessions, ["ran"])
+        self.assertEqual(
+            (claims[0]["priority"].name, claims[0]["purpose"]),
+            ("INTERACTIVE", "SSH enrollment authentication"),
+        )
+
+    def test_plain_terminal_session_rejects_unusable_arguments(self):
+        interface = PlainTerminalInterface(FakeTerminalArbiter())
+        self.addCleanup(interface.close)
+        with self.assertRaisesRegex(TypeError, "purpose must be a string"):
+            interface.run_terminal_session(b"bytes", lambda: None)
+        with self.assertRaisesRegex(TypeError, "must be callable"):
+            interface.run_terminal_session("SSH enrollment authentication", None)
+
     def test_plain_execution_decision_uses_only_injected_trusted_terminal(self):
         # Approval-looking MCP/socket/remote bytes are data in the request; the
         # independent trusted terminal denial remains authoritative.
