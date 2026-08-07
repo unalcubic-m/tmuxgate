@@ -439,6 +439,14 @@ slot. The machine-disable modal shows the exhausted request, complete approved
 request/plan evidence, and exact disable binding; Keep enabled is its fenced
 safe default.
 
+Focus follows the same fence. Every decision modal opens with its safe action
+focused and its positive action disabled. When the fence elapses on execution
+approval and secret-input authorization, focus moves to the positive action so
+one Return commits the routine decision; SSH retry, adjacent-route fallback, and
+machine-disable keep the safe action focused because their positive action is
+not the routine outcome. A compact terminal keeps the safe action focused in
+every modal, and Escape always takes the safe action.
+
 Besides the request-bound secret handoff, the interface exposes
 `run_terminal_session(purpose, session)` for a trusted session that exists
 before any request-bound secret can: SSH enrollment authentication. It is named
@@ -787,7 +795,18 @@ and requires a fresh request and approval. A subsequently approved fallback
 endpoint has its own single-retry bound. Failed-start cleanup removes an owned
 control socket only after master shutdown is confirmed; if shutdown fails, the
 socket is retained in cleanup-only pool state and shutdown is retried during
-the broker lifecycle. Declining or failing the bounded retry starts no remote
+the broker lifecycle.
+
+Masters are started detached with `ControlPersist`, so one outlives the process
+that created it and no shutdown-side cleanup can cover a crash or a kill. Since
+the control path is derived deterministically, the next process would collide
+with that survivor and could never recover. Before starting a master, the pool
+therefore reconciles a control path it does not own: ownership is proven first,
+and anything that is not a socket owned by this user with mode 0600 is still
+refused and never removed. A survivor that answers a control check is shut down
+through its own control channel rather than by unlinking its path, so it cannot
+be left running and invisible, and the path must be proven gone before a new
+master may use it. Declining or failing the bounded retry starts no remote
 command and cannot create durable remote-job state. No local transport,
 identity-validation, or control-path error is retried; a typed nonzero OpenSSH
 start exit remains opaque except for the terminal diagnostic and numeric

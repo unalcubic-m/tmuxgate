@@ -55,8 +55,13 @@ rendered widget tree. MCP and Unix-socket frames, remote stdout/stderr, OpenSSH
 diagnostics, tmux pane text, ANSI controls, terminal links, and Textual markup
 are untrusted data: they are escaped and cannot create widgets, key events, or
 decisions. Only deliberate input from the one validated foreground controlling
-terminal may resolve a prompt, and Deny, Cancel, or Keep enabled is always the
-focused default.
+terminal may resolve a prompt. Deny, Cancel, or Keep enabled is the focused
+default until the stale-input fence elapses; after it, execution approval and
+secret-input authorization focus their positive action so one Return commits
+the routine decision, while SSH retry, adjacent-route fallback, and
+machine-disable keep the safe action focused. Escape always takes the safe
+action, and a terminal below the documented minimum keeps the safe action
+focused regardless of the fence.
 
 The TUI revalidates terminal identity and foreground process-group ownership
 throughout its lifetime. Startup or runtime loss fails the unified application

@@ -688,6 +688,19 @@ class DetachedTmuxViewerProcess:
         return None
 
 
+def _viewer_session_ended(viewer: DetachedTmuxViewerProcess) -> bool:
+    """Report whether the viewer session is provably gone.
+
+    A probe that cannot be completed is not proof of an ordinary ending, so it
+    reports ``False`` and leaves the caller's transport failure in place.
+    """
+
+    try:
+        return not viewer.attached
+    except (OSError, TransportError):
+        return False
+
+
 class SecretPromptPresenter:
     """Notify on prompt detection and attach only after exact authorization."""
 
@@ -908,10 +921,12 @@ class SecretPromptPresenter:
             with self._active_lock:
                 self._active = (viewer, client_tty)
             prompt_probe_error: OSError | TransportError | None = None
+            session_ended = False
             try:
                 while process.poll() is None and not self._stop.is_set():
                     try:
                         if not viewer.attached:
+                            session_ended = True
                             break
                         current_completion_count = (
                             viewer.authentication_complete_count()
@@ -935,10 +950,18 @@ class SecretPromptPresenter:
                         process.wait(timeout=2)
                 returncode = process.poll()
                 if type(returncode) is not int or returncode != 0:
-                    raise TransportError(
-                        "automatic viewer attachment exited with status "
-                        f"{returncode}"
-                    )
+                    # A client whose session is destroyed while it is still
+                    # attached prints "[exited]" and exits non-zero.  For a
+                    # short command that finishes right after authentication
+                    # that is the ordinary ending, not a transport failure, so
+                    # only an exit with the session still alive is one.
+                    if not session_ended:
+                        session_ended = _viewer_session_ended(viewer)
+                    if not session_ended:
+                        raise TransportError(
+                            "automatic viewer attachment exited with status "
+                            f"{returncode}"
+                        )
                 if prompt_probe_error is not None:
                     raise TransportError(
                         "automatic viewer prompt inspection failed"

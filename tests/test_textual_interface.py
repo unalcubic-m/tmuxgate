@@ -42,6 +42,7 @@ from tmuxgate.operator_interface import (
     SecretInputRecipient,
     SshRetryPrompt,
 )
+from tmuxgate import textual_interface as textual_interface_module
 from tmuxgate.textual_interface import (
     APPROVAL_ARM_SECONDS,
     DashboardJob,
@@ -60,6 +61,7 @@ from tmuxgate.textual_interface import (
     TextualOperatorInterface,
     TerminalOwnershipState,
     TmuxgateDashboardApp,
+    _resume_after,
     flush_textual_input,
     validate_textual_terminal,
 )
@@ -121,6 +123,243 @@ class TextualDependencyTests(unittest.TestCase):
         ]
         pins = [item for item in project["dependencies"] if item.startswith("textual")]
         self.assertEqual(pins, ["textual==8.2.8"])
+
+
+class SuspendResumeTests(unittest.TestCase):
+    """A suspended session always resumes before its failure propagates."""
+
+    @staticmethod
+    def _unguarded_suspension(events):
+        # textual.app.App.suspend resumes in the statement after its yield and
+        # guards it with no try/finally, so anything raised by the body skips
+        # the resume.  These tests hold that exact shape.
+        @contextmanager
+        def suspension():
+            events.append("suspend")
+            yield
+            events.append("resume")
+
+        return suspension()
+
+    def test_successful_session_resumes(self):
+        events = []
+        _resume_after(
+            self._unguarded_suspension(events),
+            lambda: events.append("session"),
+        )
+        self.assertEqual(events, ["suspend", "session", "resume"])
+
+    def test_failing_session_resumes_before_reraising(self):
+        events = []
+        failure = OperatorInterfaceError("viewer attachment exited with status 1")
+
+        def session() -> None:
+            events.append("session")
+            raise failure
+
+        with self.assertRaises(OperatorInterfaceError) as caught:
+            _resume_after(self._unguarded_suspension(events), session)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(events, ["suspend", "session", "resume"])
+
+    def test_interrupted_session_resumes_before_reraising(self):
+        # A bare KeyboardInterrupt must not strand the driver either.
+        events = []
+
+        def session() -> None:
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            _resume_after(self._unguarded_suspension(events), session)
+        self.assertEqual(events, ["suspend", "resume"])
+
+
+class ArmedFocusTests(unittest.TestCase):
+    """Routine decisions focus the positive action only once it is armed."""
+
+    @staticmethod
+    async def _settle_armed(screen, pilot) -> None:
+        """Wait for the arm timer itself, never for a wall-clock estimate.
+
+        A loaded runner can take longer than APPROVAL_ARM_SECONDS to deliver
+        the timer, so pausing for that duration and assuming the screen armed
+        races the very fence under test.
+        """
+
+        deadline = time.monotonic() + 5
+        while not screen._arm_ready:
+            if time.monotonic() >= deadline:
+                raise AssertionError("the decision never armed")
+            await pilot.pause(0.02)
+        await pilot.pause()
+
+    @staticmethod
+    def _never_arms():
+        """Hold the arm fence open so the pre-arm state cannot elapse."""
+
+        return mock.patch.object(
+            textual_interface_module, "APPROVAL_ARM_SECONDS", 3600.0
+        )
+
+    def _drive(self, screen_type, request, size=(100, 30), arm=True):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        decisions = []
+        asking = threading.Thread(
+            target=lambda: decisions.append(request(interface))
+        )
+        asking.start()
+        self.addCleanup(lambda: asking.join(timeout=1))
+        while interface.pending_prompt_count < 1:
+            time.sleep(0.01)
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+        focused = []
+
+        async def exercise() -> None:
+            async with app.run_test(size=size) as pilot:
+                deadline = time.monotonic() + 2
+                while not isinstance(app.screen, screen_type):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("decision modal did not open")
+                    await pilot.pause(0.02)
+                screen = app.screen
+                if arm:
+                    await self._settle_armed(screen, pilot)
+                else:
+                    await pilot.pause()
+                focused.append(screen.focused.id if screen.focused else None)
+                await pilot.press("escape")
+                await pilot.pause()
+
+        asyncio.run(exercise())
+        return focused[0]
+
+    @staticmethod
+    def _execution(interface):
+        return interface.request_execution_approval(prompt()).decision
+
+    @staticmethod
+    def _secret(interface):
+        return interface.request_secret_input_authorization(secret_prompt()).decision
+
+    def test_execution_approval_focuses_approve_once_armed(self):
+        self.assertEqual(self._drive(ExecutionApprovalScreen, self._execution),
+                         "approval-approve")
+
+    def test_secret_authorization_focuses_approve_once_armed(self):
+        self.assertEqual(self._drive(SecretInputAuthorizationScreen, self._secret),
+                         "secret-approve")
+
+    def test_execution_approval_keeps_deny_focused_before_arming(self):
+        # The arm window must stay unfocused as well as disabled, so buffered
+        # input cannot commit the positive action.
+        with self._never_arms():
+            focused = self._drive(
+                ExecutionApprovalScreen, self._execution, arm=False
+            )
+        self.assertEqual(focused, "approval-deny")
+
+    def test_compact_terminal_keeps_deny_focused_after_arming(self):
+        # Too small to display the evidence means the operator cannot have
+        # reviewed it, so the safe action keeps focus however long it is open.
+        self.assertEqual(
+            self._drive(
+                ExecutionApprovalScreen,
+                self._execution,
+                size=(MINIMUM_COLUMNS - 1, MINIMUM_ROWS - 1),
+            ),
+            "approval-deny",
+        )
+
+    def test_return_alone_approves_an_armed_execution_request(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        decisions = []
+        asking = threading.Thread(
+            target=lambda: decisions.append(
+                interface.request_execution_approval(prompt()).decision
+            )
+        )
+        asking.start()
+        self.addCleanup(lambda: asking.join(timeout=1))
+        while interface.pending_prompt_count < 1:
+            time.sleep(0.01)
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                deadline = time.monotonic() + 2
+                while not isinstance(app.screen, ExecutionApprovalScreen):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("approval modal did not open")
+                    await pilot.pause(0.02)
+                screen = app.screen
+                await self._settle_armed(screen, pilot)
+                self.assertEqual(screen.focused.id, "approval-approve")
+                await pilot.press("enter")
+                deadline = time.monotonic() + 2
+                while asking.is_alive() and time.monotonic() < deadline:
+                    await pilot.pause(0.02)
+
+        asyncio.run(exercise())
+        asking.join(timeout=1)
+        self.assertEqual(decisions, [ApprovalDecision.APPROVED])
+
+    def test_return_before_arming_takes_the_safe_action(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        decisions = []
+        asking = threading.Thread(
+            target=lambda: decisions.append(
+                interface.request_execution_approval(prompt()).decision
+            )
+        )
+        asking.start()
+        self.addCleanup(lambda: asking.join(timeout=1))
+        while interface.pending_prompt_count < 1:
+            time.sleep(0.01)
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                deadline = time.monotonic() + 2
+                while not isinstance(app.screen, ExecutionApprovalScreen):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("approval modal did not open")
+                    await pilot.pause(0.02)
+                # Deny still holds focus inside the arm window, so a Return
+                # that beats the timer denies rather than approving.
+                await pilot.press("enter")
+                deadline = time.monotonic() + 2
+                while asking.is_alive() and time.monotonic() < deadline:
+                    await pilot.pause(0.02)
+
+        with self._never_arms():
+            asyncio.run(exercise())
+        asking.join(timeout=1)
+        self.assertEqual(decisions, [ApprovalDecision.DENIED])
+
+    def test_machine_disable_keeps_the_safe_action_focused(self):
+        def request(interface):
+            return interface.request_machine_disable(
+                MachineDisablePrompt.create(
+                    REQUEST_ID,
+                    prompt().request,
+                    build_plan(),
+                    failure_detail="all routes failed",
+                    remote_mutation_state=RemoteMutationState.NOT_STARTED,
+                )
+            ).decision
+
+        self.assertEqual(
+            self._drive(MachineDisableScreen, request), "disable-cancel"
+        )
 
 
 class TextualOperatorInterfaceTests(unittest.TestCase):
@@ -410,6 +649,90 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
             ],
         )
 
+    def test_failing_secret_terminal_session_still_resumes_the_app(self):
+        # Regression for the production wedge: the sudo password handoff raised
+        # when the remote tmux session was destroyed while the client was still
+        # attached, and the escaping exception skipped Textual's resume.
+        events = []
+
+        class RecordingTerminal(FakeTerminalArbiter):
+            @contextmanager
+            def claim(self, **keywords):
+                events.append(("claim", keywords["priority"]))
+                try:
+                    yield
+                finally:
+                    events.append(("release", keywords["priority"]))
+
+        class RecordingApp(TmuxgateDashboardApp):
+            @contextmanager
+            def suspend(self):
+                events.append("suspend")
+                yield
+                events.append("resume")
+
+        interface = TextualOperatorInterface(
+            RecordingTerminal(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        secret = secret_prompt()
+        authorizer = threading.Thread(
+            target=lambda: interface.request_secret_input_authorization(secret)
+        )
+        authorizer.start()
+        app = RecordingApp(interface, threading.Event(), config())
+        failures = []
+
+        def failing_session() -> None:
+            events.append("trusted-session")
+            raise OperatorInterfaceError("viewer attachment exited with status 1")
+
+        def handoff_target() -> None:
+            try:
+                interface.run_external_terminal_session(secret, failing_session)
+            except BaseException as exc:
+                failures.append(exc)
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                deadline = time.monotonic() + 2
+                while not isinstance(app.screen, SecretInputAuthorizationScreen):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("secret authorization modal did not open")
+                    await pilot.pause(0.02)
+                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                self.assertTrue(await pilot.click("#secret-approve"))
+                deadline = time.monotonic() + 1
+                while authorizer.is_alive() and time.monotonic() < deadline:
+                    await pilot.pause(0.02)
+
+                handoff = threading.Thread(target=handoff_target)
+                handoff.start()
+                deadline = time.monotonic() + 2
+                while handoff.is_alive() and time.monotonic() < deadline:
+                    await pilot.pause(0.02)
+                handoff.join(timeout=0)
+                self.assertFalse(handoff.is_alive())
+                self.assertIs(
+                    interface.terminal_ownership_state,
+                    TerminalOwnershipState.TUI,
+                )
+
+        asyncio.run(exercise())
+        authorizer.join(timeout=1)
+        self.assertEqual(
+            events,
+            [
+                ("claim", TerminalPriority.SECRET),
+                "suspend",
+                "trusted-session",
+                "resume",
+                ("release", TerminalPriority.SECRET),
+            ],
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], OperatorInterfaceError)
+
     def test_ssh_terminal_session_suspends_without_an_authorizing_modal(self):
         # Regression for SSH master creation being impossible under the default
         # interface: this application holds the terminal noncanonical, so the
@@ -473,6 +796,80 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 ("release", TerminalPriority.INTERACTIVE),
             ],
         )
+
+    def test_failing_ssh_terminal_session_still_resumes_the_app(self):
+        # Regression: textual.app.App.suspend resumes application mode in the
+        # statement after its yield, with no try/finally, so a session that
+        # raised skipped the resume.  The driver was then left stopped with a
+        # stopped writer thread whose bounded queue still accepted writes, and
+        # the next repaint blocked the app forever.
+        events = []
+
+        class RecordingTerminal(FakeTerminalArbiter):
+            @contextmanager
+            def claim(self, **keywords):
+                # Mirrors TerminalArbiter.claim, which releases in a finally.
+                events.append(("claim", keywords["priority"]))
+                try:
+                    yield
+                finally:
+                    events.append(("release", keywords["priority"]))
+
+        class RecordingApp(TmuxgateDashboardApp):
+            @contextmanager
+            def suspend(self):
+                # Mirrors App.suspend exactly: no try/finally, so an exception
+                # raised by the body must not be allowed to reach it.
+                events.append("suspend")
+                yield
+                events.append("resume")
+
+        def failing_session() -> None:
+            events.append("ssh-authentication")
+            raise OperatorInterfaceError("viewer attachment exited with status 1")
+
+        interface = TextualOperatorInterface(
+            RecordingTerminal(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        app = RecordingApp(interface, threading.Event(), config())
+        failures = []
+
+        def handoff_target() -> None:
+            try:
+                interface.run_terminal_session(
+                    "SSH enrollment authentication", failing_session
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                handoff = threading.Thread(target=handoff_target)
+                handoff.start()
+                deadline = time.monotonic() + 2
+                while handoff.is_alive() and time.monotonic() < deadline:
+                    await pilot.pause(0.02)
+                handoff.join(timeout=0)
+                self.assertFalse(handoff.is_alive())
+                self.assertIs(
+                    interface.terminal_ownership_state,
+                    TerminalOwnershipState.TUI,
+                )
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            events,
+            [
+                ("claim", TerminalPriority.INTERACTIVE),
+                "suspend",
+                "ssh-authentication",
+                "resume",
+                ("release", TerminalPriority.INTERACTIVE),
+            ],
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], OperatorInterfaceError)
 
     def test_terminal_session_shares_one_exclusive_external_slot(self):
         # Secret input and SSH authentication reserve the same single slot, so

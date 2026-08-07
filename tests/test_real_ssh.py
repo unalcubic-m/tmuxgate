@@ -1021,6 +1021,96 @@ class RealSshProcessTests(unittest.TestCase):
             self.assertTrue(presenter.close())
 
 
+class EndingSessionViewer(ScriptedDetachedViewer):
+    """A viewer whose session can be destroyed while a client is attached."""
+
+    def __init__(self, request_suffix):
+        super().__init__(request_suffix)
+        self.session_alive = True
+        self.probe_fails = False
+
+    @property
+    def attached(self):
+        if self.probe_fails:
+            raise TransportError("detached viewer cursor is unavailable")
+        return self.session_alive
+
+    def detach_client(self, client_tty):
+        if not self.session_alive:
+            raise AssertionError("a destroyed session must not be detached")
+        super().detach_client(client_tty)
+
+
+class ViewerSessionEndingTests(unittest.TestCase):
+    """A destroyed viewer session is an ordinary ending, not a failure."""
+
+    def _presenter(self, popen):
+        return approved_presenter(
+            terminal_opener=lambda *args, **kwargs: FakeTerminal(),
+            popen=popen,
+            terminal_path_resolver=lambda: "/dev/pts/test",
+            terminal_input_flusher=lambda terminal, path: None,
+            poll_seconds=0.005,
+        )
+
+    @staticmethod
+    def _exited_client(viewer, **changes):
+        def popen(argv, **kwargs):
+            process = FakeAttachProcess()
+            # tmux prints "[exited]" and exits non-zero when the session it is
+            # attached to is destroyed underneath the client.
+            process.returncode = 1
+            viewer.process = process
+            for name, value in changes.items():
+                setattr(viewer, name, value)
+            return process
+
+        return popen
+
+    def test_client_exit_after_session_destruction_is_not_a_failure(self):
+        # Regression: a command that finishes right after authentication tears
+        # down its tmux session while the client is still attached, so the
+        # client exits non-zero on its own.  That used to be reported as a
+        # transport failure, and the resulting exception escaped Textual's
+        # suspend block and permanently wedged the dashboard.
+        viewer = EndingSessionViewer("aaaaaaaaaaaa")
+        presenter = self._presenter(
+            self._exited_client(viewer, session_alive=False)
+        )
+        try:
+            presenter._attach_authorized_viewer(
+                viewer, secret_input_recipient(viewer)
+            )
+            self.assertEqual(viewer.detach_count, 0)
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_client_exit_with_a_live_session_remains_a_failure(self):
+        viewer = EndingSessionViewer("bbbbbbbbbbbb")
+        presenter = self._presenter(self._exited_client(viewer))
+        try:
+            with self.assertRaisesRegex(TransportError, "exited with status 1"):
+                presenter._attach_authorized_viewer(
+                    viewer, secret_input_recipient(viewer)
+                )
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_unreadable_session_probe_remains_a_failure(self):
+        # An inconclusive probe is not proof of an ordinary ending.
+        viewer = EndingSessionViewer("cccccccccccc")
+        presenter = self._presenter(
+            self._exited_client(viewer, probe_fails=True)
+        )
+        try:
+            with self.assertRaisesRegex(TransportError, "exited with status 1"):
+                presenter._attach_authorized_viewer(
+                    viewer, secret_input_recipient(viewer)
+                )
+        finally:
+            self.assertTrue(presenter.close())
+
+
 class MasterStartTerminalBoundaryTests(unittest.TestCase):
     """Only a master that can actually prompt may reach the terminal."""
 
