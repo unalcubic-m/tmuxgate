@@ -464,9 +464,18 @@ _CODEX_ANY_TABLE_LINE = re.compile(
 )
 _CODEX_SIMPLE_ASSIGNMENT = re.compile(
     r"^[ \t]*[A-Za-z0-9_-]+[ \t]*=[ \t]*"
-    r"(?:\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[+-]?[0-9][0-9_]*|true|false)"
+    # Codex rewrites this file and renders our integer timeout as a float, so a
+    # trailing fractional part is our own value coming back, not a value some
+    # other writer introduced.  It stays as unambiguous as the integer form.
+    r"(?:\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[+-]?[0-9][0-9_]*(?:\.[0-9]+)?"
+    r"|true|false)"
     r"[ \t]*(?:#[^\r\n]*)?(?:\r\n|\n|\r)?$"
 )
+# Sub-tables Codex writes below our own, such as
+# ``[mcp_servers.tmuxgate.tools.run_argv]``.  They are the operator's approval
+# policy, they are preserved by the byte-span rewrite, and they must not be
+# read as a competing registration.
+_CODEX_OWNED_SUBTABLE_KEYS = frozenset({"tools"})
 
 
 def _codex_registration_payload(*, url: str, name: str = MCP_NAME) -> bytes:
@@ -491,6 +500,35 @@ def _codex_target(parsed: dict[str, object], *, name: str) -> object | None:
     if not isinstance(servers, dict):
         raise InstallError("Codex mcp_servers configuration is not a table")
     return servers.get(name)
+
+
+def _codex_declared_keys(target: object) -> dict[str, object]:
+    """The keys our own table declares, excluding Codex's own sub-tables.
+
+    Only a genuine sub-table is excluded.  A scalar of the same name was not
+    written by Codex, so it stays visible and is still treated as a conflict.
+    """
+
+    if not isinstance(target, dict):
+        return {}
+    return {
+        key: value
+        for key, value in target.items()
+        if not (key in _CODEX_OWNED_SUBTABLE_KEYS and isinstance(value, dict))
+    }
+
+
+def _codex_timeout_is_ours_to_update(value: object) -> bool:
+    """Whether a present timeout is a plain number this installer may rewrite.
+
+    This is deliberately a check of form, not of value.  Any simple number in
+    our own table is ours to bring up to date, which is what keeps an install
+    working after ``MCP_TOOL_TIMEOUT_SECONDS`` changes.  Only the float case is
+    new: Codex rewrites this file and renders our integer as a float.
+    """
+
+    # ``bool`` is an ``int`` subclass and is never a valid timeout.
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def update_codex_registration(
@@ -567,15 +605,16 @@ def update_codex_registration(
                     "edit it manually"
                 )
 
-        if target == desired:
+        declared = _codex_declared_keys(target)
+        if declared == desired:
             return raw
         compatible = bool(
-            set(target).issubset(desired)
-            and target.get("url") == url
-            and target.get("bearer_token_env_var") == MCP_TOKEN_ENV
+            set(declared).issubset(desired)
+            and declared.get("url") == url
+            and declared.get("bearer_token_env_var") == MCP_TOKEN_ENV
             and (
-                "tool_timeout_sec" not in target
-                or type(target["tool_timeout_sec"]) is int
+                "tool_timeout_sec" not in declared
+                or _codex_timeout_is_ours_to_update(declared["tool_timeout_sec"])
             )
         )
         if not compatible and not replace_conflict:
@@ -595,7 +634,7 @@ def update_codex_registration(
         raise InstallError(
             "Codex config layout cannot be updated safely; edit it manually"
         ) from exc
-    if updated_target != desired:
+    if _codex_declared_keys(updated_target) != desired:
         raise InstallError(
             "Codex tmuxgate table has nested or ambiguous configuration; edit it manually"
         )

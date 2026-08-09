@@ -166,7 +166,15 @@ that isolated directory; neither the live config nor unrelated hooks and
 settings are exposed to CLI serialization. The installer refuses a different
 registration named `tmuxgate` unless `--replace-codex` is explicit, and even
 then replaces only an unambiguous simple table; nested, quoted, or complex
-layouts fail closed for manual review. An owner-controlled Codex home is
+layouts fail closed for manual review. Codex rewrites this file, so the
+installer recognizes its own registration in the shape Codex leaves it: a
+`tool_timeout_sec` rendered as a float, and the
+`[mcp_servers.tmuxgate.tools.*]` approval sub-tables Codex appends when an
+operator approves a tool. Both are treated as already installed rather than as
+a competing entry, and the sub-tables are preserved even when a genuinely
+conflicting table is replaced, because they are the operator's approval policy.
+A scalar named `tools` is not a Codex sub-table and remains a conflict. An
+owner-controlled Codex home is
 hardened to mode `0700` before its configuration is changed. Installer
 children receive neither the MCP bearer token nor `PYTHONPATH`, `PYTHONHOME`,
 or `VIRTUAL_ENV`, preventing credentials or checkout imports from leaking into
