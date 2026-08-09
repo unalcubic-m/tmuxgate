@@ -366,6 +366,36 @@ and fsynced; the verified spool flag is inseparable from its exact manifest
 digest. The real executor uses this store directly; there is no second state
 path.
 
+The durable record begins at approval, not at transport. As soon as the
+one-shot approved context is consumed the executor fsyncs
+`APPROVED_PRE_REMOTE`, before it opens any SSH master. Every later
+pre-transport outcome therefore terminalizes an existing record rather than
+leaving nothing: an exhausted endpoint plan, a denied fallback, a cancelled
+retry, a revalidation refusal, or any other failure before the remote-start
+boundary becomes `FAILED_PRE_REMOTE` carrying the same detail the caller
+receives. An authorized request is consequently always visible to `list_jobs`,
+and an operator can tell a failure that reached approval from a request that
+was never submitted. Because the approval is what is recorded, a plan that
+proves unusable while being consumed, such as a machine disabled between
+approval and execution, is deliberately not recorded: nothing was authorized
+to run. The
+volume this creates is intended; a machine that cannot be reached leaves one
+terminal audit record per approved attempt, which is the evidence a
+pre-transport failure otherwise destroys.
+
+Route fallback is offered only before any remote mutation, so the approved
+record is retargeted to the next endpoint under the same generation-checked
+write when the operator authorizes it. Retargeting requires
+`APPROVED_PRE_REMOTE`, an unmutated record, and the record's own approved
+connection-plan digest, so it can never rewrite the identity of a request that
+already touched a host. `FAILED_PRE_REMOTE` is terminal and carries
+`remote_mutation_started = false` with no start time, exit status, or spool
+evidence, so a record that never reached a remote host can never become a
+startup-recovery blocker. If the failing transition cannot itself be written,
+the last fsynced `APPROVED_PRE_REMOTE` record stands untouched, the caller
+still receives `pre_remote_failure`, and startup recovery terminalizes the
+record conservatively.
+
 SSH public-key setup has its own durable sub-lifecycle in the same record. A
 read-only remote check first proves whether the exact dedicated key is already
 present. If it is missing, tmuxgate fsyncs

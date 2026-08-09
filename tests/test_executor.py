@@ -7,7 +7,7 @@ from tmuxgate.executor import RealExecutor
 from tmuxgate.result import TransportStatus
 from tmuxgate.scheduler import RequestState
 from tmuxgate.spool import ResultSpool
-from tmuxgate.state import DurableStateStore
+from tmuxgate.state import DurableStateStore, recover_startup
 from tmuxgate.approval import ApprovalDecision
 from tmuxgate.operator_interface import (
     ConnectionPhase,
@@ -136,6 +136,24 @@ class RealExecutorTests(unittest.TestCase):
     def approve(self, spec):
         self.planner(REQUEST_ID, spec)
 
+    def assert_durable_pre_remote_failure(self, *, endpoint_id, detail_fragment):
+        """An approved request that never reached a host is still listable."""
+
+        records = self.state.load_all()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.request_id, REQUEST_ID)
+        self.assertEqual(record.state, RequestState.FAILED_PRE_REMOTE)
+        self.assertEqual(record.decision, ApprovalDecision.APPROVED)
+        self.assertFalse(record.remote_mutation_started)
+        self.assertIsNone(record.start_time)
+        self.assertIsNone(record.completion_time)
+        self.assertIsNone(record.exit_status)
+        self.assertFalse(record.local_spool_verified)
+        self.assertEqual(record.endpoint_id, endpoint_id)
+        self.assertIn(detail_fragment, record.failure_detail)
+        return record
+
     def executor(self, backend, **kwargs):
         operator = CallbackOperatorInterface(
             fallback_approver=kwargs.pop(
@@ -187,12 +205,82 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual((spooled.stdout, spooled.stderr, spooled.exit_status), (b"stdout-line\n", b"stderr-line\n", 7))
         self.assertIsNone(self.pool.pinned_request_id)
 
-    def test_transport_failure_is_proven_pre_remote_and_creates_no_job_state(self):
+    def test_transport_failure_is_proven_pre_remote_and_stays_durably_listed(self):
         spec = request(("true",))
         self.approve(spec)
         self.master_backend.fail_next_start = True
         result = self.executor(AutoCompletingBackend())(REQUEST_ID, spec)
         self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        record = self.assert_durable_pre_remote_failure(
+            endpoint_id="home-lan",
+            detail_fragment="synthetic authentication failure",
+        )
+        self.assertIn("SSH transport was not established", record.failure_detail)
+        self.assertIsNone(self.pool.pinned_request_id)
+
+    def test_durable_pre_remote_failure_never_blocks_startup_recovery(self):
+        spec = request(("true",))
+        self.approve(spec)
+        self.master_backend.fail_next_start = True
+        self.executor(AutoCompletingBackend())(REQUEST_ID, spec)
+
+        report = recover_startup(self.state)
+
+        self.assertTrue(report.safe_to_accept_new_approvals)
+        self.assertEqual(report.blocking_request_ids, ())
+        self.assertEqual(report.interrupted_pre_remote_ids, ())
+        self.assertEqual(len(report.records), 1)
+        self.assertEqual(report.records[0].state, RequestState.FAILED_PRE_REMOTE)
+
+    def test_pre_remote_failure_stands_when_its_own_durable_failure_fails(self):
+        spec = request(("true",))
+        self.approve(spec)
+        self.master_backend.fail_next_start = True
+        written = []
+        real_fail_pre_remote = self.state.fail_pre_remote
+
+        def refuse_fail_pre_remote(record, **kwargs):
+            written.append(record)
+            raise OSError("synthetic durable failure-of-the-failure")
+
+        self.state.fail_pre_remote = refuse_fail_pre_remote
+        try:
+            result = self.executor(AutoCompletingBackend())(REQUEST_ID, spec)
+        finally:
+            self.state.fail_pre_remote = real_fail_pre_remote
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertIn("synthetic authentication failure", result.detail)
+        self.assertEqual(len(written), 1)
+        # The record is left in its last fsynced state, not mid-transition, so
+        # startup recovery can terminalize it conservatively.
+        stranded = self.state.load(REQUEST_ID)
+        self.assertEqual(stranded.state, RequestState.APPROVED_PRE_REMOTE)
+        self.assertFalse(stranded.remote_mutation_started)
+        report = recover_startup(self.state)
+        self.assertTrue(report.safe_to_accept_new_approvals)
+        self.assertEqual(report.interrupted_pre_remote_ids, (REQUEST_ID,))
+        self.assertEqual(
+            self.state.load(REQUEST_ID).state, RequestState.FAILED_PRE_REMOTE
+        )
+
+    def test_unrecordable_approval_fails_pre_remote_without_opening_ssh(self):
+        spec = request(("true",))
+        self.approve(spec)
+        real_write = self.state.write
+
+        def refuse_write(record):
+            raise OSError("synthetic durable write failure")
+
+        self.state.write = refuse_write
+        try:
+            result = self.executor(AutoCompletingBackend())(REQUEST_ID, spec)
+        finally:
+            self.state.write = real_write
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertIn("could not be recorded durably", result.detail)
+        self.assertEqual(self.master_backend.starts, [])
         self.assertEqual(self.state.load_all(), ())
         self.assertIsNone(self.pool.pinned_request_id)
 
@@ -286,6 +374,8 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
         self.assertIn("configured machine is disabled", result.detail)
         self.assertEqual(self.master_backend.starts, [])
+        # The approval was invalidated while being consumed, so no approved
+        # record may exist: an unusable plan is not an authorized request.
         self.assertEqual(self.state.load_all(), ())
         self.assertIsNone(self.pool.pinned_request_id)
         self.assertEqual(self.planner.pending_request_ids, ())
@@ -365,7 +455,10 @@ class RealExecutorTests(unittest.TestCase):
             fallback_prompt.openssh_diagnostics,
             b"attempt 2: malicious \x1b]8;;link\x07\n",
         )
-        self.assertEqual(self.state.load_all(), ())
+        self.assert_durable_pre_remote_failure(
+            endpoint_id="home-lan",
+            detail_fragment="human denied the next approved fallback",
+        )
 
     def test_cancelled_ssh_retry_requires_fallback_approval_without_state(self):
         self.master_backend.close()
@@ -402,7 +495,10 @@ class RealExecutorTests(unittest.TestCase):
             "cancelled the same-endpoint retry",
             fallback_calls[0][1]["failure_detail"],
         )
-        self.assertEqual(self.state.load_all(), ())
+        self.assert_durable_pre_remote_failure(
+            endpoint_id="home-lan",
+            detail_fragment="human denied the next approved fallback",
+        )
 
     def test_fallback_endpoint_has_its_own_single_confirmed_retry(self):
         self.master_backend.close()
@@ -468,7 +564,12 @@ class RealExecutorTests(unittest.TestCase):
         self.assertFalse(disable_calls[0][1]["remote_mutation_started"])
         self.assertEqual(disabled, ["app-server"])
         self.assertIn("machine disabled by operator", result.detail)
-        self.assertEqual(self.state.load_all(), ())
+        # The record follows the plan to the last endpoint actually attempted.
+        record = self.assert_durable_pre_remote_failure(
+            endpoint_id="wireguard",
+            detail_fragment="machine disabled by operator",
+        )
+        self.assertEqual(record.failure_detail, result.detail)
 
     def test_disable_write_failure_preserves_original_pre_remote_failure(self):
         self.master_backend.close()
@@ -497,7 +598,10 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
         self.assertIn("SSH transport was not established", result.detail)
         self.assertIn("machine remains enabled because disabling failed", result.detail)
-        self.assertEqual(self.state.load_all(), ())
+        self.assert_durable_pre_remote_failure(
+            endpoint_id="wireguard",
+            detail_fragment="machine remains enabled because disabling failed",
+        )
 
     def test_already_disabled_machine_skips_duplicate_disable_prompt(self):
         self.master_backend.close()
@@ -523,7 +627,10 @@ class RealExecutorTests(unittest.TestCase):
 
         self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
         self.assertIn("machine was already disabled", result.detail)
-        self.assertEqual(self.state.load_all(), ())
+        self.assert_durable_pre_remote_failure(
+            endpoint_id="wireguard",
+            detail_fragment="machine was already disabled",
+        )
 
     def test_ssh_retry_refuses_changed_ssh_identity_plan(self):
         self.master_backend.close()
@@ -556,7 +663,10 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
         self.assertIn("plan changed", result.detail)
         self.assertEqual(len(self.master_backend.starts), 1)
-        self.assertEqual(self.state.load_all(), ())
+        self.assert_durable_pre_remote_failure(
+            endpoint_id="home-lan",
+            detail_fragment="plan changed",
+        )
 
     def test_non_ssh_setup_failure_never_offers_authentication_retry(self):
         spec = request(("true",))
