@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -958,6 +959,176 @@ class InstallerFlowTests(unittest.TestCase):
                     )
                     self.assertEqual(installer.install(acknowledged), 0)
             self.assertTrue((fixture["bin_dir"] / "tmuxgate").is_symlink())
+
+    def _main_stderr(self, fixture, *extra):
+        """Run the public entrypoint and return (exit status, stdout, stderr)."""
+
+        out = io.StringIO()
+        err = io.StringIO()
+        argv = [
+            "--source",
+            str(REPOSITORY),
+            "--bin-dir",
+            str(fixture["bin_dir"]),
+            "--codex-bin",
+            str(fixture["codex"]),
+            *extra,
+        ]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = installer.main(argv)
+        return status, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def _rows(text):
+        """Report lines with column padding collapsed, so layout is not asserted."""
+
+        return re.sub(r"[ \t]+", " ", text)
+
+    def _disable_approvals(self, fixture):
+        fixture["config"].write_bytes(
+            fixture["config_payload"].replace(
+                b'approval_mode = "always"', b'approval_mode = "disabled"'
+            )
+        )
+
+    def test_disabled_approval_guard_reports_candidate_and_active_state(self):
+        # Regression for issue #40. pip prints "Successfully installed tmuxgate"
+        # inside the unpublished candidate, and the guard then stops before any
+        # publication. The run must say so rather than leaving the operator to
+        # guess whether that build became the active tmuxgate.
+        for label, preinstall in (("fresh install", False), ("update", True)):
+            with self.subTest(scenario=label):
+                with tempfile.TemporaryDirectory() as temporary:
+                    fixture = self._fixture(Path(temporary))
+                    fake_run = self._fake_installer_runner(installer._run)
+                    install_root = fixture["data"] / "tmuxgate"
+                    current = install_root / "current"
+                    launcher = fixture["bin_dir"] / "tmuxgate"
+                    with mock.patch.dict(os.environ, fixture["environment"], clear=True):
+                        with mock.patch.object(installer, "_run", side_effect=fake_run):
+                            active_before = None
+                            if preinstall:
+                                with contextlib.redirect_stdout(io.StringIO()):
+                                    self.assertEqual(
+                                        installer.install(self._arguments(fixture)), 0
+                                    )
+                                active_before = os.readlink(current)
+                            self._disable_approvals(fixture)
+                            status, out, err = self._main_stderr(fixture)
+
+                    self.assertEqual(status, 1)
+                    self.assertIn("--allow-disabled-approvals", err)
+                    self.assertIn("Overall result", err)
+                    self.assertIn("INCOMPLETE", err)
+                    # Candidate staging is reported separately from publication.
+                    self.assertIn("VERIFIED, THEN DISCARDED", err)
+                    self.assertIn("Current/launcher publication : NOT ATTEMPTED", self._rows(err))
+                    self.assertIn("Codex registration : NOT ATTEMPTED", self._rows(err))
+                    self.assertIn("Shell integration : NOT ATTEMPTED", self._rows(err))
+                    self.assertIn("Configuration validation : PASSED", self._rows(err))
+                    self.assertIn("MCP credential : PRE-EXISTING", self._rows(err))
+                    self.assertIn("approval_mode to 'always'", err)
+                    # The candidate is named by release identity, not by the
+                    # version string every build shares.
+                    self.assertNotIn("Candidate identity : NONE", self._rows(err))
+                    self.assertNotIn("0.1.0.dev0", err)
+                    # Only one release directory is ever left behind: the
+                    # discarded candidate must be gone.
+                    releases = sorted(p.name for p in (install_root / "releases").iterdir())
+                    if preinstall:
+                        self.assertIn("Active tmuxgate release : UNCHANGED", self._rows(err))
+                        self.assertEqual(os.readlink(current), active_before)
+                        self.assertEqual(releases, [Path(active_before).name])
+                        self.assertTrue(launcher.is_symlink())
+                    else:
+                        self.assertIn("Active tmuxgate release : ABSENT", self._rows(err))
+                        self.assertFalse(current.exists() or current.is_symlink())
+                        self.assertEqual(releases, [])
+                        self.assertFalse(launcher.exists() or launcher.is_symlink())
+                    combined = out + err
+                    self.assertNotIn(fixture["token"], combined)
+                    self.assertNotIn("e" * 64, combined)
+
+    def test_acknowledged_disabled_approvals_publish_and_report_complete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            fake_run = self._fake_installer_runner(installer._run)
+            with mock.patch.dict(os.environ, fixture["environment"], clear=True):
+                with mock.patch.object(installer, "_run", side_effect=fake_run):
+                    self._disable_approvals(fixture)
+                    status, out, err = self._main_stderr(
+                        fixture, "--allow-disabled-approvals"
+                    )
+
+            self.assertEqual(status, 0)
+            current = fixture["data"] / "tmuxgate" / "current"
+            release_id = Path(os.readlink(current)).name
+            # A published run names the release that actually became active.
+            self.assertIn(f"Active release: {release_id}", out)
+            self.assertIn("WARNING: approval_mode is disabled", err)
+            self.assertNotIn("Overall result", err)
+            self.assertNotIn(fixture["token"], out + err)
+
+    def test_a_token_created_by_the_run_is_reported_as_retained(self):
+        # A newly created MCP token is durable state that survives a blocked
+        # install, so the guard must not describe it as pre-existing.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            fixture["token_path"].unlink()
+            fake_run = self._fake_installer_runner(installer._run)
+            with mock.patch.dict(os.environ, fixture["environment"], clear=True):
+                with mock.patch.object(installer, "_run", side_effect=fake_run):
+                    self._disable_approvals(fixture)
+                    status, out, err = self._main_stderr(fixture)
+
+            self.assertEqual(status, 1)
+            self.assertIn("MCP credential : CREATED AND RETAINED", self._rows(err))
+            self.assertTrue(fixture["token_path"].is_file())
+            self.assertNotIn(
+                fixture["token_path"].read_text(encoding="ascii").strip(), out + err
+            )
+
+    def test_failure_after_publication_reports_retained_candidate_and_rollback(self):
+        # A release that was published before the failure may already have been
+        # observed, so it is kept on purpose. The report must say it is retained
+        # but not active, and must not describe the rolled-back integrations as
+        # still updated.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            fake_run = self._fake_installer_runner(installer._run)
+            real_write = installer._write_owned
+
+            def failing_write(path, payload, mode, **kwargs):
+                if path.name == "install.json":
+                    raise installer.InstallError("synthetic manifest failure")
+                return real_write(path, payload, mode, **kwargs)
+
+            report = installer.InstallReport()
+            with mock.patch.dict(os.environ, fixture["environment"], clear=True):
+                with mock.patch.object(installer, "_run", side_effect=fake_run):
+                    with mock.patch.object(
+                        installer, "_write_owned", side_effect=failing_write
+                    ):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            with contextlib.redirect_stderr(io.StringIO()):
+                                with self.assertRaises(installer.InstallError):
+                                    installer.install(
+                                        self._arguments(fixture), report
+                                    )
+
+            rendered = self._rows(report.render())
+            self.assertIn("Candidate release : RETAINED, NOT ACTIVE", rendered)
+            self.assertIn("Current/launcher publication : ROLLED BACK", rendered)
+            self.assertIn("Codex registration : RESTORED", rendered)
+            self.assertIn("Shell integration : RESTORED", rendered)
+            self.assertIn("Rollback : COMPLETE", rendered)
+            self.assertIn("Overall result : INCOMPLETE", rendered)
+            self.assertIsNotNone(report.candidate_identity)
+            retained = sorted(
+                path.name
+                for path in (fixture["data"] / "tmuxgate" / "releases").iterdir()
+            )
+            self.assertEqual(retained, [report.candidate_identity])
 
     def test_codex_home_is_hardened_to_owner_only(self):
         with tempfile.TemporaryDirectory() as temporary:

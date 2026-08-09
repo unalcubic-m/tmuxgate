@@ -155,6 +155,19 @@ default protected configuration must exist before installation. A newly
 created token is durable application state and is intentionally retained if a
 later deployment step fails.
 
+A verified candidate is not an active release. `pip` reports
+`Successfully installed tmuxgate` inside the unpublished candidate long before
+the `current` and launcher symlinks are switched, so a run blocked between
+those two points would otherwise read as a successful update. Every
+`InstallError` exit therefore prints the failure reason and then a final-state
+block naming the candidate release, whether it was discarded or retained, which
+release is active or that none is, whether publication was attempted, and what
+persistent state the run left behind, including whether it created the MCP
+token. Releases are identified by release ID, because every build reports the
+same `0.1.0.dev0` version and only the release ID distinguishes them; a
+successful run prints the release it published for the same reason. Uncatchable
+termination and interruption checkpoints are not yet covered by this contract.
+
 Codex registration is written directly to the single
 `[mcp_servers.tmuxgate]` table using the configured
 `http://127.0.0.1:<port>/mcp` Streamable HTTP URL,
