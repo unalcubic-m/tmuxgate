@@ -459,17 +459,37 @@ class MasterTransportPool:
         self.clock = clock
         self._transports: dict[str, MasterTransport] = {}
         self._lock = threading.RLock()
+        # Machines whose master is being authenticated right now.  The start is
+        # deliberately performed with ``_lock`` released, so this is what keeps
+        # the reuse decision and the derived control path exclusive per machine.
+        self._starting: set[str] = set()
+        self._start_finished = threading.Condition(self._lock)
+        self._retained: tuple[str, ...] = ()
         self.key_manager = key_manager
 
     @property
     def retained_machine_names(self) -> tuple[str, ...]:
-        with self._lock:
-            return tuple(
-                item.machine_name
-                for item in sorted(
-                    self._transports.values(), key=lambda value: value.last_used
-                )
+        """Retained machines, read without ever taking the transport lock.
+
+        The dashboard reads this on the Textual main thread, which is also the
+        thread that services a terminal hand-off for a prompt-capable master.
+        A reader that took ``_lock`` could therefore be made to wait on
+        transport work that is itself waiting on that same reader.  The
+        snapshot is an immutable tuple republished under the lock at every
+        change, so a reader observes a consistent state without blocking.
+        """
+
+        return self._retained
+
+    def _publish_retained(self) -> None:
+        """Republish the lock-free reader snapshot; call under ``_lock``."""
+
+        self._retained = tuple(
+            item.machine_name
+            for item in sorted(
+                self._transports.values(), key=lambda value: value.last_used
             )
+        )
 
     @property
     def pinned_request_ids(self) -> tuple[str, ...]:
@@ -566,6 +586,7 @@ class MasterTransportPool:
         self.backend.stop_master(invocation, transport.control_path)
         self._remove_socket_if_safe(transport.control_path)
         self._transports.pop(transport.machine_name, None)
+        self._publish_retained()
 
     def _evict_one_idle(self) -> None:
         idle = [item for item in self._transports.values() if not item.pinned_request_ids]
@@ -593,6 +614,64 @@ class MasterTransportPool:
             raise TransportIdentityError("SSH identity changed after authorization")
         return current, current_digest
 
+    def _reusable_transport(
+        self,
+        authorization: TransportAuthorization,
+        current: ResolvedSshEndpoint,
+        identity_digest: str,
+    ) -> MasterTransport | None:
+        """Return a proven-live retained master, or ``None``; hold ``_lock``."""
+
+        existing = self._transports.get(authorization.machine_name)
+        if existing is not None and existing.cleanup_pending:
+            self._stop(existing)
+            existing = None
+        if existing is not None and existing.identity_sha256 != identity_digest:
+            self._stop(existing)
+            existing = None
+        if existing is None:
+            return None
+        if not self._control_socket_present(existing.control_path):
+            if existing.pinned_request_ids:
+                raise TransportBusyError(
+                    "active machine transport lost its control socket"
+                )
+            self._transports.pop(existing.machine_name, None)
+            self._publish_retained()
+            return None
+        check = build_master_control_invocation(
+            current, existing.control_path, "check"
+        )
+        if not self.backend.check_master(check, existing.control_path):
+            if existing.pinned_request_ids:
+                raise TransportBusyError(
+                    "active machine transport failed its control check"
+                )
+            self._remove_socket_if_safe(existing.control_path)
+            self._transports.pop(existing.machine_name, None)
+            self._publish_retained()
+            return None
+        return existing
+
+    def _pin(
+        self, transport: MasterTransport, authorization: TransportAuthorization
+    ) -> TransportLease:
+        """Bind one request to a retained master; hold ``_lock``."""
+
+        if authorization.request_id in transport.pinned_request_ids:
+            raise TransportBusyError("request already pins this SSH master")
+        transport.connection_plan_sha256 = authorization.connection_plan_sha256
+        transport.last_used = self.clock()
+        transport.pinned_request_ids.add(authorization.request_id)
+        self._publish_retained()
+        return TransportLease(self, transport, authorization.request_id)
+
+    def _finish_start(self, machine_name: str) -> None:
+        """Release a machine's start reservation; hold ``_lock``."""
+
+        self._starting.discard(machine_name)
+        self._start_finished.notify_all()
+
     def acquire(
         self,
         authorization: TransportAuthorization,
@@ -600,211 +679,239 @@ class MasterTransportPool:
         *,
         key_enrollment_lifecycle: KeyEnrollmentLifecycle | None = None,
     ) -> TransportLease:
-        """Reuse or authenticate a master, then pin it to this one request."""
+        """Reuse or authenticate a master, then pin it to this one request.
+
+        Authenticating a prompt-capable master hands the operator's terminal to
+        OpenSSH, and that hand-off blocks until the interface's own thread runs
+        it.  ``_lock`` is therefore released for the whole start, because a
+        reader that took it could otherwise be made to wait behind transport
+        work that is itself waiting on that reader.  The machine is reserved in
+        ``_starting`` instead, which preserves what the lock provided: at most
+        one start per machine, so the reuse decision stays atomic and the
+        derived control path stays exclusive.
+        """
 
         with self._lock:
+            while authorization.machine_name in self._starting:
+                self._start_finished.wait()
             current, identity_digest = self._validated_current_identity(
                 authorization, resolved
             )
-            existing = self._transports.get(authorization.machine_name)
-            if existing is not None and existing.cleanup_pending:
-                self._stop(existing)
-                existing = None
-            if existing is not None and existing.identity_sha256 != identity_digest:
-                self._stop(existing)
-                existing = None
+            existing = self._reusable_transport(
+                authorization, current, identity_digest
+            )
             if existing is not None:
-                if not self._control_socket_present(existing.control_path):
-                    if existing.pinned_request_ids:
-                        raise TransportBusyError(
-                            "active machine transport lost its control socket"
-                        )
-                    self._transports.pop(existing.machine_name, None)
-                    existing = None
-                else:
-                    check = build_master_control_invocation(
-                        current, existing.control_path, "check"
-                    )
-                    if not self.backend.check_master(check, existing.control_path):
-                        if existing.pinned_request_ids:
-                            raise TransportBusyError(
-                                "active machine transport failed its control check"
-                            )
-                        self._remove_socket_if_safe(existing.control_path)
-                        self._transports.pop(existing.machine_name, None)
-                        existing = None
-            if existing is None:
-                if len(self._transports) >= self.max_masters:
-                    self._evict_one_idle()
-                if self.key_manager is not None:
-                    self.key_manager.prepare_local_key(current)
-                path = self._control_path(authorization.machine_name, identity_digest)
-                self._reconcile_unowned_control_path(current, path)
-                start_builder = (
-                    build_enrollment_master_start_invocation
-                    if self.key_manager is not None
-                    else build_master_start_invocation
+                return self._pin(existing, authorization)
+            # A reserved start holds a retention slot it has not filled yet, so
+            # it must count against capacity or concurrent starts would together
+            # exceed ``max_masters``.
+            if len(self._transports) + len(self._starting) >= self.max_masters:
+                self._evict_one_idle()
+            path = self._control_path(authorization.machine_name, identity_digest)
+            self._starting.add(authorization.machine_name)
+
+        try:
+            self._authenticate_master(
+                authorization,
+                current,
+                identity_digest,
+                path,
+                key_enrollment_lifecycle=key_enrollment_lifecycle,
+            )
+        except BaseException:
+            with self._lock:
+                self._finish_start(authorization.machine_name)
+            raise
+
+        with self._lock:
+            # Publishing and releasing the reservation must be one step, or a
+            # waiter could wake, see no transport, and start a second master on
+            # the same control path.
+            transport = MasterTransport(
+                machine_name=authorization.machine_name,
+                endpoint=current,
+                control_path=path,
+                connection_plan_sha256=authorization.connection_plan_sha256,
+                identity_sha256=identity_digest,
+                last_used=self.clock(),
+            )
+            self._transports[transport.machine_name] = transport
+            self._publish_retained()
+            self._finish_start(authorization.machine_name)
+            return self._pin(transport, authorization)
+
+    def _authenticate_master(
+        self,
+        authorization: TransportAuthorization,
+        current: ResolvedSshEndpoint,
+        identity_digest: str,
+        path: Path,
+        *,
+        key_enrollment_lifecycle: KeyEnrollmentLifecycle | None,
+    ) -> None:
+        """Authenticate one new master, with ``_lock`` deliberately released.
+
+        The caller holds this machine's ``_starting`` reservation, which is what
+        keeps ``path`` exclusive: it is derived from the machine name and the
+        resolved identity, so no other machine can collide with it and no second
+        start for this machine can run concurrently.
+        """
+
+        if self.key_manager is not None:
+            self.key_manager.prepare_local_key(current)
+        self._reconcile_unowned_control_path(current, path)
+        start_builder = (
+            build_enrollment_master_start_invocation
+            if self.key_manager is not None
+            else build_master_start_invocation
+        )
+        start = start_builder(
+            current, path,
+            control_persist_seconds=self.idle_timeout_seconds,
+        )
+        master_started = False
+        key_enrollment_started = False
+        try:
+            self.backend.start_master(start, path)
+            master_started = True
+            if not self._control_socket_present(path):
+                raise TransportError(
+                    "authenticated master did not create its control socket"
                 )
-                start = start_builder(
-                    current, path,
+            check = build_master_control_invocation(
+                current, path, "check"
+            )
+            if not self.backend.check_master(check, path):
+                raise TransportError(
+                    "new authenticated SSH master failed its control check"
+                )
+            if self.key_manager is not None:
+                def before_remote_mutation() -> None:
+                    nonlocal key_enrollment_started
+                    if key_enrollment_lifecycle is None:
+                        raise TransportError(
+                            "remote key enrollment lacks a durable lifecycle"
+                        )
+                    key_enrollment_lifecycle.before_remote_mutation(current)
+                    key_enrollment_started = True
+
+                outcome = self.key_manager.enroll_remote_key(
+                    current,
+                    path,
+                    before_remote_mutation=before_remote_mutation,
+                )
+                if outcome is KeyEnrollmentOutcome.ENROLLED_AND_VERIFIED:
+                    if not key_enrollment_started:
+                        raise TransportError(
+                            "key manager reported enrollment without crossing "
+                            "the durable mutation boundary"
+                        )
+                    assert key_enrollment_lifecycle is not None
+                    key_enrollment_lifecycle.remote_mutation_verified(current)
+                elif outcome is not KeyEnrollmentOutcome.ALREADY_PRESENT:
+                    raise TransportError(
+                        "key manager returned an invalid enrollment outcome"
+                    )
+                stop = build_master_control_invocation(
+                    current, path, "exit"
+                )
+                self.backend.stop_master(stop, path)
+                master_started = False
+                self._remove_socket_if_safe(path)
+
+                strict_start = build_master_start_invocation(
+                    current,
+                    path,
                     control_persist_seconds=self.idle_timeout_seconds,
                 )
-                master_started = False
-                key_enrollment_started = False
-                try:
-                    self.backend.start_master(start, path)
-                    master_started = True
-                    if not self._control_socket_present(path):
-                        raise TransportError(
-                            "authenticated master did not create its control socket"
-                        )
-                    check = build_master_control_invocation(
-                        current, path, "check"
+                self.backend.start_master(strict_start, path)
+                master_started = True
+                if not self._control_socket_present(path):
+                    raise TransportError(
+                        "post-enrollment master did not create its control socket"
                     )
-                    if not self.backend.check_master(check, path):
-                        raise TransportError(
-                            "new authenticated SSH master failed its control check"
-                        )
-                    if self.key_manager is not None:
-                        def before_remote_mutation() -> None:
-                            nonlocal key_enrollment_started
-                            if key_enrollment_lifecycle is None:
-                                raise TransportError(
-                                    "remote key enrollment lacks a durable lifecycle"
-                                )
-                            key_enrollment_lifecycle.before_remote_mutation(current)
-                            key_enrollment_started = True
-
-                        outcome = self.key_manager.enroll_remote_key(
-                            current,
-                            path,
-                            before_remote_mutation=before_remote_mutation,
-                        )
-                        if outcome is KeyEnrollmentOutcome.ENROLLED_AND_VERIFIED:
-                            if not key_enrollment_started:
-                                raise TransportError(
-                                    "key manager reported enrollment without crossing "
-                                    "the durable mutation boundary"
-                                )
-                            assert key_enrollment_lifecycle is not None
-                            key_enrollment_lifecycle.remote_mutation_verified(current)
-                        elif outcome is not KeyEnrollmentOutcome.ALREADY_PRESENT:
-                            raise TransportError(
-                                "key manager returned an invalid enrollment outcome"
-                            )
-                        stop = build_master_control_invocation(
-                            current, path, "exit"
-                        )
-                        self.backend.stop_master(stop, path)
-                        master_started = False
-                        self._remove_socket_if_safe(path)
-
-                        strict_start = build_master_start_invocation(
-                            current,
-                            path,
-                            control_persist_seconds=self.idle_timeout_seconds,
-                        )
-                        self.backend.start_master(strict_start, path)
-                        master_started = True
-                        if not self._control_socket_present(path):
-                            raise TransportError(
-                                "post-enrollment master did not create its control socket"
-                            )
-                        strict_check = build_master_control_invocation(
-                            current, path, "check"
-                        )
-                        if not self.backend.check_master(strict_check, path):
-                            raise TransportError(
-                                "post-enrollment SSH master failed its control check"
-                            )
-                except BaseException as exc:
-                    should_stop = master_started
-                    if not should_stop:
-                        try:
-                            should_stop = self._control_socket_present(path)
-                        except BaseException:
-                            should_stop = False
-                    try:
-                        if should_stop:
-                            stop = build_master_control_invocation(
-                                current, path, "exit"
-                            )
-                            self.backend.stop_master(stop, path)
-                    except BaseException as stop_exc:
-                        try:
-                            socket_retained = self._control_socket_present(path)
-                        except BaseException as path_exc:
-                            cleanup_error = TransportError(
-                                "partial SSH master shutdown was not confirmed "
-                                "and its control path is unsafe; the path was not removed"
-                            )
-                            if key_enrollment_started:
-                                raise KeyEnrollmentMutationError(
-                                    "remote key enrollment may have mutated authorized_keys; "
-                                    "SSH master cleanup also could not be confirmed"
-                                ) from path_exc
-                            raise cleanup_error from path_exc
-                        if socket_retained:
-                            self._transports[authorization.machine_name] = (
-                                MasterTransport(
-                                    machine_name=authorization.machine_name,
-                                    endpoint=current,
-                                    control_path=path,
-                                    connection_plan_sha256=(
-                                        authorization.connection_plan_sha256
-                                    ),
-                                    identity_sha256=identity_digest,
-                                    last_used=self.clock(),
-                                    cleanup_pending=True,
-                                )
-                            )
-                            cleanup_error = TransportError(
-                                "partial SSH master shutdown was not confirmed; "
-                                "its owned control socket was retained for "
-                                "broker lifecycle cleanup"
-                            )
-                        else:
-                            cleanup_error = TransportError(
-                                "partial SSH master shutdown was not confirmed"
-                            )
-                        if key_enrollment_started:
-                            raise KeyEnrollmentMutationError(
-                                "remote key enrollment may have mutated authorized_keys; "
-                                "SSH master cleanup also could not be confirmed"
-                            ) from stop_exc
-                        raise cleanup_error from stop_exc
-                    try:
-                        self._remove_socket_if_safe(path)
-                    except BaseException as cleanup_exc:
-                        if key_enrollment_started:
-                            raise KeyEnrollmentMutationError(
-                                "remote key enrollment may have mutated authorized_keys; "
-                                "its SSH control path also could not be cleaned safely"
-                            ) from cleanup_exc
-                        raise
+                strict_check = build_master_control_invocation(
+                    current, path, "check"
+                )
+                if not self.backend.check_master(strict_check, path):
+                    raise TransportError(
+                        "post-enrollment SSH master failed its control check"
+                    )
+        except BaseException as exc:
+            should_stop = master_started
+            if not should_stop:
+                try:
+                    should_stop = self._control_socket_present(path)
+                except BaseException:
+                    should_stop = False
+            try:
+                if should_stop:
+                    stop = build_master_control_invocation(
+                        current, path, "exit"
+                    )
+                    self.backend.stop_master(stop, path)
+            except BaseException as stop_exc:
+                try:
+                    socket_retained = self._control_socket_present(path)
+                except BaseException as path_exc:
+                    cleanup_error = TransportError(
+                        "partial SSH master shutdown was not confirmed "
+                        "and its control path is unsafe; the path was not removed"
+                    )
                     if key_enrollment_started:
-                        if isinstance(exc, KeyEnrollmentMutationError):
-                            raise
                         raise KeyEnrollmentMutationError(
                             "remote key enrollment may have mutated authorized_keys; "
-                            "the requested command was not started"
-                        ) from exc
+                            "SSH master cleanup also could not be confirmed"
+                        ) from path_exc
+                    raise cleanup_error from path_exc
+                if socket_retained:
+                    with self._lock:
+                        self._transports[authorization.machine_name] = (
+                            MasterTransport(
+                                machine_name=authorization.machine_name,
+                                endpoint=current,
+                                control_path=path,
+                                connection_plan_sha256=(
+                                    authorization.connection_plan_sha256
+                                ),
+                                identity_sha256=identity_digest,
+                                last_used=self.clock(),
+                                cleanup_pending=True,
+                            )
+                        )
+                        self._publish_retained()
+                    cleanup_error = TransportError(
+                        "partial SSH master shutdown was not confirmed; "
+                        "its owned control socket was retained for "
+                        "broker lifecycle cleanup"
+                    )
+                else:
+                    cleanup_error = TransportError(
+                        "partial SSH master shutdown was not confirmed"
+                    )
+                if key_enrollment_started:
+                    raise KeyEnrollmentMutationError(
+                        "remote key enrollment may have mutated authorized_keys; "
+                        "SSH master cleanup also could not be confirmed"
+                    ) from stop_exc
+                raise cleanup_error from stop_exc
+            try:
+                self._remove_socket_if_safe(path)
+            except BaseException as cleanup_exc:
+                if key_enrollment_started:
+                    raise KeyEnrollmentMutationError(
+                        "remote key enrollment may have mutated authorized_keys; "
+                        "its SSH control path also could not be cleaned safely"
+                    ) from cleanup_exc
+                raise
+            if key_enrollment_started:
+                if isinstance(exc, KeyEnrollmentMutationError):
                     raise
-                existing = MasterTransport(
-                    machine_name=authorization.machine_name,
-                    endpoint=current,
-                    control_path=path,
-                    connection_plan_sha256=authorization.connection_plan_sha256,
-                    identity_sha256=identity_digest,
-                    last_used=self.clock(),
-                )
-                self._transports[existing.machine_name] = existing
-            if authorization.request_id in existing.pinned_request_ids:
-                raise TransportBusyError("request already pins this SSH master")
-            existing.connection_plan_sha256 = authorization.connection_plan_sha256
-            existing.last_used = self.clock()
-            existing.pinned_request_ids.add(authorization.request_id)
-            return TransportLease(self, existing, authorization.request_id)
+                raise KeyEnrollmentMutationError(
+                    "remote key enrollment may have mutated authorized_keys; "
+                    "the requested command was not started"
+                ) from exc
+            raise
 
     def release(self, lease: TransportLease) -> None:
         with self._lock:
@@ -824,6 +931,7 @@ class MasterTransportPool:
                 raise TransportError("transport lease was already released")
             current.pinned_request_ids.remove(request_id)
             current.last_used = self.clock()
+            self._publish_retained()
 
     def reap_expired(self) -> tuple[str, ...]:
         with self._lock:
