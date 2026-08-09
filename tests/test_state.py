@@ -263,6 +263,55 @@ class DurableStateTests(unittest.TestCase):
         )
         self.assertTrue(armed.remote_mutation_started)
 
+    def test_approved_record_follows_the_plan_to_an_unmutated_fallback(self):
+        store = self.make_store()
+        request = RequestSpec(
+            "app-server", ExecutionMode.ARGV, "/", argv=("true",)
+        )
+        plan = build_plan()
+        approved = store.write(
+            new_approved_job_record(REQUEST_ID, request, plan, now=lambda: CREATED)
+        )
+        fallback = plan.endpoints[1]
+
+        retargeted = store.retarget_pre_remote_endpoint(
+            approved, plan, fallback, now=lambda: "2026-07-19T12:01:00.000000Z"
+        )
+
+        self.assertEqual(retargeted.generation, approved.generation + 1)
+        self.assertEqual(retargeted.endpoint_id, fallback.resolved.endpoint_id)
+        self.assertEqual(retargeted.resolved_hostname, fallback.resolved.resolved_hostname)
+        self.assertEqual(retargeted.state, RequestState.APPROVED_PRE_REMOTE)
+        self.assertFalse(retargeted.remote_mutation_started)
+        self.assertEqual(store.load(REQUEST_ID), retargeted)
+        # The already-selected endpoint costs no generation and no write.
+        self.assertIs(
+            store.retarget_pre_remote_endpoint(retargeted, plan, fallback),
+            retargeted,
+        )
+
+    def test_endpoint_retargeting_refuses_mutation_and_foreign_plans(self):
+        store = self.make_store()
+        request = RequestSpec(
+            "app-server", ExecutionMode.ARGV, "/", argv=("true",)
+        )
+        plan = build_plan()
+        approved = store.write(
+            new_approved_job_record(REQUEST_ID, request, plan, now=lambda: CREATED)
+        )
+        foreign = replace(plan, plan_sha256="c" * 64)
+
+        with self.assertRaisesRegex(StateConflictError, "approved connection plan"):
+            store.retarget_pre_remote_endpoint(approved, foreign, plan.endpoints[1])
+        with self.assertRaisesRegex(StateConflictError, "not in the connection plan"):
+            store.retarget_pre_remote_endpoint(approved, plan, plan.selected.resolved)
+        with self.assertRaises(TypeError):
+            store.retarget_pre_remote_endpoint(approved, None, plan.endpoints[1])
+
+        enrolled = store.arm_key_enrollment(approved)
+        with self.assertRaisesRegex(StateConflictError, "approved-pre-remote state"):
+            store.retarget_pre_remote_endpoint(enrolled, plan, plan.endpoints[1])
+
     def test_remote_start_cannot_be_armed_without_approval_plan_and_job_identity(self):
         store = self.make_store()
         queued = record(

@@ -66,8 +66,20 @@ class RemoteSetupFailure(TransportError):
         self.record = record
 
 
-class _DurableKeyEnrollmentLifecycle:
-    """Bind a possible key append to the approved request before it starts."""
+def _bounded_detail(detail: str, fallback: str) -> str:
+    """Keep a durable failure detail non-empty, NUL-free, and bounded."""
+
+    text = detail.replace("\x00", "\ufffd")[:1000].strip()
+    return text or fallback
+
+
+class _DurablePreRemoteBoundary:
+    """Own the approved request's durable record before any remote mutation.
+
+    The record exists from the moment the bound approval is consumed, so a
+    request that fails before SSH transport is established still leaves a
+    truthful terminal record instead of nothing at all.
+    """
 
     def __init__(
         self,
@@ -75,73 +87,129 @@ class _DurableKeyEnrollmentLifecycle:
         request_id: str,
         request: RequestSpec,
         plan: ConnectionPlan,
-        endpoint: PlannedEndpoint,
     ) -> None:
         self.state = state
         self.request_id = request_id
         self.request = request
         self.plan = plan
-        self.endpoint = endpoint
         self.record: DurableJobRecord | None = None
+
+    def approve(self, endpoint: PlannedEndpoint | None = None) -> DurableJobRecord:
+        if self.record is not None:
+            raise ExecutorError("the approved durable record was already written")
+        approved = new_approved_job_record(
+            self.request_id,
+            self.request,
+            self.plan,
+            planned_endpoint=endpoint,
+        )
+        self.record = self.state.write(approved)
+        return self.record
+
+    def require_record(self) -> DurableJobRecord:
+        if self.record is None:
+            raise ExecutorError("the approved durable record was never written")
+        return self.record
+
+    def retarget(self, endpoint: PlannedEndpoint) -> DurableJobRecord:
+        self.record = self.state.retarget_pre_remote_endpoint(
+            self.require_record(),
+            self.plan,
+            endpoint,
+        )
+        return self.record
+
+    def arm_key_enrollment(self) -> DurableJobRecord:
+        self.record = self.state.arm_key_enrollment(self.require_record())
+        return self.record
+
+    def mark_key_enrollment_verified(self) -> DurableJobRecord:
+        self.record = self.state.mark_key_enrollment_verified(self.require_record())
+        return self.record
+
+    def fail_pre_remote(self, detail: str) -> None:
+        """Terminalize an approved record that never reached a remote host."""
+
+        record = self.record
+        if record is None or record.state is not RequestState.APPROVED_PRE_REMOTE:
+            return
+        try:
+            self.record = self.state.fail_pre_remote(
+                record,
+                detail=_bounded_detail(
+                    detail, "the request failed before SSH transport was established"
+                ),
+            )
+        except BaseException:
+            # The already-fsynced approved record stays truthful and startup
+            # recovery terminalizes it; the caller's failure result still holds.
+            pass
+
+    def fail_remote_setup(self, detail: str) -> DurableJobRecord:
+        record = self.require_record()
+        try:
+            if record.state in {
+                RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
+                RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+            }:
+                self.record = self.state.fail_remote_setup(
+                    record,
+                    detail=_bounded_detail(
+                        detail, "remote setup failed after a possible key enrollment"
+                    ),
+                )
+        except BaseException:
+            # The already-fsynced may-have-started record remains truthful and
+            # startup recovery will terminalize it conservatively.
+            pass
+        return self.require_record()
+
+
+class _DurableKeyEnrollmentLifecycle:
+    """Bind a possible key append to the approved request before it starts."""
+
+    def __init__(
+        self,
+        boundary: _DurablePreRemoteBoundary,
+        endpoint: PlannedEndpoint,
+    ) -> None:
+        self.boundary = boundary
+        self.endpoint = endpoint
+        self.armed = False
+
+    @property
+    def record(self) -> DurableJobRecord:
+        return self.boundary.require_record()
 
     def before_remote_mutation(self, resolved: ResolvedSshEndpoint) -> None:
         if resolved != self.endpoint.resolved:
             raise KeyEnrollmentBoundaryError(
                 "key enrollment endpoint differs from the approved route"
             )
-        if self.record is not None:
+        if self.armed:
             raise KeyEnrollmentBoundaryError(
                 "key enrollment mutation boundary was requested more than once"
             )
+        self.armed = True
         try:
-            approved = new_approved_job_record(
-                self.request_id,
-                self.request,
-                self.plan,
-                planned_endpoint=self.endpoint,
-            )
-            self.record = self.state.write(approved)
-            self.record = self.state.arm_key_enrollment(self.record)
+            self.boundary.arm_key_enrollment()
         except BaseException as exc:
-            if (
-                self.record is not None
-                and self.record.state is RequestState.APPROVED_PRE_REMOTE
-            ):
-                try:
-                    self.record = self.state.fail_pre_remote(
-                        self.record,
-                        detail="durable SSH key-enrollment boundary failed",
-                    )
-                except BaseException:
-                    pass
+            self.boundary.fail_pre_remote("durable SSH key-enrollment boundary failed")
             raise KeyEnrollmentBoundaryError(
                 "durable SSH key-enrollment boundary failed before remote mutation"
             ) from exc
 
     def remote_mutation_verified(self, resolved: ResolvedSshEndpoint) -> None:
-        if resolved != self.endpoint.resolved or self.record is None:
+        if resolved != self.endpoint.resolved or not self.armed:
             raise KeyEnrollmentMutationError(
                 "key enrollment verification is not bound to the armed endpoint"
             )
-        self.record = self.state.mark_key_enrollment_verified(self.record)
+        self.boundary.mark_key_enrollment_verified()
 
     def fail_after_remote_mutation(self, detail: str) -> DurableJobRecord:
-        if self.record is None or not self.record.remote_mutation_started:
+        if not self.record.remote_mutation_started:
             raise ExecutorError("key enrollment failure lacks a durable mutation record")
-        try:
-            if self.record.state in {
-                RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
-                RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
-            }:
-                self.record = self.state.fail_remote_setup(
-                    self.record,
-                    detail=detail[:1000],
-                )
-        except BaseException:
-            # The already-fsynced may-have-started record remains truthful and
-            # startup recovery will terminalize it conservatively.
-            pass
-        return self.record
+        return self.boundary.fail_remote_setup(detail)
 
 
 RemoteBackendFactory = Callable[[MasterTransport, SecretInputRecipient], object]
@@ -248,7 +316,8 @@ class RealExecutor:
         request_id: str,
         request: RequestSpec,
         plan: ConnectionPlan,
-    ) -> tuple[TransportLease, PlannedEndpoint, DurableJobRecord | None]:
+        boundary: _DurablePreRemoteBoundary,
+    ) -> tuple[TransportLease, PlannedEndpoint, DurableJobRecord]:
         failure: BaseException | None = None
         failure_diagnostics = b""
         all_endpoints_exhausted = True
@@ -302,6 +371,9 @@ class RealExecutor:
                     fallback_endpoint_id=endpoint.resolved.endpoint_id,
                     fallback_decision=decision,
                 )
+            # Route fallback happens only before remote mutation, so the
+            # approved record can truthfully follow the plan to this endpoint.
+            boundary.retarget(endpoint)
             ssh_attempt = 0
             failure_diagnostics = b""
             while True:
@@ -314,13 +386,7 @@ class RealExecutor:
                         "is occurring and the requested command has not started.",
                         endpoint_id=endpoint.resolved.endpoint_id,
                     )
-                enrollment = _DurableKeyEnrollmentLifecycle(
-                    self.state,
-                    request_id,
-                    request,
-                    plan,
-                    endpoint,
-                )
+                enrollment = _DurableKeyEnrollmentLifecycle(boundary, endpoint)
                 try:
                     lease = self.transports.acquire(
                         authorization,
@@ -401,10 +467,7 @@ class RealExecutor:
                         )
                     break
                 except TransportError as exc:
-                    if (
-                        enrollment.record is not None
-                        and enrollment.record.remote_mutation_started
-                    ):
+                    if enrollment.record.remote_mutation_started:
                         detail = (
                             f"SSH setup on {endpoint.resolved.endpoint_id} failed "
                             f"after verified key enrollment: {exc}; retry and route "
@@ -492,11 +555,36 @@ class RealExecutor:
                 TransportStatus.PRE_REMOTE_FAILURE,
                 detail=f"approved connection plan was not usable: {exc}",
             )
+        # Approval is final once the one-shot plan has been consumed, so the
+        # approved record is written here.  Everything after this point leaves
+        # a durable trace even when no remote host is ever contacted.
+        boundary = _DurablePreRemoteBoundary(
+            self.state,
+            request_id,
+            request,
+            context.connection_plan,
+        )
+        try:
+            boundary.approve()
+        except BaseException as exc:
+            self._publish_connection(
+                request_id,
+                request,
+                ConnectionPhase.FAILED,
+                "The approved request could not be recorded durably; no remote "
+                "command or mutation started.",
+            )
+            return ExecutionResult(
+                request_id,
+                TransportStatus.PRE_REMOTE_FAILURE,
+                detail=f"approved request could not be recorded durably: {exc}",
+            )
         try:
             lease, endpoint, approved = self._acquire_transport(
                 request_id,
                 request,
                 context.connection_plan,
+                boundary,
             )
         except RemoteSetupFailure as exc:
             return ExecutionResult(
@@ -538,6 +626,8 @@ class RealExecutor:
                     "; machine remains enabled because disabling failed: "
                     f"{str(disable_exc)[:500]}"
                 )
+            detail = f"SSH transport was not established: {exc}{disable_detail}"
+            boundary.fail_pre_remote(detail)
             self._publish_connection(
                 request_id,
                 request,
@@ -547,9 +637,11 @@ class RealExecutor:
             return ExecutionResult(
                 request_id,
                 TransportStatus.PRE_REMOTE_FAILURE,
-                detail=f"SSH transport was not established: {exc}{disable_detail}",
+                detail=detail,
             )
         except BaseException as exc:
+            detail = f"SSH transport was not established: {exc}"
+            boundary.fail_pre_remote(detail)
             self._publish_connection(
                 request_id,
                 request,
@@ -559,18 +651,10 @@ class RealExecutor:
             return ExecutionResult(
                 request_id,
                 TransportStatus.PRE_REMOTE_FAILURE,
-                detail=f"SSH transport was not established: {exc}",
+                detail=detail,
             )
 
         try:
-            if approved is None:
-                approved = new_approved_job_record(
-                    request_id,
-                    request,
-                    context.connection_plan,
-                    planned_endpoint=endpoint,
-                )
-                approved = self.state.write(approved)
             armed, permit = self.state.arm_remote_start(approved)
             self._publish_connection(
                 request_id,
@@ -587,26 +671,18 @@ class RealExecutor:
             )
         except BaseException as exc:
             try:
-                if (
-                    approved is not None
-                    and approved.state
-                    is RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE
-                ):
-                    self.state.fail_remote_setup(
-                        approved,
-                        detail=(
-                            "durable command-start boundary failed after verified "
-                            f"SSH key enrollment: {str(exc)[:800]}"
-                        ),
+                if approved.state is RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE:
+                    boundary.fail_remote_setup(
+                        "durable command-start boundary failed after verified "
+                        f"SSH key enrollment: {str(exc)[:800]}"
                     )
-                elif approved is not None:
-                    self.state.fail_pre_remote(approved, detail=str(exc)[:1000])
+                else:
+                    boundary.fail_pre_remote(
+                        f"durable remote-start boundary failed: {exc}"
+                    )
             finally:
                 lease.release()
-            if (
-                approved is not None
-                and approved.remote_mutation_started
-            ):
+            if approved.remote_mutation_started:
                 self._publish_connection(
                     request_id,
                     request,

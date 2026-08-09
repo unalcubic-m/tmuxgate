@@ -642,6 +642,57 @@ class DurableStateStore:
         records.sort(key=lambda item: (item.created_at, item.request_id))
         return tuple(records)
 
+    def retarget_pre_remote_endpoint(
+        self,
+        record: DurableJobRecord,
+        connection_plan: ConnectionPlan,
+        planned_endpoint: PlannedEndpoint,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Re-point an approved, unmutated record at another approved endpoint.
+
+        Route fallback is offered only before any remote mutation, so the
+        durable record may still follow the plan without claiming that the
+        previously named host was contacted.
+        """
+
+        if record.state is not RequestState.APPROVED_PRE_REMOTE:
+            raise StateConflictError(
+                "endpoint retargeting requires approved-pre-remote state"
+            )
+        if record.remote_mutation_started:
+            raise StateConflictError(
+                "endpoint retargeting cannot follow a remote mutation"
+            )
+        if not isinstance(connection_plan, ConnectionPlan):
+            raise TypeError("connection_plan must be a ConnectionPlan")
+        if record.connection_plan_sha256 != connection_plan.plan_sha256:
+            raise StateConflictError(
+                "endpoint retargeting requires the record's approved connection plan"
+            )
+        if (
+            not isinstance(planned_endpoint, PlannedEndpoint)
+            or planned_endpoint not in connection_plan.endpoints
+        ):
+            raise StateConflictError("planned endpoint is not in the connection plan")
+        selected = planned_endpoint.resolved
+        if selected.endpoint_id == record.endpoint_id:
+            return record
+        timestamp = now()
+        retargeted = replace(
+            record,
+            generation=record.generation + 1,
+            endpoint_id=selected.endpoint_id,
+            resolved_user=selected.resolved_user,
+            resolved_hostname=selected.resolved_hostname,
+            resolved_port=selected.resolved_port,
+            host_key_alias=selected.host_key_alias,
+            updated_at=timestamp,
+        )
+        self.write(retargeted)
+        return retargeted
+
     def arm_remote_start(
         self,
         record: DurableJobRecord,
