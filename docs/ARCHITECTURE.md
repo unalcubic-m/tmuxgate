@@ -722,6 +722,21 @@ Separately, up to three authenticated `ssh -N` ControlMaster transports may
 remain idle. Reusing a transport never reuses request identity. Queued requests
 do not cause connection attempts, health probes, or reconnections.
 
+The transport pool's lock never spans a terminal handoff. Authenticating a
+prompt-capable master gives the operator's terminal to OpenSSH, and in Textual
+mode that handoff completes only when the UI thread runs it; the same thread
+reads the pool to paint the dashboard. A pool lock held across the handoff
+therefore inverted against the renderer and wedged the whole process. Instead,
+`acquire` reserves the machine, releases the lock for the entire master start,
+and republishes the transport and the reservation in one locked step. The
+reservation is what keeps the reuse decision atomic and the derived control
+path exclusive, it counts against the retention limit while it is held, and it
+is always released on the failure path. Readers on the render path take no lock
+at all: `retained_machine_names` returns an immutable snapshot republished
+under the lock at every change. A master authenticated concurrently with
+shutdown is therefore not closed by `close_idle`; like any master that outlives
+its process, the next run reconciles it through its own control channel.
+
 Before a machine's enrollment master is authenticated, the broker creates a
 dedicated per-machine Ed25519 key below the owner-only `~/.ssh/tmuxgate`
 directory. This enrollment-only master may fall back to interactive password

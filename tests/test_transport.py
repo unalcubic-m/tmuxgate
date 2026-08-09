@@ -4,6 +4,7 @@ from pathlib import Path
 import socket
 import stat
 import tempfile
+import threading
 import unittest
 
 from tmuxgate.approval import ApprovalDecision
@@ -716,6 +717,206 @@ class MasterPoolTests(unittest.TestCase):
         with self.assertRaisesRegex(TransportError, "pre-existing"):
             self.pool.acquire(token, endpoint)
         self.assertEqual(expected.read_text(encoding="ascii"), "do not replace")
+
+
+class BlockingStartBackend(FakeMasterBackend):
+    """Holds ``start_master`` open until another thread lets it finish.
+
+    This stands in for the real prompt-capable master start, which hands the
+    operator's terminal to OpenSSH and cannot complete until the interface's
+    own thread runs the session.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.attempts = []
+        self.entered = threading.Event()
+        self.may_finish = threading.Event()
+        self.timed_out = False
+
+    def start_master(self, invocation, control_path):
+        self.attempts.append(invocation)
+        self.entered.set()
+        if not self.may_finish.wait(HANDOFF_TIMEOUT):
+            self.timed_out = True
+            raise TransportError("terminal hand-off was never serviced")
+        super().start_master(invocation, control_path)
+
+
+HANDOFF_TIMEOUT = 20.0
+READER_TIMEOUT = 5.0
+
+
+class MasterPoolConcurrencyTests(unittest.TestCase):
+    """Regression coverage for issue #54.
+
+    ``acquire`` used to hold the pool lock across the terminal hand-off inside
+    ``start_master``.  The hand-off waits on the Textual main thread, and that
+    thread takes the same lock to render the dashboard, so the broker deadlocked
+    outright: no prompt, no input, no ``SIGTERM``.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.backend = BlockingStartBackend()
+        self.addCleanup(self.backend.close)
+        self.pool = MasterTransportPool(
+            Path(self.temporary.name) / "control",
+            backend=self.backend,
+            identity_revalidator=lambda endpoint: endpoint,
+            clock=lambda: 0.0,
+            max_masters=3,
+            idle_timeout_seconds=600,
+        )
+        base = build_plan().selected.resolved
+        self.endpoints = tuple(machine_endpoint(base, index) for index in range(4))
+
+    def _acquire_in_thread(self, index, request_id=REQUEST_ID):
+        """Start one ``acquire`` on its own thread and return a result box."""
+
+        endpoint = self.endpoints[index]
+        outcome = {}
+
+        def run():
+            try:
+                outcome["lease"] = self.pool.acquire(
+                    authorization(
+                        endpoint.ssh_profile, endpoint, request_id=request_id
+                    ),
+                    endpoint,
+                )
+            except BaseException as exc:  # noqa: BLE001 - recorded for assertions
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run, name=f"tmuxgate-execution-{index}")
+        thread.start()
+        outcome["thread"] = thread
+        return outcome
+
+    def _finish_started_master(self, outcome):
+        self.backend.may_finish.set()
+        outcome["thread"].join(timeout=HANDOFF_TIMEOUT)
+        self.assertFalse(outcome["thread"].is_alive())
+        self.assertFalse(self.backend.timed_out)
+        return outcome
+
+    def test_dashboard_reader_never_waits_on_a_master_start(self):
+        # The exact reported cycle: the executor thread is inside start_master
+        # waiting for the main thread, and the main thread's refresh tick reads
+        # retained_machine_names.  Before the fix this read blocked forever.
+        pending = self._acquire_in_thread(0)
+        self.assertTrue(self.backend.entered.wait(HANDOFF_TIMEOUT))
+
+        read = []
+        reader = threading.Thread(
+            target=lambda: read.append(self.pool.retained_machine_names)
+        )
+        reader.start()
+        reader.join(timeout=READER_TIMEOUT)
+
+        self.assertFalse(
+            reader.is_alive(),
+            "dashboard refresh blocked on a master start; issue #54 deadlock",
+        )
+        self.assertEqual(read, [()])
+
+        self._finish_started_master(pending)
+        self.assertNotIn("error", pending)
+        self.assertEqual(self.pool.retained_machine_names, ("app-server",))
+        pending["lease"].release()
+
+    def test_transport_lock_is_free_during_a_master_start(self):
+        # pinned_request_ids still takes the lock, so it proves the lock itself
+        # is released across the hand-off rather than only that one reader
+        # having been made lock-free.
+        pending = self._acquire_in_thread(0)
+        self.assertTrue(self.backend.entered.wait(HANDOFF_TIMEOUT))
+
+        read = []
+        reader = threading.Thread(
+            target=lambda: read.append(self.pool.pinned_request_ids)
+        )
+        reader.start()
+        reader.join(timeout=READER_TIMEOUT)
+
+        self.assertFalse(
+            reader.is_alive(), "the pool lock was held across the terminal hand-off"
+        )
+        self.assertEqual(read, [()])
+
+        self._finish_started_master(pending)
+        pending["lease"].release()
+
+    def test_concurrent_acquires_for_one_machine_start_a_single_master(self):
+        # The lock used to make this exclusive.  The start reservation must keep
+        # it exclusive, or two masters would race for one derived control path.
+        first = self._acquire_in_thread(0)
+        self.assertTrue(self.backend.entered.wait(HANDOFF_TIMEOUT))
+        second = self._acquire_in_thread(0, request_id=SECOND_ID)
+        # The second request must wait rather than start its own master.
+        second["thread"].join(timeout=1.0)
+        self.assertTrue(second["thread"].is_alive())
+        self.assertEqual(len(self.backend.attempts), 1)
+
+        self._finish_started_master(first)
+        second["thread"].join(timeout=HANDOFF_TIMEOUT)
+        self.assertFalse(second["thread"].is_alive())
+
+        self.assertNotIn("error", first)
+        self.assertNotIn("error", second)
+        self.assertEqual(len(self.backend.starts), 1)
+        self.assertEqual(
+            first["lease"].transport.control_path,
+            second["lease"].transport.control_path,
+        )
+        self.assertEqual(self.pool.retained_machine_names, ("app-server",))
+        self.assertEqual(
+            self.pool.pinned_request_ids, tuple(sorted((REQUEST_ID, SECOND_ID)))
+        )
+        first["lease"].release()
+        second["lease"].release()
+
+    def test_a_reserved_start_counts_against_the_retention_limit(self):
+        # A reservation holds a retention slot it has not filled yet, so
+        # concurrent starts must not together exceed max_masters.
+        pending = [self._acquire_in_thread(index, request_id=f"{index + 1:032x}")
+                   for index in range(3)]
+        for outcome in pending:
+            self.assertTrue(self.backend.entered.wait(HANDOFF_TIMEOUT))
+        overflow = self._acquire_in_thread(3, request_id="4" * 32)
+        overflow["thread"].join(timeout=HANDOFF_TIMEOUT)
+
+        self.assertFalse(overflow["thread"].is_alive())
+        self.assertIsInstance(overflow.get("error"), TransportBusyError)
+
+        self.backend.may_finish.set()
+        for outcome in pending:
+            outcome["thread"].join(timeout=HANDOFF_TIMEOUT)
+            self.assertFalse(outcome["thread"].is_alive())
+            self.assertNotIn("error", outcome)
+            outcome["lease"].release()
+        self.assertEqual(len(self.pool.retained_machine_names), 3)
+
+    def test_a_failed_start_releases_its_reservation(self):
+        # A reservation that outlived its failed start would wedge the machine
+        # permanently, which is the failure mode this replaced.
+        self.backend.fail_next_start = True
+        self.backend.may_finish.set()
+        endpoint = self.endpoints[0]
+        with self.assertRaises(RuntimeError):
+            self.pool.acquire(
+                authorization(endpoint.ssh_profile, endpoint), endpoint
+            )
+
+        lease = self.pool.acquire(
+            authorization(endpoint.ssh_profile, endpoint, request_id=SECOND_ID),
+            endpoint,
+        )
+
+        self.assertEqual(len(self.backend.starts), 2)
+        self.assertEqual(self.pool.retained_machine_names, ("app-server",))
+        lease.release()
 
 
 if __name__ == "__main__":
