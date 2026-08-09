@@ -44,7 +44,6 @@ from tmuxgate.operator_interface import (
 )
 from tmuxgate import textual_interface as textual_interface_module
 from tmuxgate.textual_interface import (
-    APPROVAL_ARM_SECONDS,
     DashboardJob,
     DashboardMachine,
     DashboardRuntimeSnapshot,
@@ -174,32 +173,47 @@ class SuspendResumeTests(unittest.TestCase):
         self.assertEqual(events, ["suspend", "resume"])
 
 
+async def settle_armed(screen, pilot) -> None:
+    """Wait for the arm state itself, never for a wall-clock estimate.
+
+    A loaded runner can take longer than APPROVAL_ARM_SECONDS to deliver
+    the timer, so pausing for that duration and assuming the screen armed
+    races the very fence under test.
+    """
+
+    deadline = time.monotonic() + 5
+    while not screen._arm_ready:
+        if time.monotonic() >= deadline:
+            raise AssertionError("the decision never armed")
+        await pilot.pause(0.02)
+    await pilot.pause()
+
+
+def never_arms():
+    """Hold the arm fence open so the pre-arm state cannot elapse."""
+
+    return mock.patch.object(
+        textual_interface_module, "APPROVAL_ARM_SECONDS", 3600.0
+    )
+
+
+async def arm_now(screen, pilot) -> None:
+    """Arm one screen explicitly, under a held-open arm fence.
+
+    A test that must observe both the pre-arm and the armed state cannot let
+    the real timer decide when the boundary is crossed: every assertion about
+    the pre-arm state would then be racing that timer.  Holding the fence open
+    with ``never_arms`` and delivering the arm callback here makes the crossing
+    happen at one exact point the test chooses.  Timer delivery itself is
+    covered separately by ``ArmedFocusTests``.
+    """
+
+    screen._arm_decision()
+    await settle_armed(screen, pilot)
+
+
 class ArmedFocusTests(unittest.TestCase):
     """Routine decisions focus the positive action only once it is armed."""
-
-    @staticmethod
-    async def _settle_armed(screen, pilot) -> None:
-        """Wait for the arm timer itself, never for a wall-clock estimate.
-
-        A loaded runner can take longer than APPROVAL_ARM_SECONDS to deliver
-        the timer, so pausing for that duration and assuming the screen armed
-        races the very fence under test.
-        """
-
-        deadline = time.monotonic() + 5
-        while not screen._arm_ready:
-            if time.monotonic() >= deadline:
-                raise AssertionError("the decision never armed")
-            await pilot.pause(0.02)
-        await pilot.pause()
-
-    @staticmethod
-    def _never_arms():
-        """Hold the arm fence open so the pre-arm state cannot elapse."""
-
-        return mock.patch.object(
-            textual_interface_module, "APPROVAL_ARM_SECONDS", 3600.0
-        )
 
     def _drive(self, screen_type, request, size=(100, 30), arm=True):
         interface = TextualOperatorInterface(
@@ -226,7 +240,7 @@ class ArmedFocusTests(unittest.TestCase):
                     await pilot.pause(0.02)
                 screen = app.screen
                 if arm:
-                    await self._settle_armed(screen, pilot)
+                    await settle_armed(screen, pilot)
                 else:
                     await pilot.pause()
                 focused.append(screen.focused.id if screen.focused else None)
@@ -255,7 +269,7 @@ class ArmedFocusTests(unittest.TestCase):
     def test_execution_approval_keeps_deny_focused_before_arming(self):
         # The arm window must stay unfocused as well as disabled, so buffered
         # input cannot commit the positive action.
-        with self._never_arms():
+        with never_arms():
             focused = self._drive(
                 ExecutionApprovalScreen, self._execution, arm=False
             )
@@ -298,7 +312,7 @@ class ArmedFocusTests(unittest.TestCase):
                         raise AssertionError("approval modal did not open")
                     await pilot.pause(0.02)
                 screen = app.screen
-                await self._settle_armed(screen, pilot)
+                await settle_armed(screen, pilot)
                 self.assertEqual(screen.focused.id, "approval-approve")
                 await pilot.press("enter")
                 deadline = time.monotonic() + 2
@@ -340,7 +354,7 @@ class ArmedFocusTests(unittest.TestCase):
                 while asking.is_alive() and time.monotonic() < deadline:
                     await pilot.pause(0.02)
 
-        with self._never_arms():
+        with never_arms():
             asyncio.run(exercise())
         asking.join(timeout=1)
         self.assertEqual(decisions, [ApprovalDecision.DENIED])
@@ -609,7 +623,7 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 self.assertIn(secret.viewer_session_id, document)
                 self.assertIn(secret.secret_input_binding_sha256, document)
                 self.assertTrue(screen.query_one("#secret-deny", Button).has_focus)
-                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                await arm_now(screen, pilot)
                 self.assertTrue(await pilot.click("#secret-approve"))
                 deadline = time.monotonic() + 1
                 while authorizer.is_alive() and time.monotonic() < deadline:
@@ -635,7 +649,10 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                     TerminalOwnershipState.TUI,
                 )
 
-        asyncio.run(exercise())
+        # The deny-focused assertion above only holds while unarmed:
+        # SecretInputAuthorizationScreen moves focus to Approve once armed.
+        with never_arms():
+            asyncio.run(exercise())
         authorizer.join(timeout=1)
         self.assertIs(decisions[0].decision, ApprovalDecision.APPROVED)
         self.assertEqual(
@@ -700,7 +717,7 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                     if time.monotonic() >= deadline:
                         raise AssertionError("secret authorization modal did not open")
                     await pilot.pause(0.02)
-                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                await settle_armed(app.screen, pilot)
                 self.assertTrue(await pilot.click("#secret-approve"))
                 deadline = time.monotonic() + 1
                 while authorizer.is_alive() and time.monotonic() < deadline:
@@ -1246,7 +1263,7 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                     .plain
                 )
                 self.assertIn(fallback.fallback_binding_sha256, fallback_binding)
-                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                await settle_armed(fallback_screen, pilot)
                 self.assertTrue(await pilot.click("#recovery-approve"))
 
         asyncio.run(exercise())
@@ -1320,7 +1337,7 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 self.assertIn(r"\u001b", summary)
                 self.assertIn(plan.plan_sha256, request_evidence)
                 self.assertIn(first.binding_sha256, binding)
-                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                await settle_armed(screen, pilot)
                 self.assertFalse(
                     screen.query_one("#disable-approve", Button).disabled
                 )
@@ -1337,9 +1354,11 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 )
                 await pilot.press("enter")
 
-                await self._wait_for_machine_disable(app, pilot, second)
+                second_screen = await self._wait_for_machine_disable(
+                    app, pilot, second
+                )
                 await pilot.resize_terminal(100, 30)
-                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                await settle_armed(second_screen, pilot)
                 self.assertTrue(await pilot.click("#disable-approve"))
 
         asyncio.run(exercise())
@@ -1436,7 +1455,7 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 await pilot.pause()
                 self.assertIs(app.screen, screen)
                 self.assertTrue(screen.query_one("#approval-deny", Button).display)
-                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                await arm_now(screen, pilot)
                 self.assertFalse(screen.query_one("#approval-approve", Button).disabled)
                 self.assertTrue(await pilot.click("#approval-approve"))
 
@@ -1447,7 +1466,11 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 await pilot.press("escape")
                 await pilot.pause()
 
-        asyncio.run(exercise())
+        # Both deny-focused assertions and the disabled-Approve assertion are
+        # pre-arm states, and ExecutionApprovalScreen moves focus to Approve
+        # once armed.  Only the explicit arm_now above crosses that boundary.
+        with never_arms():
+            asyncio.run(exercise())
         first.join(timeout=1)
         second.join(timeout=1)
         self.assertFalse(first.is_alive())
@@ -1507,13 +1530,22 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 )
                 self.assertIs(app._active_decision.pending, second_item.pending)
 
-                await pilot.pause(APPROVAL_ARM_SECONDS + 0.10)
+                # Only this prompt crosses the arm boundary, and only here.
+                await arm_now(second_screen, pilot)
                 self.assertTrue(await pilot.click("#approval-approve"))
                 await self._wait_for_approval(app, pilot, prompts[2])
                 await pilot.press("enter")
                 await pilot.pause()
 
-        asyncio.run(exercise())
+        # Every pre-arm assertion above -- the refused activation, and both
+        # Enter presses landing on the focused safe default -- is only true
+        # while the decision is unarmed.  Once armed, ExecutionApprovalScreen
+        # deliberately moves focus to Approve so a single Return commits a
+        # routine decision, and Enter would approve instead of deny.  Holding
+        # the fence open keeps the arm timer from deciding, under load, which
+        # of those two behaviors the test observes.
+        with never_arms():
+            asyncio.run(exercise())
         for worker in workers:
             worker.join(timeout=1)
             self.assertFalse(worker.is_alive())
