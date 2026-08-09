@@ -86,6 +86,118 @@ class InstallerTransformTests(unittest.TestCase):
                         replace_conflict=True,
                     )
 
+    def _own_registration(self):
+        return installer._codex_registration_payload(
+            url="http://127.0.0.1:8765/mcp"
+        ).decode("utf-8")
+
+    def test_codex_registration_accepts_its_own_table_after_codex_rewrites_it(self):
+        # Regression for issue #59. Codex rewrites this file: it renders our
+        # integer timeout as a float and appends a per-tool approval sub-table
+        # the first time an operator approves a tool. Both are our own
+        # registration coming back in Codex's shape, so a later install must
+        # recognize it as already present and leave the bytes alone rather than
+        # demanding --replace-codex or manual editing.
+        own = self._own_registration()
+        floated = own.replace(
+            f"tool_timeout_sec = {installer.MCP_TOOL_TIMEOUT_SECONDS}",
+            f"tool_timeout_sec = {installer.MCP_TOOL_TIMEOUT_SECONDS}.0",
+        )
+        approvals = (
+            '\n[mcp_servers.tmuxgate.tools.run_argv]\napproval_mode = "approve"\n'
+            '[mcp_servers.tmuxgate.tools.run_script]\napproval_mode = "approve"\n'
+        )
+        for label, original in (
+            ("unchanged", own),
+            ("floated timeout", floated),
+            ("tool approvals", own + approvals),
+            ("both rewrites", floated + approvals),
+        ):
+            for replace_conflict in (False, True):
+                with self.subTest(layout=label, replace_conflict=replace_conflict):
+                    raw = original.encode("utf-8")
+                    updated = installer.update_codex_registration(
+                        raw,
+                        url="http://127.0.0.1:8765/mcp",
+                        replace_conflict=replace_conflict,
+                    )
+                    self.assertEqual(updated, raw)
+
+    def test_codex_tool_approvals_survive_a_conflicting_rewrite(self):
+        # The operator's approval policy is not ours to discard, so even the
+        # byte-span replacement of a genuinely conflicting table must leave the
+        # sub-tables below it intact.
+        original = (
+            b"[mcp_servers.tmuxgate]\n"
+            b'url = "http://127.0.0.1:9999/stale"\n'
+            b'[mcp_servers.tmuxgate.tools.run_argv]\napproval_mode = "approve"\n'
+        )
+
+        updated = installer.update_codex_registration(
+            original, url="http://127.0.0.1:8765/mcp", replace_conflict=True
+        )
+
+        target = tomllib.loads(updated.decode("utf-8"))["mcp_servers"]["tmuxgate"]
+        self.assertEqual(target["url"], "http://127.0.0.1:8765/mcp")
+        self.assertEqual(
+            target["tool_timeout_sec"], installer.MCP_TOOL_TIMEOUT_SECONDS
+        )
+        self.assertEqual(
+            target["tools"], {"run_argv": {"approval_mode": "approve"}}
+        )
+
+    def test_codex_registration_still_refuses_foreign_values(self):
+        # Tolerating Codex's own rewrite must not tolerate anything else. A
+        # scalar named 'tools' was not written by Codex, so it stays visible as
+        # a conflict rather than being mistaken for an approval sub-table.
+        own = self._own_registration()
+        conflicts = {
+            "scalar tools key": own + 'tools = "not-a-table"\n',
+            "foreign token variable": own.replace(
+                installer.MCP_TOKEN_ENV, "SOMEONE_ELSES_TOKEN"
+            ),
+            "foreign url": own.replace(
+                "http://127.0.0.1:8765/mcp", "http://evil.invalid/mcp"
+            ),
+        }
+        for label, original in conflicts.items():
+            with self.subTest(conflict=label):
+                with self.assertRaisesRegex(
+                    installer.InstallError, "different|ambiguous"
+                ):
+                    installer.update_codex_registration(
+                        original.encode("utf-8"),
+                        url="http://127.0.0.1:8765/mcp",
+                        replace_conflict=False,
+                    )
+
+    def test_codex_stale_timeout_is_updated_in_either_numeric_form(self):
+        # A timeout key in our own table is ours to bring up to date whatever
+        # its current value, which is what lets MCP_TOOL_TIMEOUT_SECONDS change
+        # without every existing install needing --replace-codex. Accepting the
+        # float form must not turn that into a conflict.
+        own = self._own_registration()
+        for label, stale in (
+            ("integer", "tool_timeout_sec = 60"),
+            ("float", "tool_timeout_sec = 60.0"),
+        ):
+            with self.subTest(form=label):
+                original = own.replace(
+                    f"tool_timeout_sec = {installer.MCP_TOOL_TIMEOUT_SECONDS}", stale
+                )
+
+                updated = installer.update_codex_registration(
+                    original.encode("utf-8"),
+                    url="http://127.0.0.1:8765/mcp",
+                    replace_conflict=False,
+                )
+
+                target = tomllib.loads(updated.decode("utf-8"))
+                self.assertEqual(
+                    target["mcp_servers"]["tmuxgate"]["tool_timeout_sec"],
+                    installer.MCP_TOOL_TIMEOUT_SECONDS,
+                )
+
     def test_codex_timeout_patch_preserves_other_tables_and_is_idempotent(self):
         original = (
             b'[model]\nname = "example"\n\n'
