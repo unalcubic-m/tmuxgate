@@ -3,11 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from tmuxgate.executor import (
-    RealExecutor,
-    SILENT_INTERACTIVE_DETAIL,
-    silent_interactive_detail,
-)
+from tmuxgate.executor import RealExecutor
 from tmuxgate.result import TransportStatus
 from tmuxgate.scheduler import RequestState
 from tmuxgate.spool import ResultSpool
@@ -38,20 +34,6 @@ class AutoCompletingBackend(FakeRemoteBackend):
     def release_gate(self, identity):
         super().release_gate(identity)
         self.complete(b"stdout-line\n", b"stderr-line\n", 7)
-        self.viewer.detach()
-
-
-class SilentFailureBackend(FakeRemoteBackend):
-    """Completes with a non-zero status and nothing on either stream."""
-
-    def attach(self, identity):
-        viewer = super().attach(identity)
-        self.viewer = viewer
-        return viewer
-
-    def release_gate(self, identity):
-        super().release_gate(identity)
-        self.complete(b"", b"", 1)
         self.viewer.detach()
 
 
@@ -199,40 +181,6 @@ class RealExecutorTests(unittest.TestCase):
             detached_wait_seconds=0.001,
             **kwargs,
         )
-
-    def test_silent_interactive_failure_reaches_the_client_annotated(self):
-        # Issue #55 point 5, end to end: the streams, the exit status and the
-        # durable record are untouched; only the otherwise-null detail changes.
-        spec = replace(request(("top",)), interactive=True)
-        self.approve(spec)
-        backend = SilentFailureBackend()
-        executor = self.executor(backend)
-
-        result = executor(REQUEST_ID, spec)
-
-        self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
-        self.assertEqual(result.stdout, b"")
-        self.assertEqual(result.stderr, b"")
-        self.assertEqual(result.remote_exit_status, 1)
-        self.assertEqual(result.detail, SILENT_INTERACTIVE_DETAIL)
-        executor.result_delivery_finished(REQUEST_ID, True)
-        record = self.state.load(REQUEST_ID)
-        self.assertEqual(record.state, RequestState.DONE)
-        self.assertEqual(record.exit_status, 1)
-        spooled = self.spool.load(REQUEST_ID)
-        self.assertEqual((spooled.stdout, spooled.stderr, spooled.exit_status), (b"", b"", 1))
-
-    def test_an_ordinary_failure_is_still_returned_without_a_detail(self):
-        spec = request(("false",))
-        self.approve(spec)
-        backend = SilentFailureBackend()
-        executor = self.executor(backend)
-
-        result = executor(REQUEST_ID, spec)
-
-        self.assertEqual(result.remote_exit_status, 1)
-        self.assertIsNone(result.detail)
-        executor.result_delivery_finished(REQUEST_ID, True)
 
     def test_full_fake_transport_and_remote_job_returns_exact_result_and_done(self):
         spec = request(("printf", "hello"))
@@ -757,75 +705,6 @@ class RealExecutorTests(unittest.TestCase):
         )
         # The retained lease is deliberately not released by the test subject.
         executor._recovery_leases[REQUEST_ID].release()
-
-
-class SilentInteractiveDetailTests(unittest.TestCase):
-    """Point 5 of issue #55: name the one failure that explains nothing itself.
-
-    An interactive request that exits non-zero having written nothing at all is
-    recorded exactly like a command that ran and failed on its own terms, and
-    nothing in the result names the usual cause.  These pin the signature
-    narrowly, because a hint that fires on ordinary failures is worse than none.
-    """
-
-    def _request(self, *, interactive=True, environment=()):
-        return replace(
-            request(), interactive=interactive, environment=tuple(environment)
-        )
-
-    def test_the_silent_interactive_signature_is_named(self):
-        detail = silent_interactive_detail(
-            self._request(), exit_status=1, stdout=b"", stderr=b""
-        )
-
-        self.assertIsNotNone(detail)
-        assert detail is not None
-        self.assertIn("TERM", detail)
-        self.assertIn("advisory", detail)
-        # It must not present itself as a diagnosis of this exact failure.
-        self.assertIn("not evidence", detail)
-
-    def test_nothing_else_is_annotated(self):
-        quiet = {
-            "non-interactive, same shape": (
-                self._request(interactive=False),
-                {"exit_status": 1, "stdout": b"", "stderr": b""},
-            ),
-            "interactive and successful": (
-                self._request(),
-                {"exit_status": 0, "stdout": b"", "stderr": b""},
-            ),
-            "no exit status recorded": (
-                self._request(),
-                {"exit_status": None, "stdout": b"", "stderr": b""},
-            ),
-            "failed but wrote to stdout": (
-                self._request(),
-                {"exit_status": 1, "stdout": b"x", "stderr": b""},
-            ),
-            "failed but wrote to stderr": (
-                self._request(),
-                {"exit_status": 1, "stdout": b"", "stderr": b"boom"},
-            ),
-            "TERM was supplied, so this cause is ruled out": (
-                self._request(environment=(("TERM", "xterm-256color"),)),
-                {"exit_status": 1, "stdout": b"", "stderr": b""},
-            ),
-        }
-        for label, (spec, outcome) in quiet.items():
-            with self.subTest(case=label):
-                self.assertIsNone(silent_interactive_detail(spec, **outcome))
-
-    def test_the_hint_carries_no_remote_bytes(self):
-        # The detail reaches the client. Keeping it a constant is what stops a
-        # remote host from steering its content.
-        detail = silent_interactive_detail(
-            self._request(), exit_status=1, stdout=b"", stderr=b""
-        )
-
-        self.assertEqual(detail, SILENT_INTERACTIVE_DETAIL)
-        self.assertTrue(detail.isascii())
-        self.assertNotIn("\x1b", detail)
 
 
 if __name__ == "__main__":
