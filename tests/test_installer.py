@@ -708,6 +708,92 @@ else:
             self.assertEqual(len(list(backups.iterdir())), 1)
 
 
+class InstallerRetentionTests(unittest.TestCase):
+    """Regression coverage for issue #53."""
+
+    def _releases(self, base, *names):
+        releases = base / "releases"
+        releases.mkdir()
+        for name in names:
+            (releases / name).mkdir()
+        return releases
+
+    def test_only_the_newest_releases_survive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            names = [f"2026080{index}T120000Z-aaaaaaa{index}" for index in range(1, 6)]
+            releases = self._releases(Path(temporary), *names)
+
+            # keep is the total retained, and the newest release is normally
+            # protected as the one just published, so it counts toward it.
+            removed = installer._prune_releases(
+                releases, keep=2, protected={names[-1]}
+            )
+
+            self.assertEqual(sorted(removed), sorted(names[:3]))
+            self.assertEqual(
+                sorted(path.name for path in releases.iterdir()), sorted(names[3:])
+            )
+
+    def test_protected_releases_survive_regardless_of_the_limit(self):
+        # The rollback path is a `current` symlink flip, so the release it
+        # would flip back to must outlive retention however small keep is.
+        with tempfile.TemporaryDirectory() as temporary:
+            names = [f"2026080{index}T120000Z-bbbbbbb{index}" for index in range(1, 6)]
+            releases = self._releases(Path(temporary), *names)
+            active, previous, in_use = names[4], names[0], names[1]
+
+            removed = installer._prune_releases(
+                releases, keep=1, protected={active, previous, in_use}
+            )
+
+            survivors = sorted(path.name for path in releases.iterdir())
+            self.assertIn(active, survivors)
+            self.assertIn(previous, survivors)
+            self.assertIn(in_use, survivors)
+            self.assertNotIn(previous, removed)
+
+    def test_zero_keeps_everything(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            names = [f"2026080{index}T120000Z-ccccccc{index}" for index in range(1, 5)]
+            releases = self._releases(Path(temporary), *names)
+
+            self.assertEqual(installer._prune_releases(releases, keep=0, protected=set()), [])
+            self.assertEqual(len(list(releases.iterdir())), len(names))
+
+    def test_a_release_a_live_process_runs_from_is_in_use(self):
+        # This interpreter is running from a directory below its own parent, so
+        # that parent stands in for the releases root and the interpreter's
+        # directory for a release still in use.
+        interpreter = Path(sys.executable).resolve()
+        releases = interpreter.parents[2]
+        expected = interpreter.parents[1].name
+
+        self.assertIn(expected, installer._releases_in_use(releases))
+
+    def test_backups_keep_the_oldest_pre_image_of_each_kind(self):
+        # The oldest pre-image is the file as it was before tmuxgate ever
+        # managed it, and is the only one that can undo the integration.
+        with tempfile.TemporaryDirectory() as temporary:
+            backups = Path(temporary)
+            profiles = [f"profile-0-2026080{index}T120000Z-dddddddd" for index in range(1, 6)]
+            codex = [f"codex-config-2026080{index}T120000Z-eeeeeeee.toml" for index in (1, 2)]
+            unmanaged = "not-written-by-this-installer"
+            for name in (*profiles, *codex, unmanaged):
+                (backups / name).write_text("x", encoding="ascii")
+
+            removed = installer._prune_backups(backups, keep=2)
+
+            survivors = sorted(path.name for path in backups.iterdir())
+            self.assertIn(profiles[0], survivors)
+            self.assertIn(profiles[-1], survivors)
+            self.assertIn(profiles[-2], survivors)
+            self.assertEqual(sorted(removed), sorted(profiles[1:3]))
+            # A kind with no surplus, and anything this installer did not
+            # write, are both left alone.
+            for name in (*codex, unmanaged):
+                self.assertIn(name, survivors)
+
+
 class InstallerFlowTests(unittest.TestCase):
     def _fixture(self, base: Path):
         home = base / "home"
@@ -1129,6 +1215,73 @@ class InstallerFlowTests(unittest.TestCase):
                 for path in (fixture["data"] / "tmuxgate" / "releases").iterdir()
             )
             self.assertEqual(retained, [report.candidate_identity])
+
+    def test_repeated_installs_stop_growing_the_data_directory(self):
+        # Regression for issue #53: every run published a release and left the
+        # one it replaced behind, so the data directory grew without bound.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            fake_run = self._fake_installer_runner(installer._run)
+            install_root = fixture["data"] / "tmuxgate"
+            arguments = self._arguments(fixture)
+            arguments.keep_releases = 2
+            announced = []
+            with mock.patch.dict(os.environ, fixture["environment"], clear=True):
+                with mock.patch.object(installer, "_run", side_effect=fake_run):
+                    for _ in range(5):
+                        out = io.StringIO()
+                        with contextlib.redirect_stdout(out):
+                            with contextlib.redirect_stderr(io.StringIO()):
+                                self.assertEqual(installer.install(arguments), 0)
+                        announced.extend(
+                            line
+                            for line in out.getvalue().splitlines()
+                            if line.startswith("Removed superseded release")
+                        )
+
+            releases = list((install_root / "releases").iterdir())
+            # Bounded, and never fewer than what rollback needs.
+            self.assertLessEqual(len(releases), 3)
+            self.assertGreaterEqual(len(releases), 2)
+            self.assertTrue(announced, "pruning must never be silent")
+            # The invariants that matter more than the count: the launcher
+            # still resolves, through current, to a release that exists.
+            current = install_root / "current"
+            self.assertTrue(current.resolve().is_dir())
+            launcher = fixture["bin_dir"] / "tmuxgate"
+            self.assertTrue(launcher.resolve().is_file())
+            self.assertIn(
+                Path(os.readlink(current)).name,
+                [path.name for path in releases],
+            )
+
+    def test_retention_failure_never_fails_a_successful_install(self):
+        # Reclaiming space is housekeeping. An install that published its
+        # release has succeeded, whatever happens to the old directories.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            fake_run = self._fake_installer_runner(installer._run)
+            with mock.patch.dict(os.environ, fixture["environment"], clear=True):
+                with mock.patch.object(installer, "_run", side_effect=fake_run):
+                    with mock.patch.object(
+                        installer,
+                        "_prune_releases",
+                        side_effect=OSError("synthetic retention failure"),
+                    ):
+                        report = installer.InstallReport()
+                        out = io.StringIO()
+                        errors = io.StringIO()
+                        with contextlib.redirect_stdout(out):
+                            with contextlib.redirect_stderr(errors):
+                                status = installer.install(
+                                    self._arguments(fixture), report
+                                )
+
+            self.assertEqual(status, 0)
+            self.assertIn("retention warning", errors.getvalue())
+            self.assertEqual(report.overall, "COMPLETE")
+            self.assertIn("FAILED", report.retention)
+            self.assertTrue((fixture["bin_dir"] / "tmuxgate").resolve().is_file())
 
     def test_codex_home_is_hardened_to_owner_only(self):
         with tempfile.TemporaryDirectory() as temporary:

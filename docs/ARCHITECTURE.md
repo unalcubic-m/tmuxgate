@@ -168,6 +168,21 @@ same `0.1.0.dev0` version and only the release ID distinguishes them; a
 successful run prints the release it published for the same reason. Uncatchable
 termination and interruption checkpoints are not yet covered by this contract.
 
+Retention runs only after the commit point, while the run still holds the
+install lock, so no concurrent installer can be staging into a directory it
+removes and nothing left to roll back can still need one. It keeps the newest
+`--keep-releases` releases, three by default. Three matters because rollback is
+a `current` symlink flip and a flip to a deleted release would leave a dangling
+launcher: the active release, the release `current` pointed at before this run,
+and any release a live process was started from are therefore protected
+unconditionally. In-use detection reads `/proc` for exe targets below the
+releases directory; it never signals or starts a process, and pruning is skipped
+entirely if that evidence cannot be gathered. Backups are trimmed per kind with
+the oldest pre-image of each always retained, since only that copy predates
+tmuxgate managing the file. Every removal is named on stdout, so a release
+retained after a failed publish is never reclaimed silently. Retention failure
+is reported but never fails an install that already published its release.
+
 Codex registration is written directly to the single
 `[mcp_servers.tmuxgate]` table using the configured
 `http://127.0.0.1:<port>/mcp` Streamable HTTP URL,
