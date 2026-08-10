@@ -752,6 +752,96 @@ class RemoteRunnerTests(unittest.TestCase):
             if entry
         }
 
+    def _run_terminal_type_case(
+        self, directory, *, mode, interactive, environment=b"", tmux_terminal="tmux-256color"
+    ):
+        """Run the real runner and report the environment the command received.
+
+        ``tmux_terminal`` is what the stand-in tmux answers for its
+        ``default-terminal``; ``None`` makes it refuse the query the way a tmux
+        too old to expand the option would.
+        """
+
+        root = Path(directory)
+        home = root / "home"
+        job = home / ".cache/tmuxgate/jobs" / REQUEST_ID
+        job.mkdir(parents=True, mode=0o700)
+        files = {
+            "mode": f"{mode}\n".encode("ascii"),
+            "cwd.bin": os.fsencode(str(job)) + b"\0",
+            "environment.bin": environment,
+            "timeout": b"5\n",
+            "interactive": f"{interactive}\n".encode("ascii"),
+            "result-limits": b"1048576\n1048576\n2097152\n",
+        }
+        if mode == "exec":
+            files["argv.bin"] = b"/usr/bin/env\0-0\0"
+        else:
+            files["payload.sh"] = b"/usr/bin/env -0\n"
+        for name, content in files.items():
+            path = job / name
+            path.write_bytes(content)
+            path.chmod(0o600)
+        answer = (
+            f'printf "%s\\n" {tmux_terminal}\n  exit 0\n'
+            if tmux_terminal is not None
+            else "  exit 1\n"
+        )
+        fake_tmux = root / "fake-tmux"
+        fake_tmux.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = wait-for ]; then exit 0; fi\n'
+            'if [ "$1" = display-message ]; then\n'
+            f"  {answer}"
+            "fi\n"
+            "exit 99\n",
+            encoding="ascii",
+        )
+        fake_tmux.chmod(0o700)
+        runner = Path(__file__).parents[1] / "src/tmuxgate/assets/remote_runner.sh"
+        completed = subprocess.run(
+            [
+                "/bin/bash",
+                str(runner),
+                str(job),
+                f"tmuxgate-start-{REQUEST_ID}",
+                str(fake_tmux),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+            timeout=8,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return self._parse_environment(completed.stdout)
+
+    def test_non_interactive_execution_still_receives_no_terminal_type(self):
+        # Regression for issue #55. A non-interactive command has no
+        # controlling terminal, so naming a terminal type would only invite
+        # escape sequences into canonical captured output.
+        for mode in ("exec", "script"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                target = self._run_terminal_type_case(
+                    directory, mode=mode, interactive=0
+                )
+
+                self.assertNotIn(b"TERM", target)
+
+    def test_an_explicit_terminal_type_is_honoured_without_a_terminal(self):
+        # The request environment is approved and bound, so it is delivered
+        # exactly as asked even where the runner supplies nothing itself.
+        with tempfile.TemporaryDirectory() as directory:
+            target = self._run_terminal_type_case(
+                directory,
+                mode="exec",
+                interactive=0,
+                environment=b"TERM\0screen-256color\0",
+            )
+
+            self.assertEqual(target[b"TERM"], b"screen-256color")
+
 
 # A distinctive value that must never reach a captured stream, a durable file,
 # or the runner's own diagnostics.
@@ -773,14 +863,23 @@ _TTY_PROMPT_READER = (
 class InteractiveRemoteRunnerTests(unittest.TestCase):
     """Exercise the real runner against a real controlling terminal."""
 
-    def _stage(self, root, command, *, interactive=b"1\n", timeout=b""):
+    def _stage(
+        self,
+        root,
+        command,
+        *,
+        interactive=b"1\n",
+        timeout=b"",
+        environment=b"",
+        tmux_terminal=None,
+    ):
         home = root / "home"
         job = home / ".cache/tmuxgate/jobs" / REQUEST_ID
         job.mkdir(parents=True, mode=0o700)
         files = {
             "mode": b"exec\n",
             "cwd.bin": os.fsencode(str(job)) + b"\0",
-            "environment.bin": b"",
+            "environment.bin": environment,
             "timeout": timeout,
             "interactive": interactive,
             "result-limits": b"1048576\n1048576\n2097152\n",
@@ -794,13 +893,77 @@ class InteractiveRemoteRunnerTests(unittest.TestCase):
             path = job / name
             path.write_bytes(content)
             path.chmod(0o600)
+        # ``tmux_terminal`` is what the stand-in tmux answers for its
+        # default-terminal; None makes it refuse, the way a tmux too old to
+        # expand the option would.
+        answer = (
+            f'printf "%s\\n" {tmux_terminal}; exit 0'
+            if tmux_terminal is not None
+            else "exit 1"
+        )
         fake_tmux = root / "fake-tmux"
         fake_tmux.write_text(
-            '#!/bin/sh\n[ "$1" = wait-for ] || exit 99\nexit 0\n',
+            "#!/bin/sh\n"
+            '[ "$1" = wait-for ] && exit 0\n'
+            f'[ "$1" = display-message ] && {{ {answer}; }}\n'
+            "exit 99\n",
             encoding="ascii",
         )
         fake_tmux.chmod(0o700)
         return home, job, fake_tmux
+
+    def _terminal_type_seen_by(self, **stage):
+        """Report the TERM an interactive command actually received."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, job, fake_tmux = self._stage(
+                root, "printf '%s' \"${TERM-UNSET}\"", **stage
+            )
+            self._run(job, home, fake_tmux)
+            return (job / "stdout.raw").read_bytes()
+
+    def test_interactive_execution_receives_the_remote_tmux_terminal_type(self):
+        # Regression for issue #55. The pane has a real controlling terminal,
+        # but `env -i` removed the terminal type tmux set for it, so a
+        # full-screen program could not tell what it was drawing onto and
+        # exited immediately having written nothing. The value must come from
+        # the tmux that owns the pane, not from the operator's local terminal:
+        # the runner itself is started with TERM=dumb here, and that must not
+        # be what the command sees.
+        self.assertEqual(
+            self._terminal_type_seen_by(tmux_terminal="tmux-256color"),
+            b"tmux-256color",
+        )
+
+    def test_an_explicit_terminal_type_overrides_the_tmux_value(self):
+        # The request environment is approved and bound, so it wins over
+        # anything the runner supplies on the operator's behalf.
+        self.assertEqual(
+            self._terminal_type_seen_by(
+                environment=b"TERM\0screen-256color\0",
+                tmux_terminal="tmux-256color",
+            ),
+            b"screen-256color",
+        )
+
+    def test_an_unusable_tmux_terminal_type_falls_back_to_screen(self):
+        # A tmux too old to expand the option, one that prints the format back
+        # literally, and one offering a name no terminfo could hold are the
+        # same case: fall back rather than fail the command outright or let
+        # unvalidated remote configuration into the command environment.
+        unusable = {
+            "query refused": None,
+            "format not expanded": "'#{default-terminal}'",
+            "shell metacharacters": "'screen;rm -rf ~'",
+            "empty": "''",
+        }
+        for label, answer in unusable.items():
+            with self.subTest(case=label):
+                self.assertEqual(
+                    self._terminal_type_seen_by(tmux_terminal=answer),
+                    b"screen",
+                )
 
     def _run(
         self,

@@ -64,10 +64,14 @@ if ((${#environment_entries[@]} % 2 != 0)); then
     exit 125
 fi
 request_environment=()
+request_has_term=0
 for ((index=0; index<${#environment_entries[@]}; index+=2)); do
     name=${environment_entries[index]}
     value=${environment_entries[index+1]}
     [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || exit 125
+    if [ "$name" = TERM ]; then
+        request_has_term=1
+    fi
     request_environment+=("$name=$value")
 done
 unset environment_entries name value index
@@ -85,6 +89,32 @@ case "$interactive" in
     0|1) ;;
     *) echo 'tmuxgate runner refused interactive flag' >&2; exit 125 ;;
 esac
+
+# An interactive command has a real controlling terminal, but `env -i` removes
+# the terminal type tmux set for this pane, so a full-screen program cannot tell
+# what it is drawing onto and exits immediately having written nothing.  The
+# correct value describes the terminal tmux emulates, not the operator's local
+# one, so it is read back from the server that owns this pane rather than
+# propagated from anywhere outside.  A non-interactive command has no terminal
+# and keeps none, so nothing invites it to emit escape sequences into captured
+# output.  An explicit request value always wins because `env` applies the last
+# assignment and the request environment is appended after this one.
+implicit_environment=()
+if [ "$interactive" = 1 ] && [ "$request_has_term" -eq 0 ]; then
+    tmux_terminal=$(
+        "$tmux_bin" display-message -p -t "tmuxgate-${job_id:0:12}" \
+            '#{default-terminal}' 2>/dev/null | /usr/bin/tr -d '\n'
+    ) || tmux_terminal=
+    # Remote tmux configuration is untrusted input that would enter the command
+    # environment, so only a terminfo-shaped name is accepted.  Anything else,
+    # including a tmux too old to expand the option and one that prints the
+    # format back literally, falls back to the terminal type tmux has always
+    # been safe to claim.
+    if [[ ! $tmux_terminal =~ ^[A-Za-z][A-Za-z0-9._+-]{0,63}$ ]]; then
+        tmux_terminal=screen
+    fi
+    implicit_environment+=("TERM=$tmux_terminal")
+fi
 
 mapfile -t result_limits < result-limits
 if [ "${#result_limits[@]}" -ne 3 ]; then
@@ -276,13 +306,14 @@ if [ "$mode" = exec ]; then
     else
         submitted_command=(
             /usr/bin/env -i "HOME=$HOME" PATH=/usr/bin:/bin
-            "${request_environment[@]}" "${argv[@]}"
+            "${implicit_environment[@]}" "${request_environment[@]}" "${argv[@]}"
         )
     fi
 else
     submitted_command=(
         /usr/bin/env -i "HOME=$HOME" PATH=/usr/bin:/bin
-        "${request_environment[@]}" /bin/bash --noprofile --norc
+        "${implicit_environment[@]}" "${request_environment[@]}"
+        /bin/bash --noprofile --norc
         "$job_dir/payload.sh"
     )
 fi

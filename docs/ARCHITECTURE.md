@@ -952,17 +952,34 @@ two execution paths therefore differ only in their session boundary:
   refuses the job with a diagnostic and no command start when the pane has no
   terminal, and it refuses any `interactive` value other than `0` or `1`.
 
-The remote environment stays scrubbed either way, so an interactive job still
-inherits no `TERM`, and a full-screen program that needs one exits immediately
-having written nothing. That result is indistinguishable from a command that ran
-and failed on its own terms: a proven exit status, a verified empty spool, and a
-terminal durable record. An interactive request that exits non-zero with no bytes
-on either stream, and that did not itself supply `TERM`, therefore carries a
-fixed advisory `detail` naming that cause and the `environment` workaround. It is
-a constant string with nothing interpolated into it, it is explicitly not
-presented as evidence about the specific failure, and it changes no environment,
-exit status, or captured byte. Whether the broker should supply `TERM` itself
-remains open.
+A controlling terminal is only half of what a full-screen program needs; the
+other half is a terminal *type*. Both execution modes build the command with
+`env -i` from a two-name allowlist, `HOME` and `PATH`, which also removed the
+`TERM` tmux had set for the pane, so a curses program had a terminal but no way
+to know what it was drawing onto and exited immediately having written nothing.
+
+The allowlist therefore gains exactly one conditional third name. An
+**interactive** request that did not itself supply `TERM` receives one, and a
+non-interactive request still receives none, because a command with no terminal
+should never be invited to emit escape sequences into canonical captured output.
+Both modes are built from the same array, so `exec` and `script` interactive
+requests now agree; a non-interactive `script` request is still free to have Bash
+invent its own `TERM=dumb` internally, which is the interpreter's business rather
+than a value tmuxgate injected.
+
+The value describes the terminal *tmux emulates*, not the operator's local one,
+so it is read back from the tmux that owns the pane
+(`display-message -p -t <session> '#{default-terminal}'`) rather than propagated
+from the broker, the SSH session, or anywhere outside. That keeps the local
+environment unexposed and avoids claiming capabilities the tmux terminal does not
+have. Because remote tmux configuration is untrusted input that would enter the
+command environment, only a terminfo-shaped name is accepted; a tmux too old to
+expand the option, one that echoes the format back literally, and one offering
+any other shape all fall back to `screen`, which tmux has always been safe to
+claim. A terminal-type lookup never fails the command.
+
+An explicit request `TERM` always wins, in either mode, because the request
+environment is approved and bound and is applied after the implicit one.
 
 The descendant-lifecycle contract from the non-interactive path is unchanged:
 the runner is never a member of the command's group, so the same
