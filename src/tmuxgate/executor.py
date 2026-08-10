@@ -46,6 +46,41 @@ from tmuxgate.transport import (
 )
 
 
+SILENT_INTERACTIVE_DETAIL = (
+    "advisory: this interactive request failed with no bytes on either stream, "
+    "which is what a full-screen program does when TERM is unset; the remote "
+    "environment is deliberately scrubbed and does not provide one. Supplying "
+    'environment={"TERM": "xterm-256color"} is a known workaround. The exit '
+    "status and the empty streams above are the command's own; this note is a "
+    "hint about one common cause, not evidence of it."
+)
+
+
+def silent_interactive_detail(
+    request: RequestSpec, *, exit_status: int | None, stdout: bytes, stderr: bytes
+) -> str | None:
+    """Advisory detail for the one failure shape that explains nothing itself.
+
+    An interactive request that exits non-zero having written nothing at all is
+    indistinguishable, in the record and in the result, from a command that ran
+    and failed on its own terms.  The most common cause is a missing ``TERM``,
+    which nothing in the result names.  This attaches a hint and changes nothing
+    else: not the environment, not the exit status, not the captured bytes.
+
+    The text is a constant.  Nothing from the remote host is interpolated into
+    it, so it cannot become a channel for remote-controlled content.
+    """
+
+    if not request.interactive or not exit_status:
+        return None
+    if stdout or stderr:
+        return None
+    if any(name == "TERM" for name, _ in request.environment):
+        # A request that set TERM already ruled this cause out.
+        return None
+    return SILENT_INTERACTIVE_DETAIL
+
+
 class ExecutorError(RuntimeError):
     """The composed executor violated a lifecycle invariant."""
 
@@ -800,6 +835,12 @@ class RealExecutor:
                 stdout=spooled.stdout,
                 stderr=spooled.stderr,
                 remote_exit_status=spooled.exit_status,
+                detail=silent_interactive_detail(
+                    request,
+                    exit_status=spooled.exit_status,
+                    stdout=spooled.stdout,
+                    stderr=spooled.stderr,
+                ),
             )
         except BaseException as exc:
             self._publish_connection(

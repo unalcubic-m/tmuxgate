@@ -952,6 +952,18 @@ two execution paths therefore differ only in their session boundary:
   refuses the job with a diagnostic and no command start when the pane has no
   terminal, and it refuses any `interactive` value other than `0` or `1`.
 
+The remote environment stays scrubbed either way, so an interactive job still
+inherits no `TERM`, and a full-screen program that needs one exits immediately
+having written nothing. That result is indistinguishable from a command that ran
+and failed on its own terms: a proven exit status, a verified empty spool, and a
+terminal durable record. An interactive request that exits non-zero with no bytes
+on either stream, and that did not itself supply `TERM`, therefore carries a
+fixed advisory `detail` naming that cause and the `environment` workaround. It is
+a constant string with nothing interpolated into it, it is explicitly not
+presented as evidence about the specific failure, and it changes no environment,
+exit status, or captured byte. Whether the broker should supply `TERM` itself
+remains open.
+
 The descendant-lifecycle contract from the non-interactive path is unchanged:
 the runner is never a member of the command's group, so the same
 `kill -- -<pgid>` TERM/KILL boundary, `/usr/bin/timeout` supervision, capture
