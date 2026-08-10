@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from unittest import mock
@@ -761,14 +762,47 @@ class InstallerRetentionTests(unittest.TestCase):
             self.assertEqual(len(list(releases.iterdir())), len(names))
 
     def test_a_release_a_live_process_runs_from_is_in_use(self):
-        # This interpreter is running from a directory below its own parent, so
-        # that parent stands in for the releases root and the interpreter's
-        # directory for a release still in use.
-        interpreter = Path(sys.executable).resolve()
-        releases = interpreter.parents[2]
-        expected = interpreter.parents[1].name
+        # A release is a virtual environment, and its bin/python is a symlink
+        # to the system interpreter, so /proc/<pid>/exe resolves *outside* the
+        # release. Detection that trusts exe alone finds nothing for exactly the
+        # processes this must protect, so the check runs against a real live
+        # process started from a real virtual environment.
+        with tempfile.TemporaryDirectory() as temporary:
+            releases = Path(temporary) / "releases"
+            release = releases / "20260101T000000Z-aaaaaaaa"
+            release.mkdir(parents=True)
+            subprocess.run(
+                (sys.executable, "-m", "venv", "--without-pip", str(release)),
+                check=True,
+                capture_output=True,
+            )
+            child = subprocess.Popen(
+                (str(release / "bin" / "python"), "-c", "import time; time.sleep(30)"),
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if release.name in installer._releases_in_use(releases):
+                        break
+                    time.sleep(0.05)
+                in_use = installer._releases_in_use(releases)
+                self.assertIn(release.name, in_use)
+                # And retention must refuse to remove it even at keep=1.
+                removed = installer._prune_releases(
+                    releases, keep=1, protected=in_use
+                )
+                self.assertEqual(removed, [])
+                self.assertTrue(release.is_dir())
+            finally:
+                child.terminate()
+                child.wait(timeout=10)
 
-        self.assertIn(expected, installer._releases_in_use(releases))
+    def test_a_release_no_process_uses_is_not_reported_in_use(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            releases = Path(temporary) / "releases"
+            (releases / "20260101T000000Z-bbbbbbbb").mkdir(parents=True)
+
+            self.assertEqual(installer._releases_in_use(releases), set())
 
     def test_backups_keep_the_oldest_pre_image_of_each_kind(self):
         # The oldest pre-image is the file as it was before tmuxgate ever

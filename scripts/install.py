@@ -1059,6 +1059,40 @@ _BACKUP_NAME = re.compile(
 )
 
 
+def _process_release_evidence(entry: Path) -> list[str]:
+    """Absolute paths that show where one process was started from.
+
+    ``/proc/<pid>/exe`` alone is not enough: a release is a virtual environment
+    whose ``bin/python`` is a symlink to the system interpreter, so ``exe``
+    resolves outside the release for exactly the processes this has to find.
+    ``cmdline[0]`` carries the path the process was actually launched with, and
+    mapped files catch a long-running application that has already loaded
+    extension modules from its own ``site-packages``.
+    """
+
+    paths: list[str] = []
+    for name in ("exe", "cwd"):
+        try:
+            paths.append(os.readlink(entry / name))
+        except OSError:
+            continue
+    try:
+        argv = (entry / "cmdline").read_bytes().split(b"\0")
+    except OSError:
+        argv = []
+    if argv and argv[0]:
+        paths.append(os.fsdecode(argv[0]))
+    try:
+        with (entry / "maps").open("rb") as mapped:
+            for line in mapped:
+                fields = line.rstrip(b"\n").split(maxsplit=5)
+                if len(fields) == 6 and fields[5].startswith(b"/"):
+                    paths.append(os.fsdecode(fields[5]))
+    except OSError:
+        pass
+    return paths
+
+
 def _releases_in_use(releases: Path) -> set[str]:
     """Release IDs a live process is still running from.
 
@@ -1070,22 +1104,41 @@ def _releases_in_use(releases: Path) -> set[str]:
     """
 
     in_use: set[str] = set()
-    root = releases.resolve()
+    # A release's ``bin/python`` is a symlink to the system interpreter, so
+    # resolving a candidate would follow it straight back out of the release.
+    # Compare the literal path against the literal root, and separately the
+    # fully resolved pair, so neither a symlinked launcher nor a symlinked data
+    # directory can hide a live process.
+    roots = {Path(os.path.abspath(releases)), releases.resolve()}
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
-        try:
-            target = Path(os.readlink(entry / "exe")).resolve()
-        except OSError:
-            # Another user's process, or one that exited between the listing
-            # and the read.  Neither can be running from our releases.
-            continue
-        try:
-            relative = target.relative_to(root)
-        except ValueError:
-            continue
-        if relative.parts:
-            in_use.add(relative.parts[0])
+        # Another user's process, or one that exited between the listing and
+        # the read, simply yields nothing.
+        found: str | None = None
+        for candidate in _process_release_evidence(entry):
+            if not candidate.startswith("/"):
+                continue
+            forms = [Path(os.path.abspath(candidate))]
+            try:
+                forms.append(Path(candidate).resolve())
+            except OSError:
+                pass
+            for form in forms:
+                for root in roots:
+                    try:
+                        relative = form.relative_to(root)
+                    except ValueError:
+                        continue
+                    if relative.parts:
+                        found = relative.parts[0]
+                        break
+                if found is not None:
+                    break
+            if found is not None:
+                break
+        if found is not None:
+            in_use.add(found)
     return in_use
 
 
