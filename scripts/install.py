@@ -1089,20 +1089,35 @@ def _releases_in_use(releases: Path) -> set[str]:
     return in_use
 
 
+def _release_age_key(path: Path) -> tuple[str, int, str]:
+    """Sort key ordering releases oldest first.
+
+    A release ID begins with a UTC timestamp, which is the authoritative order,
+    but it is only second-granular: installs within one second differ solely by
+    their random suffix and would otherwise sort arbitrarily.  Directory
+    creation time breaks those ties, and the full name makes the order total.
+    """
+
+    try:
+        created = path.stat().st_mtime_ns
+    except OSError:
+        created = 0
+    return (path.name[:16], created, path.name)
+
+
 def _prune_releases(releases: Path, *, keep: int, protected: set[str]) -> list[str]:
     """Delete surplus releases, newest kept first; return what was removed.
 
-    Release IDs begin with a UTC timestamp, so lexicographic order is
-    chronological.  ``protected`` holds the releases that must survive whatever
-    ``keep`` says: the active one, the one ``current`` pointed at before this
-    run, and anything still in use.
+    ``protected`` holds the releases that must survive whatever ``keep`` says:
+    the active one, the one ``current`` pointed at before this run, and anything
+    still in use.
     """
 
     if keep <= 0:
         return []
     existing = sorted(
         (path for path in releases.iterdir() if path.is_dir()),
-        key=lambda path: path.name,
+        key=_release_age_key,
         reverse=True,
     )
     removed: list[str] = []
