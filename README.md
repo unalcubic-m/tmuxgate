@@ -133,6 +133,18 @@ useful options are `--no-codex`, `--no-shell-integration`, and
 `--allow-disabled-approvals`; run `./install.sh --help` for the complete
 interface.
 
+After a successful install, the installer keeps the three most recent releases
+and removes older ones, naming each directory it removes. Each release is a
+complete virtual environment of roughly 80 MB, so keeping every one grew the
+data directory without bound. Three keeps the cheap rollback available: reverting
+a bad install is a `current` symlink flip while the release it points back to
+still exists. `--keep-releases N` changes the number and `--keep-releases 0`
+disables removal entirely. The release currently active, the one `current`
+pointed at before this run, and any release a running process was started from
+are never removed, whatever the limit says. Shell-profile and Codex backups are
+trimmed the same way, except that the oldest pre-image of each file always
+survives, because it is the only copy from before tmuxgate managed it.
+
 For a development-only environment, install directly into a checkout-local
 virtual environment instead:
 
