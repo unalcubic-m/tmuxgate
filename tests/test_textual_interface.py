@@ -542,7 +542,7 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
         with self.assertRaisesRegex(OperatorInterfaceError, "--plain"):
             interface.run_dashboard(threading.Event(), config())
 
-    def test_disabled_execution_approval_never_bypasses_secret_authorization(self):
+    def test_automatic_mode_suppresses_secret_authorization_modal(self):
         interface = TextualOperatorInterface(
             FakeTerminalArbiter(),
             approval_mode="disabled",
@@ -556,21 +556,17 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
         )
 
         secret = secret_prompt()
-        result = []
-        worker = threading.Thread(
-            target=lambda: result.append(
-                interface.request_secret_input_authorization(secret)
-            )
+        result = interface.request_secret_input_authorization(secret)
+        self.assertIs(result.decision, ApprovalDecision.DENIED)
+        self.assertEqual(interface.pending_prompt_count, 0)
+        self.assertEqual(
+            tuple(
+                queued
+                for queued in interface.queued_prompts
+                if queued.prompt.prompt_id == secret.prompt_id
+            ),
+            (),
         )
-        worker.start()
-        deadline = time.monotonic() + 1
-        while interface.pending_prompt_count != 1 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertTrue(worker.is_alive())
-        interface.close()
-        worker.join(timeout=1)
-        self.assertFalse(worker.is_alive())
-        self.assertIs(result[0].decision, ApprovalDecision.DENIED)
 
     def test_exact_secret_modal_reserves_suspends_and_restores_terminal(self):
         events = []

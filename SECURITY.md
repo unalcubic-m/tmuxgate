@@ -96,12 +96,16 @@ non-interactive command runs in a session with no controlling terminal and
 cannot open `/dev/tty` at all; prompt detection and terminal handoff are not
 offered for it.
 
-With Automation on, approving an interactive Codex request also authorizes one
-stored-password submission if its viewer emits the exact resolved-user sudo
-prompt. Prompt text cannot prove that the remote program really is sudo, so an
-accepted interactive command can deliberately imitate that prompt and consume
-the stored password; Codex approval is therefore the security decision for
-both command execution and this credential use. Automation off restores the
+With Automation on, approving an interactive Codex request also authorizes up
+to three stored-password submissions when distinct prompt episodes emit the
+exact resolved-user sudo prompt. This matches sudo's ordinary retry behavior
+when a stored password has changed. Automatic mode never opens the Forward
+Input authorization; missing or unusable credentials leave the command
+detached to fail or time out, with explicit `tmuxgate attach REQUEST_ID` still
+available. Prompt text cannot prove that the remote program really is sudo, so
+an accepted interactive command can deliberately imitate that prompt and
+consume the stored password; Codex approval is therefore the security decision
+for both command execution and credential use. Automation off restores the
 second single-request handoff decision. Passwords never enter captured
 stdout/stderr, the verified result spool, durable job records, activity text,
 child arguments, or environment. tmuxgate still does not support `sudo -S`,

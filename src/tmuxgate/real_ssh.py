@@ -43,6 +43,7 @@ _SECRET_PROMPT_RE = re.compile(
     rb"\s*:[ \t]*\*{0,256}[ \t]*\Z",
     re.IGNORECASE,
 )
+MAX_AUTOMATIC_SECRET_ATTEMPTS = 3
 
 
 def _sudo_prompt_matches(signature: bytes, user: str) -> bool:
@@ -861,7 +862,8 @@ class SecretPromptPresenter:
         key: tuple[str, str],
     ) -> None:
         prompt_episode = False
-        automatic_attempted = False
+        automatic_attempts = 0
+        automatic_failure_reported = False
         try:
             while not self._stop.is_set():
                 try:
@@ -877,22 +879,55 @@ class SecretPromptPresenter:
                             None if self._active is None else self._active[0]
                         )
                     if active_viewer is not viewer:
-                        automatic_submitted = False
-                        if not automatic_attempted:
+                        try:
+                            automatic_mode = self.automatic_secret_input()
+                        except Exception:
+                            automatic_mode = True
+                            if not automatic_failure_reported:
+                                automatic_failure_reported = True
+                                self.reporter(
+                                    "automatic secret-input state is unavailable for "
+                                    f"request {recipient.request_id} on "
+                                    f"{recipient.request.machine_alias}; Forward Input "
+                                    "is suppressed"
+                                )
+                        if automatic_mode:
+                            if automatic_attempts >= MAX_AUTOMATIC_SECRET_ATTEMPTS:
+                                if not automatic_failure_reported:
+                                    automatic_failure_reported = True
+                                    self.reporter(
+                                        "stored sudo password was rejected repeatedly for "
+                                        f"request {recipient.request_id} on "
+                                        f"{recipient.request.machine_alias}; Forward Input "
+                                        "is suppressed"
+                                    )
+                                continue
+                            automatic_submitted = False
                             try:
                                 automatic_submitted = self._try_automatic_secret(
                                     viewer, recipient, signature
                                 )
                             except Exception:
-                                automatic_attempted = True
+                                automatic_attempts += 1
+                                if not automatic_failure_reported:
+                                    automatic_failure_reported = True
+                                    self.reporter(
+                                        "automatic stored sudo password submission failed "
+                                        f"for request {recipient.request_id} on "
+                                        f"{recipient.request.machine_alias}; Forward Input "
+                                        "is suppressed"
+                                    )
+                            if automatic_submitted:
+                                automatic_attempts += 1
+                            elif not automatic_failure_reported:
+                                automatic_failure_reported = True
                                 self.reporter(
-                                    "automatic stored sudo password submission failed for "
-                                    f"request {recipient.request_id} on "
-                                    f"{recipient.request.machine_alias}; falling back to "
-                                    "operator authorization"
+                                    "automatic mode could not use a stored sudo password "
+                                    f"for request {recipient.request_id} on "
+                                    f"{recipient.request.machine_alias}; Forward Input is "
+                                    "suppressed"
                                 )
-                        if automatic_submitted:
-                            automatic_attempted = True
+                            continue
                         else:
                             self.reporter(
                                 "secret input requested by remote pane for request "
@@ -914,8 +949,6 @@ class SecretPromptPresenter:
         recipient: SecretInputRecipient,
         signature: bytes,
     ) -> bool:
-        if not self.automatic_secret_input():
-            return False
         endpoint = next(
             (
                 item.resolved

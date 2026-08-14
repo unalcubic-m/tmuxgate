@@ -390,6 +390,7 @@ class RealSshProcessTests(unittest.TestCase):
         viewer.prompt = b"operator@example's password:\n"
         submitted = []
         authorization_prompts = []
+        notifications = []
         viewer.submit_secret_line = submitted.append
 
         def deny(prompt):
@@ -400,19 +401,21 @@ class RealSshProcessTests(unittest.TestCase):
             authorizer=deny,
             secret_provider=lambda machine: b"must-not-be-sent",
             automatic_secret_input=lambda: True,
+            reporter=notifications.append,
             poll_seconds=0.005,
         )
         try:
             presenter.watch(viewer, secret_input_recipient(viewer))
             deadline = time.monotonic() + 1
-            while not authorization_prompts and time.monotonic() < deadline:
+            while not notifications and time.monotonic() < deadline:
                 time.sleep(0.01)
-            self.assertEqual(len(authorization_prompts), 1)
+            self.assertEqual(authorization_prompts, [])
             self.assertEqual(submitted, [])
+            self.assertTrue(any("suppressed" in item for item in notifications))
         finally:
             self.assertTrue(presenter.close())
 
-    def test_failed_automatic_submission_falls_back_to_operator_prompt(self):
+    def test_failed_automatic_submission_suppresses_operator_prompt(self):
         viewer = ScriptedDetachedViewer("dcdcdcdcdcdc")
         authorization_prompts = []
         notifications = []
@@ -436,11 +439,70 @@ class RealSshProcessTests(unittest.TestCase):
         try:
             presenter.watch(viewer, secret_input_recipient(viewer))
             deadline = time.monotonic() + 1
-            while not authorization_prompts and time.monotonic() < deadline:
+            while not notifications and time.monotonic() < deadline:
                 time.sleep(0.01)
-            self.assertEqual(len(authorization_prompts), 1)
-            self.assertTrue(any("falling back" in item for item in notifications))
+            self.assertEqual(authorization_prompts, [])
+            self.assertTrue(any("suppressed" in item for item in notifications))
             self.assertFalse(any("injected paste failure" in item for item in notifications))
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_repeated_sudo_prompts_get_three_automatic_attempts_without_modal(self):
+        class RetryingViewer(ScriptedDetachedViewer):
+            def __init__(self):
+                super().__init__("dcdedcdedcde")
+                self.signatures = iter(
+                    (
+                        self.prompt,
+                        None,
+                        self.prompt,
+                        None,
+                        self.prompt,
+                        None,
+                        self.prompt,
+                    )
+                )
+
+            def prompt_signature(self):
+                try:
+                    prompt = next(self.signatures)
+                except StopIteration:
+                    prompt = self.prompt
+                return None if prompt is None else secret_prompt_signature(prompt)
+
+        viewer = RetryingViewer()
+        submitted = []
+        authorization_prompts = []
+        notifications = []
+        viewer.submit_secret_line = submitted.append
+
+        def unexpected_authorization(prompt):
+            authorization_prompts.append(prompt)
+            return OperatorDecision.for_prompt(prompt, ApprovalDecision.DENIED)
+
+        presenter = SecretPromptPresenter(
+            authorizer=unexpected_authorization,
+            secret_provider=lambda machine: b"old-stored-password",
+            automatic_secret_input=lambda: True,
+            reporter=notifications.append,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer, secret_input_recipient(viewer))
+            deadline = time.monotonic() + 1
+            while len(submitted) < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(submitted, [b"old-stored-password"] * 3)
+            self.assertEqual(authorization_prompts, [])
+            deadline = time.monotonic() + 1
+            while (
+                not any("rejected repeatedly" in item for item in notifications)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertTrue(
+                any("rejected repeatedly" in item for item in notifications)
+            )
         finally:
             self.assertTrue(presenter.close())
 

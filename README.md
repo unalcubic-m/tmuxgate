@@ -37,8 +37,8 @@ being given a reusable interactive SSH shell. tmuxgate narrows that workflow:
 - stdout, stderr, exit status, job state, and checksums are collected through a
   durable, fail-closed lifecycle.
 - Exact default sudo prompts can receive an owner-only stored password
-  automatically. Missing credentials, non-sudo prompts, and manual mode retain
-  the separate request-bound terminal handoff.
+  automatically. Automation never opens a Forward Input window; manual mode
+  retains the separate request-bound terminal handoff.
 - A request may explicitly ask for `interactive` execution when the command
   genuinely needs a remote controlling terminal, such as `sudo` reading a
   password. Prompt detection and terminal handoff are offered only for those
@@ -426,20 +426,23 @@ labelled in the approval summary (`TERMINAL`), carries the
 `INTERACTIVE_TERMINAL` safety indicator, and shows `interactive: true` in the
 full evidence document. With Automation on and a password stored for the
 logical machine, an exact default `[sudo] password for <resolved-user>:` prompt
-receives that password automatically. The secret is attempted once for that
-viewer. A missing password, different prompt, or later retry falls back to the
-request-bound authorization that names the full request ID, machine, endpoint,
-approved command identity, and viewer session:
+receives that password automatically for up to three distinct prompt episodes.
+This lets sudo finish with its ordinary incorrect-password result if a stored
+password has changed. Automation never opens Forward Input: missing credentials,
+non-sudo prompts, and exhausted automatic attempts remain detached and are
+reported through activity and the command result. `tmuxgate attach REQUEST_ID`
+remains available for deliberate recovery.
+
+With Automation off (`approval_mode = "always"`), stored passwords are not
+submitted. A request-bound authorization names the full request ID, machine,
+endpoint, approved command identity, and viewer session:
 
 - in plain mode, type `forward <full-request-id>` on the trusted terminal;
 - in the Textual interface, use the Deny-default modal's deliberately armed
   Forward Input action.
 
-With Automation off (`approval_mode = "always"`), stored passwords are not
-submitted and this authorization is always required. Denying it leaves the
-command detached and still running; `tmuxgate attach REQUEST_ID` remains
-available for deliberate manual interaction. Prompt handling is offered only
-for requests that asked for `interactive` execution.
+Denying it leaves the command detached and still running. Prompt handling is
+offered only for requests that asked for `interactive` execution.
 
 **What is and is not recorded.** Reusable passwords are stored separately in
 the owner-only mode-`0600` state file `sudo-credentials.json`; they never enter
@@ -531,17 +534,14 @@ positive action while leaving the safe action visible.
 
 Remote password-like pane text is inspected only at the visible cursor row. In
 automatic mode, an exact resolved-user sudo prompt can receive the stored
-per-machine password once. Before tmuxgate attaches
-the broker terminal to a detached viewer, a separate card identifies the full
-request ID, logical machine, endpoint, approved argv or script digest, and the
-remote-input action. Plain mode requires `forward <full-request-id>` on the
-trusted terminal. The TUI shows the same exact recipient and binding in a
-Deny-default modal with a deliberately armed Forward Input action. This
-authorization is used whenever Automation is off, no credential exists, the
-prompt is not the exact sudo form, or the automatic attempt has already been
-used; denial leaves the command detached, while
-`tmuxgate attach REQUEST_ID` remains available for deliberate manual
-interaction.
+per-machine password for up to three fresh prompt episodes. Automatic mode
+never queues a terminal-input decision. If automatic input cannot be used or
+sudo rejects it repeatedly, activity reports the failure and the command stays
+detached until it exits or the operator deliberately runs
+`tmuxgate attach REQUEST_ID`. With Automation off, a separate card identifies
+the full request ID, logical machine, endpoint, approved argv or script digest,
+and remote-input action. Plain mode requires `forward <full-request-id>`; the
+TUI shows the same binding in a Deny-default Forward Input modal.
 
 If initial OpenSSH master setup exits, tmuxgate captures bounded complete stderr
 diagnostics as exact bytes for the structured operator decision without copying

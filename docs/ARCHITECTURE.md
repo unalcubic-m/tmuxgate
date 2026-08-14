@@ -493,7 +493,7 @@ disables the positive action until the terminal is large enough to inspect the
 complete evidence again.
 
 The TUI supports execution approval, bounded SSH retry, separately authorized
-adjacent-route fallback, exact secret-input authorization, reusable sudo
+adjacent-route fallback, manual-mode secret-input authorization, reusable sudo
 password management, and request-bound local machine-disable decisions. Its
 Dashboard button switches between automatic and manual approval, while the
 Machines button stores, replaces, or removes one password per logical machine.
@@ -508,7 +508,7 @@ safe default.
 
 Focus follows the same fence. Every decision modal opens with its safe action
 focused and its positive action disabled. When the fence elapses on execution
-approval and secret-input authorization, focus moves to the positive action so
+approval and manual-mode secret-input authorization, focus moves to the positive action so
 one Return commits the routine decision; SSH retry, adjacent-route fallback, and
 machine-disable keep the safe action focused because their positive action is
 not the routine outcome. A compact terminal keeps the safe action focused in
@@ -522,7 +522,9 @@ interface to be idle instead of competing with an open decision, and otherwise
 uses the identical claim-then-suspend sequence.
 
 The interface tracks three synchronized foreground ownership states: `tui`,
-`modal`, and `external`. A positive secret-input modal result atomically reserves
+`modal`, and `external`. This secret-input modal path is reachable only in
+manual approval mode; automatic mode never queues it. A positive secret-input
+modal result atomically reserves
 `external` ownership for that exact prompt ID before its waiting worker is
 released. The SSH handoff reserves that same single slot under its own
 one-shot token, so an authentication session and a secret session can never
@@ -655,8 +657,12 @@ slots continue independently.
 `approval_mode = "disabled"` is the default automatic policy: Codex approval is
 sufficient and no tmuxgate execution confirmation is shown. When the dashboard
 has a password for the target machine, the same policy also enables automatic
-sudo input. `approval_mode = "always"` disables stored-password submission and
-enables the execution approval UI. Its compact decision card contains advisory
+sudo input for up to three distinct prompt episodes. Repeated rejection lets
+sudo return its ordinary failure without opening terminal input.
+`approval_mode = "always"` disables stored-password submission and
+enables the execution and secret-input approval UI. Automatic mode suppresses
+the Forward Input UI even when a password is missing, rejected, or presented to
+a non-sudo prompt. Its compact decision card contains advisory
 purpose, logical machine, selected route and resolved identity, host-key status,
 working directory, a JSON-quoted shell-escaped argv view or script identity/source,
 environment, timeout, and human-readable advisories. Enter/`y` approves, `n`
@@ -677,13 +683,17 @@ exact default `[sudo] password for <resolved-user>:` form (plus bounded literal
 sudo `pwfeedback` stars), loads the per-machine password through tmux stdin,
 pastes and deletes that private named buffer, and reports only that submission
 occurred. The secret never appears in a child argument, environment, activity,
-canonical stream, spool, or durable job record. One automatic attempt is
-allowed per viewer so a bad credential cannot loop into account lockout.
+canonical stream, spool, or durable job record. One automatic submission is
+allowed per distinct prompt episode, capped at three per viewer. That bounded
+retry lets sudo finish its ordinary incorrect-password path without looping
+into account lockout.
 
-If automation is off, no credential exists, the prompt differs, or the one
-attempt was used, the presenter asks the operator to authorize the exact
-request, logical machine, approved command identity, connection plan, endpoint,
-and isolated viewer session. Authorization requires typing the full
+When automation is on, a missing credential, a different prompt, submission
+failure, or exhausted retry budget is reported without queuing Forward Input;
+the command stays detached to exit or time out. If automation is off, the
+presenter asks the operator to authorize the exact request, logical machine,
+approved command identity, connection plan, endpoint, and isolated viewer
+session. Authorization requires typing the full
 `forward <32-character request ID>` phrase on the broker's `/dev/tty`; Enter or
 an explicit denial denies. Socket/MCP data, request bytes, remote pane content,
 and process stdin are not input sources for this prompt. A stale prompt ID,
@@ -737,9 +747,8 @@ Normal completion closes the remote pane and local viewer automatically;
 canonical capture does not depend on pane history.
 
 In plain mode, one process-local `TerminalArbiter` serializes dashboard
-transactions, the optional execution approval UI, fallback secret-input
-authorization,
-fallback approval, interactive first-master SSH authentication, and approved
+transactions, the optional execution approval UI, manual secret-input
+authorization, fallback approval, interactive first-master SSH authentication, and approved
 viewer attachments. The dashboard polls for a
 complete canonical `/dev/tty` line in bounded slices without retaining a lease
 while idle. It acquires the lowest-priority lease only immediately before

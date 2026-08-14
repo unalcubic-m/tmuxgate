@@ -1274,8 +1274,11 @@ class PlainTerminalInterface:
     ) -> OperatorDecision:
         if not isinstance(prompt, SecretInputAuthorizationPrompt):
             raise TypeError("prompt must be a SecretInputAuthorizationPrompt")
-        # This is the fallback for missing, rejected, or disabled automatic
-        # sudo input, and remains an exact independent terminal decision.
+        if self.approval_mode == "disabled":
+            return self._prompts.decide_without_presentation(
+                prompt, ApprovalDecision.DENIED
+            )
+        # Manual approval mode retains an exact independent terminal decision.
         return self._request(prompt)
 
     def run_external_terminal_session(
