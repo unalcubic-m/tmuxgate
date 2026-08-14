@@ -352,6 +352,118 @@ class RealSshProcessTests(unittest.TestCase):
         finally:
             self.assertTrue(presenter.close())
 
+    def test_stored_sudo_password_is_submitted_without_operator_prompt(self):
+        viewer = ScriptedDetachedViewer("dadadadadada")
+        submitted = []
+        authorization_prompts = []
+        notifications = []
+        viewer.submit_secret_line = submitted.append
+
+        def unexpected_authorization(prompt):
+            authorization_prompts.append(prompt)
+            return OperatorDecision.for_prompt(prompt, ApprovalDecision.DENIED)
+
+        presenter = SecretPromptPresenter(
+            authorizer=unexpected_authorization,
+            secret_provider=lambda machine: (
+                b"stored-sudo-password" if machine == "app-server" else None
+            ),
+            automatic_secret_input=lambda: True,
+            reporter=notifications.append,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer, secret_input_recipient(viewer))
+            deadline = time.monotonic() + 1
+            while not submitted and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(submitted, [b"stored-sudo-password"])
+            self.assertEqual(authorization_prompts, [])
+            self.assertTrue(any("submitted automatically" in item for item in notifications))
+            time.sleep(0.05)
+            self.assertEqual(len(submitted), 1)
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_non_sudo_password_prompt_never_receives_stored_secret(self):
+        viewer = ScriptedDetachedViewer("dbdbdbdbdbdb")
+        viewer.prompt = b"operator@example's password:\n"
+        submitted = []
+        authorization_prompts = []
+        viewer.submit_secret_line = submitted.append
+
+        def deny(prompt):
+            authorization_prompts.append(prompt)
+            return OperatorDecision.for_prompt(prompt, ApprovalDecision.DENIED)
+
+        presenter = SecretPromptPresenter(
+            authorizer=deny,
+            secret_provider=lambda machine: b"must-not-be-sent",
+            automatic_secret_input=lambda: True,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer, secret_input_recipient(viewer))
+            deadline = time.monotonic() + 1
+            while not authorization_prompts and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(authorization_prompts), 1)
+            self.assertEqual(submitted, [])
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_failed_automatic_submission_falls_back_to_operator_prompt(self):
+        viewer = ScriptedDetachedViewer("dcdcdcdcdcdc")
+        authorization_prompts = []
+        notifications = []
+
+        def fail_submission(secret):
+            self.assertEqual(secret, b"stored-sudo-password")
+            raise TransportError("injected paste failure")
+
+        def deny(prompt):
+            authorization_prompts.append(prompt)
+            return OperatorDecision.for_prompt(prompt, ApprovalDecision.DENIED)
+
+        viewer.submit_secret_line = fail_submission
+        presenter = SecretPromptPresenter(
+            authorizer=deny,
+            secret_provider=lambda machine: b"stored-sudo-password",
+            automatic_secret_input=lambda: True,
+            reporter=notifications.append,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer, secret_input_recipient(viewer))
+            deadline = time.monotonic() + 1
+            while not authorization_prompts and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(authorization_prompts), 1)
+            self.assertTrue(any("falling back" in item for item in notifications))
+            self.assertFalse(any("injected paste failure" in item for item in notifications))
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_secret_submission_uses_stdin_not_process_arguments(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        viewer = DetachedTmuxViewerProcess(
+            run,
+            Path("/tmp/dfdfdfdfdfdf.sock"),
+            "tmuxgate-dfdfdfdfdfdf",
+        )
+        viewer.submit_secret_line(b"private value with spaces")
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1]["input"], b"private value with spaces\n")
+        self.assertNotIn("private value with spaces", repr(calls[0][0]))
+        self.assertIn("load-buffer", calls[0][0])
+        self.assertIn("paste-buffer", calls[1][0])
+
     def test_stale_secret_authorization_cannot_attach_terminal(self):
         viewer = ScriptedDetachedViewer("efefefefefef")
         recipient = secret_input_recipient(viewer)

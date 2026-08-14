@@ -21,6 +21,7 @@ from tmuxgate.settings import (
     ConfigWriteConflictError,
     publish_edited_config,
     serialize_config,
+    set_approval_mode,
     set_machine_enabled,
 )
 from test_config import valid_config
@@ -65,6 +66,17 @@ class SettingsCommandTests(unittest.TestCase):
             b'[mcp]\nhost = "127.0.0.1"\nport = 8765\n',
             content,
         )
+
+    def test_dashboard_approval_switch_persists_immediately(self):
+        updated, changed = set_approval_mode(self.path, "always")
+        self.assertTrue(changed)
+        self.assertEqual(updated.broker.approval_mode, "always")
+        self.assertEqual(load_config(self.path).broker.approval_mode, "always")
+        _same, changed = set_approval_mode(self.path, "always")
+        self.assertFalse(changed)
+        updated, changed = set_approval_mode(self.path, "disabled")
+        self.assertTrue(changed)
+        self.assertEqual(updated.broker.approval_mode, "disabled")
 
     def test_list_and_structured_add_remove_are_atomic_and_need_no_remote(self):
         output = io.StringIO()

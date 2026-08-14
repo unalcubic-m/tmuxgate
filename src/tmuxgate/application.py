@@ -14,6 +14,7 @@ from tmuxgate.broker import BrokerServer
 from tmuxgate.broker_api import BrokerControlService
 from tmuxgate.config import AppConfig, Machine, load_config
 from tmuxgate.connection_plan import ConnectionPlan
+from tmuxgate.credentials import SudoCredentialStore
 from tmuxgate.executor import RealExecutor
 from tmuxgate.fake import FakeExecution
 from tmuxgate.mcp_server import (
@@ -49,7 +50,7 @@ from tmuxgate.runtime import (
     prepare_runtime_layout,
 )
 from tmuxgate.spool import ResultSpool
-from tmuxgate.settings import set_machine_enabled
+from tmuxgate.settings import set_approval_mode, set_machine_enabled
 from tmuxgate.scheduler import RequestState
 from tmuxgate.ssh import ResolvedSshEndpoint, resolve_ssh_endpoint
 from tmuxgate.ssh_key import AutoSshKeyManager
@@ -80,11 +81,6 @@ class _ZeroFakeExecutor:
     def __call__(self, request_id: str, request: RequestSpec) -> FakeExecution:
         del request_id, request
         return FakeExecution()
-
-
-def _approve_without_prompt(*arguments: object, **keywords: object) -> ApprovalDecision:
-    del arguments, keywords
-    return ApprovalDecision.APPROVED
 
 
 class UnifiedApplication:
@@ -149,12 +145,14 @@ class UnifiedApplication:
             state_dir=self._state_dir,
         )
         bearer_token = load_or_create_mcp_token(paths.state_dir)
+        credential_store = SudoCredentialStore(paths.state_dir)
         if self._operator_interface is not None:
             operator = self._operator_interface
         elif self._textual:
             operator = TextualOperatorInterface(
                 self._terminal,
                 approval_mode=config.broker.approval_mode,
+                credential_store=credential_store,
             )
         else:
             operator = PlainTerminalInterface(
@@ -162,6 +160,13 @@ class UnifiedApplication:
                 dashboard=self._dashboard,
                 approval_mode=config.broker.approval_mode,
             )
+        if isinstance(operator, TextualOperatorInterface):
+            def set_automatic_mode(enabled: bool) -> str:
+                mode = "disabled" if enabled else "always"
+                set_approval_mode(self._config_path, mode)
+                return mode
+
+            operator.bind_automation_setter(set_automatic_mode)
         clean = True
         pool: MasterTransportPool | None = None
         prompt_presenter: SecretPromptPresenter | None = None
@@ -211,20 +216,17 @@ class UnifiedApplication:
             )
 
             if self._fake:
-                if config.broker.approval_mode == "always":
-                    def approver(request_id: str, request: RequestSpec) -> ApprovalDecision:
-                        prompt = ExecutionApprovalPrompt.create(
-                            request_id,
-                            request,
-                            None,
-                            unbound_fake=True,
-                        )
-                        return require_operator_decision(
-                            prompt,
-                            operator.request_execution_approval(prompt),
-                        )
-                else:
-                    approver = _approve_without_prompt
+                def approver(request_id: str, request: RequestSpec) -> ApprovalDecision:
+                    prompt = ExecutionApprovalPrompt.create(
+                        request_id,
+                        request,
+                        None,
+                        unbound_fake=True,
+                    )
+                    return require_operator_decision(
+                        prompt,
+                        operator.request_execution_approval(prompt),
+                    )
                 selected_executor = _ZeroFakeExecutor()
                 def approval_discarder(request_id: str) -> None:
                     return None
@@ -232,37 +234,29 @@ class UnifiedApplication:
                 def delivery_observer(request_id: str, delivered: bool) -> None:
                     return None
             else:
-                if config.broker.approval_mode == "always":
-                    def bound_approver(
-                        request_id: str,
-                        request: RequestSpec,
-                        connection_plan: ConnectionPlan,
-                    ) -> ApprovalDecision:
-                        prompt = ExecutionApprovalPrompt.create(
-                            request_id,
-                            request,
-                            connection_plan,
-                        )
-                        return require_operator_decision(
-                            prompt,
-                            operator.request_execution_approval(prompt),
-                        )
-
-                    planner = BoundRequestPlanner(
-                        config,
-                        approver=bound_approver,
-                        machine_enabled=availability.is_enabled,
+                def bound_approver(
+                    request_id: str,
+                    request: RequestSpec,
+                    connection_plan: ConnectionPlan,
+                ) -> ApprovalDecision:
+                    prompt = ExecutionApprovalPrompt.create(
+                        request_id,
+                        request,
+                        connection_plan,
+                    )
+                    return require_operator_decision(
+                        prompt,
+                        operator.request_execution_approval(prompt),
                     )
 
-                    def approver(request_id: str, request: RequestSpec) -> ApprovalDecision:
-                        return planner(request_id, request)
-                else:
-                    planner = BoundRequestPlanner(
-                        config,
-                        approver=_approve_without_prompt,
-                        machine_enabled=availability.is_enabled,
-                    )
-                    approver = planner
+                planner = BoundRequestPlanner(
+                    config,
+                    approver=bound_approver,
+                    machine_enabled=availability.is_enabled,
+                )
+
+                def approver(request_id: str, request: RequestSpec) -> ApprovalDecision:
+                    return planner(request_id, request)
 
                 def revalidate(resolved: ResolvedSshEndpoint) -> ResolvedSshEndpoint:
                     machine = config.machines[resolved.machine_name]
@@ -301,6 +295,15 @@ class UnifiedApplication:
                 prompt_presenter = SecretPromptPresenter(
                     terminal_lock=self._terminal,
                     authorizer=operator.request_secret_input_authorization,
+                    secret_provider=credential_store.password_for,
+                    automatic_secret_input=lambda: (
+                        getattr(
+                            operator,
+                            "approval_mode",
+                            config.broker.approval_mode,
+                        )
+                        == "disabled"
+                    ),
                     terminal_handoff=operator.run_external_terminal_session,
                     reporter=lambda message: operator.publish_activity(
                         OperationalActivity.create(
@@ -427,6 +430,7 @@ class UnifiedApplication:
                             alias=name,
                             description=machine.description,
                             enabled=availability.is_enabled(name),
+                            sudo_password=credential_store.has_password(name),
                             ssh_state=(
                                 "retained"
                                 if name in retained
@@ -446,7 +450,7 @@ class UnifiedApplication:
                     return DashboardRuntimeSnapshot(
                         ready=services_ready[0],
                         listener=f"http://{config.mcp.host}:{config.mcp.port}/mcp",
-                        approval_mode=config.broker.approval_mode,
+                        approval_mode=operator.approval_mode,
                         machines=machines,
                         jobs=jobs,
                         active_job_count=sum(
@@ -567,8 +571,8 @@ class UnifiedApplication:
         if config.broker.approval_mode == "disabled":
             operator.publish_activity(
                 OperationalActivity.create(
-                    ActivityKind.WARNING,
-                    "WARNING: authenticated requests run without per-command approval.",
+                    ActivityKind.STARTUP,
+                    "Automation is on: Codex approval is sufficient for execution.",
                 )
             )
 

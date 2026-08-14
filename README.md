@@ -17,10 +17,11 @@ transport.
 > [!WARNING]
 > tmuxgate is pre-1.0 security-sensitive software. Review the threat model,
 > configuration, bearer-token handling, and approval mode before using it on
-> important systems. The default `approval_mode = "disabled"` does not ask for
-> confirmation after an authenticated request passes broker validation. Set it
-> to `"always"` when every request should require an explicit decision in the
-> tmuxgate terminal.
+> important systems. The default `approval_mode = "disabled"` treats the Codex
+> tool approval as the operator decision and does not ask again in tmuxgate.
+> A reusable password configured in the dashboard can then be submitted
+> automatically at an exact sudo prompt. Turn Automation off in the dashboard
+> (or set `approval_mode = "always"`) to restore tmuxgate-owned decisions.
 
 ## Why tmuxgate
 
@@ -35,10 +36,9 @@ being given a reusable interactive SSH shell. tmuxgate narrows that workflow:
   viewer. Existing remote sessions are not reused or modified.
 - stdout, stderr, exit status, job state, and checksums are collected through a
   durable, fail-closed lifecycle.
-- Password and passphrase prompt detection produces an operator notification;
-  forwarding controlling-terminal input requires a separate exact
-  request-bound authorization, and tmuxgate does not read or store entered
-  secret bytes.
+- Exact default sudo prompts can receive an owner-only stored password
+  automatically. Missing credentials, non-sudo prompts, and manual mode retain
+  the separate request-bound terminal handoff.
 - A request may explicitly ask for `interactive` execution when the command
   genuinely needs a remote controlling terminal, such as `sudo` reading a
   password. Prompt detection and terminal handoff are offered only for those
@@ -115,12 +115,11 @@ the official Python MCP SDK and Uvicorn are installed inside the isolated
 environment.
 
 The installer never starts tmuxgate in the background. After it completes,
-run `tmuxgate` in the trusted terminal that should own the dashboard,
-approvals, and interactive authentication. If the existing configuration has
-`approval_mode = "disabled"`, installation stops before Codex or launcher
-changes. Either change the file-based policy to `"always"`, or review the risk
-and explicitly rerun with `--allow-disabled-approvals`; possession of the
-bearer token then permits execution without a per-request terminal decision.
+run `tmuxgate` in the trusted terminal that should own the dashboard and
+interactive authentication. The packaged example uses
+`approval_mode = "disabled"`, so Codex approval is sufficient without a second
+tmuxgate prompt. The dashboard Automation button changes this immediately and
+persists it for the next launch.
 
 Existing Codex or shell-profile files are backed up with owner-only
 permissions below `$XDG_DATA_HOME/tmuxgate/backups` before managed changes.
@@ -129,9 +128,8 @@ release, Codex configuration, and shell profiles without overwriting a
 concurrent edit. A release that may already have been observed by a process is
 retained instead of being deleted. A conflicting Codex registration named
 `tmuxgate` is refused unless `--replace-codex` is explicitly given. Other
-useful options are `--no-codex`, `--no-shell-integration`, and
-`--allow-disabled-approvals`; run `./install.sh --help` for the complete
-interface.
+useful options are `--no-codex` and `--no-shell-integration`; run
+`./install.sh --help` for the complete interface.
 
 After a successful install, the installer keeps the three most recent releases
 and removes older ones, naming each directory it removes. Each release is a
@@ -423,46 +421,45 @@ onto a PTY. Only `/dev/tty` carries the prompt and the reply, so the canonical
 prompt and password bytes. Their limits, digests, and collection rules are
 identical to a non-interactive job.
 
-**Approval and handoff are two separate decisions.** An interactive request is
+**Codex approval is sufficient in automatic mode.** An interactive request is
 labelled in the approval summary (`TERMINAL`), carries the
 `INTERACTIVE_TERMINAL` safety indicator, and shows `interactive: true` in the
-full evidence document. Approving execution does *not* authorize typing into
-the command. When a password-like prompt is then detected in the viewer pane,
-tmuxgate raises a second, request-bound authorization that names the full
-request ID, machine, endpoint, approved argv or script digest, and viewer
-session:
+full evidence document. With Automation on and a password stored for the
+logical machine, an exact default `[sudo] password for <resolved-user>:` prompt
+receives that password automatically. The secret is attempted once for that
+viewer. A missing password, different prompt, or later retry falls back to the
+request-bound authorization that names the full request ID, machine, endpoint,
+approved command identity, and viewer session:
 
 - in plain mode, type `forward <full-request-id>` on the trusted terminal;
 - in the Textual interface, use the Deny-default modal's deliberately armed
   Forward Input action.
 
-This authorization is mandatory even when `approval_mode = "disabled"`. Denying
-it leaves the command detached and still running; `tmuxgate attach REQUEST_ID`
-remains available for deliberate manual interaction. While attached, the tmux
-prefix followed by `d` ends the handoff at any time. Prompt detection is
-notification only, and it is offered only for requests that asked for
-`interactive` execution.
+With Automation off (`approval_mode = "always"`), stored passwords are not
+submitted and this authorization is always required. Denying it leaves the
+command detached and still running; `tmuxgate attach REQUEST_ID` remains
+available for deliberate manual interaction. Prompt handling is offered only
+for requests that asked for `interactive` execution.
 
-**What is and is not recorded.** Typed bytes go to the remote controlling
-terminal only. tmuxgate does not read, buffer, transform, log, or store them:
-they do not enter the captured `stdout`/`stderr`, the verified result spool,
-durable job state, or the operator interface, and `capture-pane` is never a
-canonical result source. `sudo` disables terminal echo while reading, so the
-password does not appear in the pane either.
+**What is and is not recorded.** Reusable passwords are stored separately in
+the owner-only mode-`0600` state file `sudo-credentials.json`; they never enter
+ordinary configuration, activity text, process arguments, captured
+`stdout`/`stderr`, the verified result spool, or durable job records. Automatic
+submission loads a private named tmux buffer through stdin, pastes it, and
+deletes it. Manual input still flows directly to the remote terminal. `sudo`
+disables terminal echo while reading.
 
 **Remote `sudo` prerequisites.** The remote account needs its own working sudo
-rule; tmuxgate never becomes root itself and never supplies a password. The
+rule; tmuxgate never becomes root itself but can supply the dashboard-stored
+password. The
 command runs under `env -i` with the fixed `/usr/bin:/bin` path, so invoke
 `/usr/bin/sudo` by absolute path. Every request gets a fresh remote tmux session
 and terminal, so with sudo's usual per-terminal timestamp policy a credential
 cached by another session does not apply and the prompt appears again.
 
-**Rejected alternatives.** tmuxgate does not support `sudo -S`, piped or
-environment-supplied passwords, or any stored credential: those route the secret
-through the broker and the captured streams, which is exactly what the
-`/dev/tty` handoff avoids. It also does not encourage root SSH login or broad
-`NOPASSWD` rules as a way to avoid the prompt; both replace a per-command
-decision with standing privilege.
+tmuxgate still does not use `sudo -S`, command-line passwords, environment
+passwords, root SSH login, or broad `NOPASSWD` rules. Automatic input goes only
+to the already-bound interactive viewer's exact default sudo prompt.
 
 > [!WARNING]
 > A terminal handoff gives the remote program your keystrokes. Suppressing echo
@@ -532,14 +529,17 @@ an authorized external viewer. Foreground ownership is re-proved on each
 dashboard refresh, and a terminal below 72×20 hides evidence and disables the
 positive action while leaving the safe action visible.
 
-Remote password-like pane text is notification only. Before tmuxgate attaches
+Remote password-like pane text is inspected only at the visible cursor row. In
+automatic mode, an exact resolved-user sudo prompt can receive the stored
+per-machine password once. Before tmuxgate attaches
 the broker terminal to a detached viewer, a separate card identifies the full
 request ID, logical machine, endpoint, approved argv or script digest, and the
 remote-input action. Plain mode requires `forward <full-request-id>` on the
 trusted terminal. The TUI shows the same exact recipient and binding in a
 Deny-default modal with a deliberately armed Forward Input action. This
-authorization remains mandatory when
-`approval_mode = "disabled"`; denial leaves the command detached, while
+authorization is used whenever Automation is off, no credential exists, the
+prompt is not the exact sudo form, or the automatic attempt has already been
+used; denial leaves the command detached, while
 `tmuxgate attach REQUEST_ID` remains available for deliberate manual
 interaction.
 
@@ -581,9 +581,10 @@ policy and resolved-identity digests shown in approval evidence.
 
 tmuxgate is designed to fail closed around route evidence, effective SSH
 configuration, host-key validation, request binding, remote-start state,
-result collection, and cleanup. It never stores SSH or sudo passwords: an
-interactive command reads them from the remote controlling terminal after a
-separate, single-request operator authorization. Normal
+result collection, and cleanup. It can store one reusable sudo password per
+logical machine in an owner-only state file and submit it to an exact bound
+sudo prompt. SSH enrollment passwords and all non-sudo prompts remain
+terminal-owned. Normal
 successful jobs are collected and remotely cleaned automatically; the
 standalone remote-cleanup surface remains disabled until it can provide the
 same durable guarantees.
@@ -591,10 +592,10 @@ same durable guarantees.
 Loopback TCP does not provide the peer-UID authentication of the broker's Unix
 socket. The MCP endpoint therefore requires the owner-only bearer token before
 MCP request parsing and accepts only the configured loopback listener. Anyone
-who obtains that token can submit requests. In particular, with
-`approval_mode = "disabled"`, token possession is sufficient to cause remote
-execution without a per-command decision. Never log, share, commit, or place
-the token in `config.toml`.
+who obtains that token can submit requests. With Automation on, token possession
+is sufficient to cause remote execution and a matching interactive sudo request
+may consume the stored password. Never log, share, or commit the token or
+`sudo-credentials.json`, and never place either secret in `config.toml`.
 
 tmuxgate is not a privilege boundary when a client and broker run as the same
 Unix account. That account can normally access the same configuration, SSH

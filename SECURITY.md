@@ -78,12 +78,13 @@ started with no terminal at all. Both handoffs — SSH authentication and secret
 input — reserve the same single exclusive ownership slot and suspend the
 full-screen interface before a trusted process reads.
 
-Secret input is a separate ownership boundary. Prompt-like remote output is
-notification only. After an exact request-, command-, route-, endpoint-, and
-viewer-bound authorization, Textual leaves application mode and stops reading
-the terminal before the trusted external viewer receives `/dev/tty`. The TUI
-does not inspect, buffer, transform, retain, or log those bytes and must restore
-the previous screen and terminal modes on every return path.
+Manual secret input is a separate ownership boundary. After an exact request-,
+command-, route-, endpoint-, and viewer-bound authorization, Textual leaves
+application mode and stops reading the terminal before the trusted external
+viewer receives `/dev/tty`. In automatic mode, an exact default sudo prompt for
+the resolved SSH user may instead receive the owner-only stored per-machine
+password once. Manual bytes are not retained; stored bytes are kept only in the
+mode-`0600` credential file and a short-lived private tmux buffer.
 
 ## Interactive remote execution
 
@@ -95,15 +96,16 @@ non-interactive command runs in a session with no controlling terminal and
 cannot open `/dev/tty` at all; prompt detection and terminal handoff are not
 offered for it.
 
-Approving execution never authorizes typing into the command. The handoff is a
-second, single-request decision that remains mandatory when
-`approval_mode = "disabled"`, and denying it leaves the command running and
-detached. Typed bytes reach the remote controlling terminal only: they are not
-read, stored, or logged by tmuxgate and never enter the captured stdout/stderr,
-the verified result spool, durable state, or the operator interface. tmuxgate
-never stores a sudo or SSH password and does not support `sudo -S`, piped, or
-environment-supplied passwords, which would route the secret through the broker
-and the captured streams.
+With Automation on, approving an interactive Codex request also authorizes one
+stored-password submission if its viewer emits the exact resolved-user sudo
+prompt. Prompt text cannot prove that the remote program really is sudo, so an
+accepted interactive command can deliberately imitate that prompt and consume
+the stored password; Codex approval is therefore the security decision for
+both command execution and this credential use. Automation off restores the
+second single-request handoff decision. Passwords never enter captured
+stdout/stderr, the verified result spool, durable job records, activity text,
+child arguments, or environment. tmuxgate still does not support `sudo -S`,
+piped passwords, or environment-supplied passwords.
 
 The residual risk is inherent to a handoff: while attached, the remote program
 receives the operator's keystrokes, and suppressing echo is that program's
@@ -153,8 +155,8 @@ by a public-key-only master before any requested command starts. Reports that
 show another identity or authentication method can influence a post-enrollment
 connection are security-boundary reports.
 
-Installation does not change `approval_mode`. When it is `disabled`, anyone
-who obtains the MCP token can submit commands without a per-request terminal
-approval. The installer refuses Codex integration in this condition unless the
-operator explicitly supplies `--allow-disabled-approvals`; use the file-based
-policy `always` when terminal confirmation is required.
+Installation does not change `approval_mode` and accepts the default automatic
+mode. Anyone who obtains the MCP token can submit commands without a
+per-request terminal approval and can consume a stored sudo password through a
+matching interactive prompt. Use the dashboard Automation switch or the
+file-based policy `always` when tmuxgate-terminal confirmation is required.

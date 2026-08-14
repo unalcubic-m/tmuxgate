@@ -234,12 +234,12 @@ releases and backups for operator recovery. The application itself is never
 started, stopped, or killed by the installer: `tmuxgate` must still run in the
 foreground in the terminal that owns approvals and authentication.
 
-If the preserved configuration has `approval_mode = "disabled"`, installation
-stops before Codex and launcher mutation unless the operator supplies
-`--allow-disabled-approvals`. Registration does not weaken or override that
-policy: the bearer token alone authorizes execution requests in this mode,
-whereas `approval_mode = "always"` retains the independent broker-terminal
-decision.
+The packaged configuration uses `approval_mode = "disabled"`, and installation
+accepts that automatic policy without a second acknowledgement flag. The
+bearer token plus Codex's tool approval authorizes execution in this mode;
+`approval_mode = "always"` restores the independent broker-terminal decision.
+The dashboard switch applies this change to the running operator interface and
+atomically persists it for the next launch.
 
 Configuration edits are validated and atomically published but require a
 restart. Direct-home enrollment still requires complete local link,
@@ -493,10 +493,11 @@ disables the positive action until the terminal is large enough to inspect the
 complete evidence again.
 
 The TUI supports execution approval, bounded SSH retry, separately authorized
-adjacent-route fallback, exact secret-input authorization, and request-bound
-local machine-disable decisions. It may run with either approval mode: disabled
-execution approval is still automatic, but never disables secret-input
-authorization. Its presenter thread remains the sole FIFO consumer,
+adjacent-route fallback, exact secret-input authorization, reusable sudo
+password management, and request-bound local machine-disable decisions. Its
+Dashboard button switches between automatic and manual approval, while the
+Machines button stores, replaces, or removes one password per logical machine.
+Its presenter thread remains the sole FIFO consumer,
 but it schedules each supported prompt through Textual's thread-safe
 `call_from_thread` boundary. The UI thread creates one modal for that exact
 immutable queued item and returns its result through a callback which retains
@@ -651,10 +652,11 @@ Detaching while a command runs does not release that request's lease. An
 uncertain job holds its own lease in recovery-required state; other configured
 slots continue independently.
 
-`approval_mode = "disabled"` is the default and performs no execution
-confirmation prompt after authentication and broker validation. It does not
-disable secret-input authorization. `approval_mode = "always"` enables the
-execution approval UI. Its compact decision card contains advisory
+`approval_mode = "disabled"` is the default automatic policy: Codex approval is
+sufficient and no tmuxgate execution confirmation is shown. When the dashboard
+has a password for the target machine, the same policy also enables automatic
+sudo input. `approval_mode = "always"` disables stored-password submission and
+enables the execution approval UI. Its compact decision card contains advisory
 purpose, logical machine, selected route and resolved identity, host-key status,
 working directory, a JSON-quoted shell-escaped argv view or script identity/source,
 environment, timeout, and human-readable advisories. Enter/`y` approves, `n`
@@ -670,12 +672,18 @@ process stdin, and client-supplied purpose text cannot answer it.
 Each SSH viewer runs in a separate owner-only local tmux server below the
 runtime directory. A broker-owned monitor checks only the visible cursor row of
 each viewer for a password or passphrase prompt; this deliberately ignores the
-nested remote tmux status row below it. A match publishes a notification and
-enters one shared FIFO, but never attaches the broker terminal by itself. The
-presenter first asks the operator to authorize the exact request, logical
-machine, approved argv or script identity, connection plan, endpoint, and
-isolated viewer session. The trusted display states that typed bytes will be
-sent to the remote process. Authorization requires typing the full
+nested remote tmux status row below it. In automatic mode, it accepts only the
+exact default `[sudo] password for <resolved-user>:` form (plus bounded literal
+sudo `pwfeedback` stars), loads the per-machine password through tmux stdin,
+pastes and deletes that private named buffer, and reports only that submission
+occurred. The secret never appears in a child argument, environment, activity,
+canonical stream, spool, or durable job record. One automatic attempt is
+allowed per viewer so a bad credential cannot loop into account lockout.
+
+If automation is off, no credential exists, the prompt differs, or the one
+attempt was used, the presenter asks the operator to authorize the exact
+request, logical machine, approved command identity, connection plan, endpoint,
+and isolated viewer session. Authorization requires typing the full
 `forward <32-character request ID>` phrase on the broker's `/dev/tty`; Enter or
 an explicit denial denies. Socket/MCP data, request bytes, remote pane content,
 and process stdin are not input sources for this prompt. A stale prompt ID,
@@ -683,10 +691,11 @@ binding, request, command, endpoint, or viewer cannot resolve a replacement
 prompt. Only after an Approved decision does the presenter request an exclusive
 presentation-layer handoff, then revalidate the still-live viewer and
 still-visible prompt and attach to the resolved broker-owned terminal device.
-In Textual mode this happens only while the application is suspended. The prompt
-matcher accepts at most 256 literal ASCII sudo `pwfeedback` stars after an
-otherwise valid cursor-row prompt, including fewer stars after backspacing; it
-does not accept arbitrary suffix text or alternate mask characters.
+In Textual mode this happens only while the application is suspended. The
+general prompt matcher accepts at most 256 literal ASCII sudo `pwfeedback`
+stars after an otherwise valid cursor-row prompt, including fewer stars after
+backspacing; it does not accept arbitrary suffix text or alternate mask
+characters.
 
 The presenter has no typing-speed, authentication-check, or retry timeout.
 While the underlying approved job remains active, an attachment remains open
@@ -728,7 +737,7 @@ Normal completion closes the remote pane and local viewer automatically;
 canonical capture does not depend on pane history.
 
 In plain mode, one process-local `TerminalArbiter` serializes dashboard
-transactions, the optional execution approval UI, mandatory secret-input
+transactions, the optional execution approval UI, fallback secret-input
 authorization,
 fallback approval, interactive first-master SSH authentication, and approved
 viewer attachments. The dashboard polls for a
@@ -751,8 +760,9 @@ execution never places two password prompts or an approval and password prompt
 on `/dev/tty` concurrently. This serialization applies only to human terminal
 interaction; the remote command leases continue independently. The Textual
 interface handles execution approval, SSH retry, fallback, machine disable,
-and secret-input authorization inside the full-screen driver; secret bytes flow only through
-the separately owned external viewer while that driver is suspended.
+secret-input authorization, and password management inside the full-screen
+driver. Manual bytes flow through the separately owned external viewer;
+automatic sudo bytes flow through the exact viewer's private tmux buffer.
 
 Separately, up to three authenticated `ssh -N` ControlMaster transports may
 remain idle. Reusing a transport never reuses request identity. Queued requests
@@ -800,10 +810,10 @@ After the exact key is verified, the enrollment master is closed and its
 control socket is removed. A separate post-enrollment master must then
 authenticate with the dedicated public key alone before the request receives a
 transport lease. A missing or rejected key therefore fails closed instead of
-falling back to another workstation identity or password. Passwords and sudo
-credentials are never stored. Automatic viewer presentation forwards terminal
-input directly through tmux and SSH; tmuxgate does not read or retain those
-bytes.
+falling back to another workstation identity or SSH password. SSH credentials
+are never stored. Sudo passwords may be stored separately in the owner-only
+mode-`0600` `sudo-credentials.json` state file; they are never part of SSH
+configuration, request evidence, results, or activity output.
 
 Only the enrollment master reaches the operator's terminal. The backend selects
 its start path from the invocation's own `interactive_terminal` policy: a
@@ -1007,14 +1017,13 @@ Prompt detection is offered only for an interactive request. `SshChannelRunner`
 watches a viewer only when the bound recipient's request asked for it, and
 `SecretPromptPresenter.watch` independently refuses a non-interactive recipient,
 so prompt-like text produced by a command that has no controlling terminal can
-never propose a handoff. Detection remains notification only: attaching the
-broker terminal requires the separate `SecretInputAuthorizationPrompt` decision
-described under the operator-interface boundary, which names the full request,
-machine, endpoint, approved command identity, and viewer session, is mandatory
-even when `approval_mode = "disabled"`, applies to that one request, and is
-never recorded as a durable credential. tmuxgate does not read, buffer,
-transform, retain, or log the typed bytes, and echo suppression is the remote
-program's own responsibility.
+never propose a handoff. An exact sudo prompt may consume the stored
+per-machine password when automation is on. Every other prompt requires the
+separate `SecretInputAuthorizationPrompt` decision described under the
+operator-interface boundary, which names the full request, machine, endpoint,
+approved command identity, and viewer session. Manual typed bytes are not
+buffered or logged, and echo suppression is the remote program's own
+responsibility.
 
 ## Request state machine
 

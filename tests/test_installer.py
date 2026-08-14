@@ -478,7 +478,7 @@ class InstallerProbeTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertEqual(payload["mcp_url"], "http://127.0.0.1:8765/mcp")
-            self.assertEqual(payload["approval_mode"], "always")
+            self.assertEqual(payload["approval_mode"], "disabled")
             self.assertNotIn(token, output.getvalue())
             self.assertEqual(config.read_bytes(), config_payload)
             self.assertEqual(token_path.read_text(encoding="ascii"), token + "\n")
@@ -1050,34 +1050,14 @@ class InstallerFlowTests(unittest.TestCase):
             releases = fixture["data"] / "tmuxgate" / "releases"
             self.assertEqual(list(releases.iterdir()), [])
 
-    def test_disabled_approvals_require_explicit_acknowledgement(self):
+    def test_automatic_approvals_install_without_extra_acknowledgement(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self._fixture(Path(temporary))
-            disabled = fixture["config_payload"].replace(
-                b'approval_mode = "always"', b'approval_mode = "disabled"'
-            )
-            fixture["config"].write_bytes(disabled)
-            fixture["config_payload"] = disabled
             real_run = installer._run
             fake_run = self._fake_installer_runner(real_run)
             with mock.patch.dict(os.environ, fixture["environment"], clear=True):
                 with mock.patch.object(installer, "_run", side_effect=fake_run):
-                    with self.assertRaisesRegex(
-                        installer.InstallError, "--allow-disabled-approvals"
-                    ):
-                        installer.install(self._arguments(fixture))
-                    acknowledged = installer._public_parser().parse_args(
-                        (
-                            "--source",
-                            str(REPOSITORY),
-                            "--bin-dir",
-                            str(fixture["bin_dir"]),
-                            "--codex-bin",
-                            str(fixture["codex"]),
-                            "--allow-disabled-approvals",
-                        )
-                    )
-                    self.assertEqual(installer.install(acknowledged), 0)
+                    self.assertEqual(installer.install(self._arguments(fixture)), 0)
             self.assertTrue((fixture["bin_dir"] / "tmuxgate").is_symlink())
 
     def _main_stderr(self, fixture, *extra):
@@ -1111,63 +1091,19 @@ class InstallerFlowTests(unittest.TestCase):
             )
         )
 
-    def test_disabled_approval_guard_reports_candidate_and_active_state(self):
-        # Regression for issue #40. pip prints "Successfully installed tmuxgate"
-        # inside the unpublished candidate, and the guard then stops before any
-        # publication. The run must say so rather than leaving the operator to
-        # guess whether that build became the active tmuxgate.
-        for label, preinstall in (("fresh install", False), ("update", True)):
-            with self.subTest(scenario=label):
-                with tempfile.TemporaryDirectory() as temporary:
-                    fixture = self._fixture(Path(temporary))
-                    fake_run = self._fake_installer_runner(installer._run)
-                    install_root = fixture["data"] / "tmuxgate"
-                    current = install_root / "current"
-                    launcher = fixture["bin_dir"] / "tmuxgate"
-                    with mock.patch.dict(os.environ, fixture["environment"], clear=True):
-                        with mock.patch.object(installer, "_run", side_effect=fake_run):
-                            active_before = None
-                            if preinstall:
-                                with contextlib.redirect_stdout(io.StringIO()):
-                                    self.assertEqual(
-                                        installer.install(self._arguments(fixture)), 0
-                                    )
-                                active_before = os.readlink(current)
-                            self._disable_approvals(fixture)
-                            status, out, err = self._main_stderr(fixture)
+    def test_automatic_approval_mode_publishes_and_registers_codex(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(Path(temporary))
+            fake_run = self._fake_installer_runner(installer._run)
+            with mock.patch.dict(os.environ, fixture["environment"], clear=True):
+                with mock.patch.object(installer, "_run", side_effect=fake_run):
+                    status, out, err = self._main_stderr(fixture)
 
-                    self.assertEqual(status, 1)
-                    self.assertIn("--allow-disabled-approvals", err)
-                    self.assertIn("Overall result", err)
-                    self.assertIn("INCOMPLETE", err)
-                    # Candidate staging is reported separately from publication.
-                    self.assertIn("VERIFIED, THEN DISCARDED", err)
-                    self.assertIn("Current/launcher publication : NOT ATTEMPTED", self._rows(err))
-                    self.assertIn("Codex registration : NOT ATTEMPTED", self._rows(err))
-                    self.assertIn("Shell integration : NOT ATTEMPTED", self._rows(err))
-                    self.assertIn("Configuration validation : PASSED", self._rows(err))
-                    self.assertIn("MCP credential : PRE-EXISTING", self._rows(err))
-                    self.assertIn("approval_mode to 'always'", err)
-                    # The candidate is named by release identity, not by the
-                    # version string every build shares.
-                    self.assertNotIn("Candidate identity : NONE", self._rows(err))
-                    self.assertNotIn("0.1.0.dev0", err)
-                    # Only one release directory is ever left behind: the
-                    # discarded candidate must be gone.
-                    releases = sorted(p.name for p in (install_root / "releases").iterdir())
-                    if preinstall:
-                        self.assertIn("Active tmuxgate release : UNCHANGED", self._rows(err))
-                        self.assertEqual(os.readlink(current), active_before)
-                        self.assertEqual(releases, [Path(active_before).name])
-                        self.assertTrue(launcher.is_symlink())
-                    else:
-                        self.assertIn("Active tmuxgate release : ABSENT", self._rows(err))
-                        self.assertFalse(current.exists() or current.is_symlink())
-                        self.assertEqual(releases, [])
-                        self.assertFalse(launcher.exists() or launcher.is_symlink())
-                    combined = out + err
-                    self.assertNotIn(fixture["token"], combined)
-                    self.assertNotIn("e" * 64, combined)
+            self.assertEqual(status, 0)
+            self.assertTrue((fixture["bin_dir"] / "tmuxgate").is_symlink())
+            self.assertIn("WARNING: approval_mode is disabled", err)
+            self.assertNotIn("Overall result", err)
+            self.assertNotIn(fixture["token"], out + err)
 
     def test_acknowledged_disabled_approvals_publish_and_report_complete(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1189,9 +1125,7 @@ class InstallerFlowTests(unittest.TestCase):
             self.assertNotIn("Overall result", err)
             self.assertNotIn(fixture["token"], out + err)
 
-    def test_a_token_created_by_the_run_is_reported_as_retained(self):
-        # A newly created MCP token is durable state that survives a blocked
-        # install, so the guard must not describe it as pre-existing.
+    def test_a_token_created_by_the_run_is_retained_after_success(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = self._fixture(Path(temporary))
             fixture["token_path"].unlink()
@@ -1201,8 +1135,7 @@ class InstallerFlowTests(unittest.TestCase):
                     self._disable_approvals(fixture)
                     status, out, err = self._main_stderr(fixture)
 
-            self.assertEqual(status, 1)
-            self.assertIn("MCP credential : CREATED AND RETAINED", self._rows(err))
+            self.assertEqual(status, 0)
             self.assertTrue(fixture["token_path"].is_file())
             self.assertNotIn(
                 fixture["token_path"].read_text(encoding="ascii").strip(), out + err
