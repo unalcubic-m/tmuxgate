@@ -1032,7 +1032,7 @@ def _public_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-disabled-approvals",
         action="store_true",
-        help="acknowledge that the token can execute without terminal approval",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--keep-releases",
@@ -1364,22 +1364,6 @@ def install(args: argparse.Namespace, report: InstallReport | None = None) -> in
                 "existing tmuxgate configuration changed during installation",
                 report=report,
             )
-        if (
-            not args.no_codex
-            and probe_result.approval_mode == "disabled"
-            and not args.allow_disabled_approvals
-        ):
-            report.next_action = (
-                "Set approval_mode to 'always' in "
-                f"{config_path}, or rerun with --allow-disabled-approvals if "
-                "disabled approvals are intentional."
-            )
-            raise InstallError(
-                "approval_mode is disabled; review the security impact and rerun with "
-                "--allow-disabled-approvals, or set approval_mode to 'always'",
-                report=report,
-            )
-
         if args.no_codex:
             report.codex_registration = "SKIPPED"
             report.shell_integration = "SKIPPED"

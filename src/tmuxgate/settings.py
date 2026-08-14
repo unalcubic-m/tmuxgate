@@ -314,3 +314,27 @@ def set_machine_enabled(
         updated = replace(config, machines=MappingProxyType(machines))
         _publish_config_unlocked(config_path, updated)
         return updated, True
+
+
+def set_approval_mode(
+    path: Path,
+    approval_mode: str,
+) -> tuple[AppConfig, bool]:
+    """Persist the dashboard's automatic/manual approval switch atomically."""
+
+    if approval_mode not in {"always", "disabled"}:
+        raise ConfigError("broker.approval_mode must be 'always' or 'disabled'")
+    config_path = Path(path).expanduser()
+    if not config_path.is_absolute():
+        raise ConfigError("configuration path must be absolute")
+    load_config(config_path)
+    with _config_write_lock(config_path):
+        config = load_config(config_path)
+        if config.broker.approval_mode == approval_mode:
+            return config, False
+        updated = replace(
+            config,
+            broker=replace(config.broker, approval_mode=approval_mode),
+        )
+        _publish_config_unlocked(config_path, updated)
+        return updated, True

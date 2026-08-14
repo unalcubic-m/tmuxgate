@@ -23,10 +23,11 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from textual.widgets import Button, Static, TabbedContent
+from textual.widgets import Button, Input, Static, TabbedContent
 
 from tmuxgate.approval import ApprovalDecision
 from tmuxgate.config import parse_config
+from tmuxgate.credentials import SudoCredentialStore
 from tmuxgate.models import ExecutionMode, RequestSpec
 from tmuxgate.operator_interface import (
     ActivityKind,
@@ -56,6 +57,7 @@ from tmuxgate.textual_interface import (
     REFRESH_SECONDS,
     RouteFallbackScreen,
     SecretInputAuthorizationScreen,
+    SudoCredentialScreen,
     SshRetryScreen,
     TextualOperatorInterface,
     TerminalOwnershipState,
@@ -1112,6 +1114,80 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 self.assertTrue(app.query_one("#views", TabbedContent).display)
 
         asyncio.run(exercise())
+
+    def test_dashboard_toggles_automation_and_manages_sudo_password(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            state_dir.mkdir(mode=0o700)
+            store = SudoCredentialStore(state_dir)
+            terminal = FakeTerminalArbiter()
+            interface = TextualOperatorInterface(
+                terminal,
+                approval_mode="disabled",
+                credential_store=store,
+                validate_terminal=False,
+            )
+            self.addCleanup(interface.close)
+            changes = []
+
+            def set_automatic(enabled):
+                changes.append(enabled)
+                return "disabled" if enabled else "always"
+
+            interface.bind_automation_setter(set_automatic)
+            configured = SimpleNamespace(
+                broker=SimpleNamespace(approval_mode="disabled"),
+                mcp=SimpleNamespace(host="127.0.0.1", port=8765),
+                machines={
+                    "app-server": SimpleNamespace(
+                        description="Application server", enabled=True
+                    )
+                },
+            )
+            app = TmuxgateDashboardApp(
+                interface, threading.Event(), configured
+            )
+
+            async def exercise() -> None:
+                async with app.run_test(size=(100, 30)) as pilot:
+                    await pilot.pause()
+                    self.assertEqual(
+                        str(app.query_one("#automation-toggle", Button).label),
+                        "Automation: ON",
+                    )
+                    self.assertTrue(await pilot.click("#automation-toggle"))
+                    await pilot.pause()
+                    self.assertEqual(changes, [False])
+                    self.assertEqual(interface.approval_mode, "always")
+                    self.assertEqual(
+                        str(app.query_one("#automation-toggle", Button).label),
+                        "Automation: OFF",
+                    )
+
+                    await pilot.press("m")
+                    self.assertTrue(await pilot.click("#credential-manage"))
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, SudoCredentialScreen)
+                    app.screen.query_one("#credential-password", Input).value = (
+                        "stored-from-dashboard"
+                    )
+                    self.assertTrue(await pilot.click("#credential-save"))
+                    await pilot.pause()
+                    self.assertEqual(
+                        store.password_for("app-server"), b"stored-from-dashboard"
+                    )
+                    self.assertIn(
+                        "stored",
+                        app.query_one("#machines-content", Static).render().plain,
+                    )
+
+                    self.assertTrue(await pilot.click("#credential-manage"))
+                    await pilot.pause()
+                    self.assertTrue(await pilot.click("#credential-remove"))
+                    await pilot.pause()
+                    self.assertIsNone(store.password_for("app-server"))
+
+            asyncio.run(exercise())
 
     def test_connection_progress_replaces_request_projection_in_place(self):
         interface = TextualOperatorInterface(

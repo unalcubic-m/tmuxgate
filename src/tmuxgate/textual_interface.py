@@ -20,7 +20,16 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.events import Resize
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Static, TabbedContent, TabPane
+from textual.widgets import (
+    Button,
+    Footer,
+    Header,
+    Input,
+    Select,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 
 from .approval import (
     ApprovalDecision,
@@ -33,6 +42,7 @@ from .approval import (
     render_secret_input_authorization_document,
     render_ssh_retry_document,
 )
+from .credentials import CredentialError, SudoCredentialStore
 from .operator_interface import (
     ActivityKind,
     ExecutionApprovalPrompt,
@@ -180,6 +190,7 @@ class DashboardMachine:
     description: str
     enabled: bool
     ssh_state: str
+    sudo_password: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -838,6 +849,98 @@ class SecretInputAuthorizationScreen(_FailClosedDecisionScreen):
                 )
 
 
+@dataclass(frozen=True, slots=True)
+class SudoCredentialAction:
+    machine_alias: str
+    password: str | None
+
+
+class SudoCredentialScreen(ModalScreen[SudoCredentialAction | None]):
+    """Small password-management dialog; the password input is always masked."""
+
+    CSS = """
+    SudoCredentialScreen { align: center middle; background: $background 80%; }
+    #credential-dialog {
+        width: 72;
+        max-width: 95%;
+        height: auto;
+        border: heavy $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #credential-title { height: 2; text-style: bold; }
+    #credential-help { height: auto; margin-bottom: 1; }
+    #credential-machine { margin-bottom: 1; }
+    #credential-password { margin-bottom: 1; }
+    #credential-actions { height: 3; align-horizontal: right; }
+    #credential-actions Button { margin-left: 1; min-width: 12; }
+    """
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(
+        self,
+        machine_aliases: tuple[str, ...],
+        stored: frozenset[str],
+    ) -> None:
+        if not machine_aliases:
+            raise ValueError("credential screen requires at least one machine")
+        super().__init__()
+        self.machine_aliases = machine_aliases
+        self.stored = stored
+
+    def compose(self) -> ComposeResult:
+        first = self.machine_aliases[0]
+        options = [
+            (
+                alias + (" — password stored" if alias in self.stored else " — no password"),
+                alias,
+            )
+            for alias in self.machine_aliases
+        ]
+        with Vertical(id="credential-dialog"):
+            yield Static("Reusable sudo password", markup=False, id="credential-title")
+            yield Static(
+                "Stored in tmuxgate's owner-only state file and submitted only "
+                "to an exact sudo password prompt for this machine.",
+                markup=False,
+                id="credential-help",
+            )
+            yield Select(
+                options,
+                value=first,
+                allow_blank=False,
+                id="credential-machine",
+            )
+            yield Input(
+                placeholder="Enter or replace sudo password",
+                password=True,
+                max_length=4096,
+                id="credential-password",
+            )
+            with Horizontal(id="credential-actions"):
+                yield Button("Cancel", id="credential-cancel")
+                yield Button("Remove", variant="warning", id="credential-remove")
+                yield Button("Save", variant="primary", id="credential-save")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "credential-cancel":
+            self.dismiss(None)
+            return
+        machine = self.query_one("#credential-machine", Select).value
+        if not isinstance(machine, str) or machine not in self.machine_aliases:
+            return
+        if event.button.id == "credential-remove":
+            self.dismiss(SudoCredentialAction(machine, None))
+            return
+        if event.button.id == "credential-save":
+            password = self.query_one("#credential-password", Input).value
+            if password:
+                self.dismiss(SudoCredentialAction(machine, password))
+
+
 
 class TmuxgateDashboardApp(App[None]):
     """Bounded dashboard with one request-bound approval modal at a time."""
@@ -856,6 +959,8 @@ class TmuxgateDashboardApp(App[None]):
     }
     #views { height: 1fr; }
     .panel { padding: 1 2; height: 1fr; overflow-y: auto; }
+    .dashboard-actions { height: 3; padding: 0 2; }
+    .dashboard-actions Button { margin-right: 1; min-width: 20; }
     """
     BINDINGS = [
         Binding("d", "show_view('dashboard')", "Dashboard"),
@@ -892,6 +997,12 @@ class TmuxgateDashboardApp(App[None]):
                     classes="panel",
                     id="dashboard-content",
                 )
+                with Horizontal(classes="dashboard-actions"):
+                    yield Button(
+                        "Automation: starting",
+                        variant="success",
+                        id="automation-toggle",
+                    )
             with TabPane("Jobs", id="jobs"):
                 yield Static(
                     "No durable jobs.",
@@ -906,6 +1017,12 @@ class TmuxgateDashboardApp(App[None]):
                     classes="panel",
                     id="machines-content",
                 )
+                with Horizontal(classes="dashboard-actions"):
+                    yield Button(
+                        "Manage sudo passwords",
+                        variant="primary",
+                        id="credential-manage",
+                    )
             with TabPane("Activity", id="activity"):
                 yield Static(
                     "No recent activity.",
@@ -926,11 +1043,11 @@ class TmuxgateDashboardApp(App[None]):
                     "d  dashboard    j  jobs       m  machines\n"
                     "a  activity     r  requests   ?  help\n"
                     "q  stop tmuxgate\n\n"
-                    "Execution approvals, bounded SSH retries, and separate "
-                    "route fallbacks open one at a time with a safe default. "
-                    "Secret-input handoffs require a separate exact decision; "
-                    "the TUI then suspends while the trusted viewer owns the "
-                    "terminal. Exhausted-machine disable decisions use a "
+                    "Automation defaults on: Codex approval is sufficient and "
+                    "stored sudo passwords are submitted to exact user-bound "
+                    "sudo prompts. Use the Dashboard button to restore manual "
+                    "tmuxgate approvals, and the Machines button to set or remove "
+                    "passwords. Exhausted-machine disable decisions use a "
                     "separate local-mutation modal.",
                     markup=False,
                     classes="panel",
@@ -971,6 +1088,33 @@ class TmuxgateDashboardApp(App[None]):
         self.interface.fail_closed()
         self.external_stop.set()
         self.exit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if self.minimum_size or self._active_decision is not None:
+            return
+        if event.button.id == "automation-toggle":
+            enabled = self.interface.approval_mode != "disabled"
+            self.interface.set_automation_enabled(enabled)
+            self.refresh_snapshot()
+            return
+        if event.button.id != "credential-manage":
+            return
+        machines = tuple(sorted(getattr(self.config, "machines", {})))
+        if not machines or self.interface.credential_store is None:
+            return
+        stored = frozenset(
+            alias
+            for alias in machines
+            if self.interface.credential_store.has_password(alias)
+        )
+
+        def complete(action: SudoCredentialAction | None) -> None:
+            if action is None:
+                return
+            self.interface.apply_credential_action(action)
+            self.refresh_snapshot()
+
+        self.push_screen(SudoCredentialScreen(machines, stored), complete)
 
     def present_operator_decision(self, queued: QueuedPrompt) -> None:
         """Present one exact supported prompt without reconstructing identity."""
@@ -1149,6 +1293,11 @@ class TmuxgateDashboardApp(App[None]):
             "Terminal ownership: " + inert_text(snapshot.terminal_owner),
         ]
         self.query_one("#dashboard-content", Static).update(self._text(lines))
+        automation = self.query_one("#automation-toggle", Button)
+        enabled = snapshot.approval_mode == "disabled"
+        automation.label = "Automation: ON" if enabled else "Automation: OFF"
+        automation.variant = "success" if enabled else "warning"
+        automation.disabled = not self.interface.automation_controls_available
 
     def _render_jobs(self, jobs: tuple[DashboardJob, ...]) -> None:
         bounded = jobs[-MAX_DASHBOARD_JOBS:]
@@ -1164,10 +1313,11 @@ class TmuxgateDashboardApp(App[None]):
 
     def _render_machines(self, machines: tuple[DashboardMachine, ...]) -> None:
         bounded = machines[:MAX_DASHBOARD_MACHINES]
-        lines = ["ALIAS              ENABLED  SSH STATE       DESCRIPTION"]
+        lines = ["ALIAS              ENABLED  SUDO  SSH STATE       DESCRIPTION"]
         lines.extend(
             f"{inert_text(machine.alias):18} "
             f"{('yes' if machine.enabled else 'no'):8} "
+            f"{('stored' if machine.sudo_password else 'none'):5} "
             f"{inert_text(machine.ssh_state):15} "
             f"{inert_text(machine.description)}"
             for machine in bounded
@@ -1175,6 +1325,9 @@ class TmuxgateDashboardApp(App[None]):
         if not bounded:
             lines.append("No configured machines.")
         self.query_one("#machines-content", Static).update(self._text(lines))
+        self.query_one("#credential-manage", Button).disabled = (
+            not machines or self.interface.credential_store is None
+        )
 
     def _render_activity(self, activity: tuple[OperationalActivity, ...]) -> None:
         bounded = activity[-MAX_RENDERED_ACTIVITY:]
@@ -1216,6 +1369,7 @@ class TextualOperatorInterface(PlainTerminalInterface):
         terminal: TerminalArbiter,
         *,
         approval_mode: str = "always",
+        credential_store: SudoCredentialStore | None = None,
         activity_capacity: int = 256,
         prompt_capacity: int = MAX_DASHBOARD_PROMPTS,
         validate_terminal: bool = True,
@@ -1244,11 +1398,17 @@ class TextualOperatorInterface(PlainTerminalInterface):
             raise ValueError("prompt_capacity must be between 1 and 65536")
         if not callable(app_factory):
             raise TypeError("app_factory must be callable")
+        if credential_store is not None and not isinstance(
+            credential_store, SudoCredentialStore
+        ):
+            raise TypeError("credential_store must be a SudoCredentialStore")
         self._queued_lock = threading.Lock()
         self._queued: deque[QueuedPrompt] = deque(maxlen=prompt_capacity)
         self._pending_prompt_count = 0
         self._submitted_sequence = 0
         self._dashboard_provider: DashboardProvider | None = None
+        self.credential_store = credential_store
+        self._automation_setter: Callable[[bool], str] | None = None
         self._app_factory = app_factory
         self._app_lock = threading.Lock()
         self._app_ready = threading.Event()
@@ -1283,6 +1443,70 @@ class TextualOperatorInterface(PlainTerminalInterface):
     def terminal_ownership_state(self) -> TerminalOwnershipState:
         with self._ownership_lock:
             return self._ownership_state
+
+    @property
+    def automation_controls_available(self) -> bool:
+        return self._automation_setter is not None
+
+    def bind_automation_setter(self, setter: Callable[[bool], str]) -> None:
+        if not callable(setter):
+            raise TypeError("automation setter must be callable")
+        if self._automation_setter is not None:
+            raise OperatorInterfaceError("automation setter is already bound")
+        self._automation_setter = setter
+
+    def set_automation_enabled(self, enabled: bool) -> None:
+        if type(enabled) is not bool:
+            raise TypeError("automation enabled state must be boolean")
+        setter = self._automation_setter
+        if setter is None:
+            raise OperatorInterfaceError("automation controls are unavailable")
+        try:
+            mode = setter(enabled)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.publish_activity(
+                OperationalActivity.create(
+                    ActivityKind.WARNING,
+                    f"Could not update automation: {inert_text(exc)}",
+                )
+            )
+            return
+        self.set_approval_mode(mode)
+        self.publish_activity(
+            OperationalActivity.create(
+                ActivityKind.STATUS,
+                "Automation enabled; Codex approval is sufficient."
+                if enabled
+                else "Automation disabled; tmuxgate approvals are required.",
+            )
+        )
+
+    def apply_credential_action(self, action: SudoCredentialAction) -> None:
+        if not isinstance(action, SudoCredentialAction):
+            raise TypeError("credential action is invalid")
+        store = self.credential_store
+        if store is None:
+            raise OperatorInterfaceError("credential controls are unavailable")
+        try:
+            if action.password is None:
+                changed = store.remove_password(action.machine_alias)
+                message = (
+                    f"Removed stored sudo password for {action.machine_alias}."
+                    if changed
+                    else f"No sudo password was stored for {action.machine_alias}."
+                )
+            else:
+                store.set_password(action.machine_alias, action.password)
+                message = f"Stored sudo password for {action.machine_alias}."
+        except CredentialError as exc:
+            message = f"Could not update sudo password: {inert_text(exc)}"
+        self.publish_activity(
+            OperationalActivity.create(
+                ActivityKind.STATUS,
+                message,
+                machine_name=action.machine_alias,
+            )
+        )
 
     def _begin_modal(self, prompt: OperatorPrompt) -> bool:
         del prompt
@@ -1399,11 +1623,10 @@ class TextualOperatorInterface(PlainTerminalInterface):
                     "dashboard provider returned invalid state"
                 )
             return snapshot
-        broker = getattr(config, "broker", None)
         mcp = getattr(config, "mcp", None)
         machines = getattr(config, "machines", {})
         return DashboardRuntimeSnapshot(
-            approval_mode=str(getattr(broker, "approval_mode", "unknown")),
+            approval_mode=self.approval_mode,
             listener=(
                 f"http://{getattr(mcp, 'host', '?')}:{getattr(mcp, 'port', '?')}/mcp"
             ),
@@ -1413,6 +1636,11 @@ class TextualOperatorInterface(PlainTerminalInterface):
                     description=str(getattr(machine, "description", "")),
                     enabled=bool(getattr(machine, "enabled", True)),
                     ssh_state="unknown",
+                    sudo_password=(
+                        self.credential_store.has_password(str(alias))
+                        if self.credential_store is not None
+                        else False
+                    ),
                 )
                 for alias, machine in sorted(machines.items())
             )[:MAX_DASHBOARD_MACHINES],

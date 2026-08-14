@@ -1207,6 +1207,7 @@ class PlainTerminalInterface:
         self._pager = pager
         self._presenter = self._present_prompt if presenter is None else presenter
         self._approval_mode = approval_mode
+        self._approval_mode_lock = threading.Lock()
         self._prompts = PromptQueue()
         self._activity: deque[OperationalActivity] = deque(maxlen=activity_capacity)
         self._activity_lock = threading.Lock()
@@ -1224,6 +1225,17 @@ class PlainTerminalInterface:
         with self._activity_lock:
             return tuple(self._activity)
 
+    @property
+    def approval_mode(self) -> str:
+        with self._approval_mode_lock:
+            return self._approval_mode
+
+    def set_approval_mode(self, approval_mode: str) -> None:
+        if approval_mode not in {"always", "disabled"}:
+            raise ValueError("approval_mode must be 'always' or 'disabled'")
+        with self._approval_mode_lock:
+            self._approval_mode = approval_mode
+
     def _request(self, prompt: OperatorPrompt) -> OperatorDecision:
         pending = self._prompts.submit(prompt)
         try:
@@ -1237,7 +1249,7 @@ class PlainTerminalInterface:
     ) -> OperatorDecision:
         if not isinstance(prompt, ExecutionApprovalPrompt):
             raise TypeError("prompt must be an ExecutionApprovalPrompt")
-        if self._approval_mode == "disabled":
+        if self.approval_mode == "disabled":
             return self._prompts.decide_without_presentation(
                 prompt, ApprovalDecision.APPROVED
             )
@@ -1251,7 +1263,7 @@ class PlainTerminalInterface:
     def request_fallback(self, prompt: RouteFallbackPrompt) -> OperatorDecision:
         if not isinstance(prompt, RouteFallbackPrompt):
             raise TypeError("prompt must be a RouteFallbackPrompt")
-        if self._approval_mode == "disabled":
+        if self.approval_mode == "disabled":
             return self._prompts.decide_without_presentation(
                 prompt, ApprovalDecision.APPROVED
             )
@@ -1262,8 +1274,8 @@ class PlainTerminalInterface:
     ) -> OperatorDecision:
         if not isinstance(prompt, SecretInputAuthorizationPrompt):
             raise TypeError("prompt must be a SecretInputAuthorizationPrompt")
-        # This permission is independent of per-request execution approval.
-        # In particular, approval_mode="disabled" never bypasses it.
+        # This is the fallback for missing, rejected, or disabled automatic
+        # sudo input, and remains an exact independent terminal decision.
         return self._request(prompt)
 
     def run_external_terminal_session(

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import secrets
 import selectors
 import stat
 import subprocess
@@ -42,6 +43,24 @@ _SECRET_PROMPT_RE = re.compile(
     rb"\s*:[ \t]*\*{0,256}[ \t]*\Z",
     re.IGNORECASE,
 )
+
+
+def _sudo_prompt_matches(signature: bytes, user: str) -> bool:
+    """Accept only sudo's default, exact user-bound password prompt."""
+
+    if not isinstance(signature, bytes) or not isinstance(user, str):
+        return False
+    try:
+        user_bytes = user.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    pattern = re.compile(
+        rb"\[sudo\][ \t]+password[ \t]+for[ \t]+"
+        + re.escape(user_bytes)
+        + rb":[ \t]*\*{0,256}[ \t]*\Z",
+        re.IGNORECASE,
+    )
+    return pattern.fullmatch(signature) is not None
 
 
 def secret_prompt_signature(
@@ -623,6 +642,51 @@ class DetachedTmuxViewerProcess:
             raise TransportError("detached viewer history is unavailable")
         return completed.stdout
 
+    def submit_secret_line(self, secret: bytes) -> None:
+        """Paste one secret line without exposing it in process arguments."""
+
+        if (
+            not isinstance(secret, bytes)
+            or not secret
+            or len(secret) > 16 * 1024
+            or any(character in secret for character in (0, 10, 13))
+        ):
+            raise TransportError("automatic secret input is invalid")
+        buffer_name = f"tmuxgate-secret-{secrets.token_hex(8)}"
+        completed = _run_completed(
+            self.runner(
+                (
+                    "/usr/bin/tmux", "-S", os.fspath(self.socket_path),
+                    "load-buffer", "-b", buffer_name, "-",
+                ),
+                input=secret + b"\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=5,
+                env=_safe_environment(),
+            ),
+            "automatic secret buffer load",
+        )
+        if completed.returncode != 0:
+            raise TransportError("automatic secret input could not be loaded")
+        try:
+            pasted = self._control(
+                "paste-buffer", "-d", "-b", buffer_name, "-t", self.session_name
+            )
+        except (OSError, TransportError):
+            try:
+                self._control("delete-buffer", "-b", buffer_name)
+            except (OSError, TransportError):
+                pass
+            raise
+        if pasted.returncode == 0:
+            return
+        # A failed paste leaves the named buffer behind. Remove that exact
+        # buffer before reporting failure so reusable bytes do not linger.
+        self._control("delete-buffer", "-b", buffer_name)
+        raise TransportError("automatic secret input could not be submitted")
+
     def prompt_signature(self) -> bytes | None:
         cursor = self._control(
             "display-message", "-p", "-t", self.session_name, "#{cursor_y}"
@@ -702,7 +766,7 @@ def _viewer_session_ended(viewer: DetachedTmuxViewerProcess) -> bool:
 
 
 class SecretPromptPresenter:
-    """Notify on prompt detection and attach only after exact authorization."""
+    """Submit stored sudo input or request an exact manual authorization."""
 
     def __init__(
         self,
@@ -717,6 +781,8 @@ class SecretPromptPresenter:
         authorizer: Callable[
             [SecretInputAuthorizationPrompt], OperatorDecision
         ],
+        secret_provider: Callable[[str], bytes | None] = lambda machine: None,
+        automatic_secret_input: Callable[[], bool] = lambda: False,
         terminal_handoff: Callable[
             [SecretInputAuthorizationPrompt, Callable[[], None]], None
         ] | None = None,
@@ -727,12 +793,16 @@ class SecretPromptPresenter:
             raise ValueError("prompt presenter timing is invalid")
         if not callable(authorizer):
             raise TypeError("prompt presenter authorizer must be callable")
+        if not callable(secret_provider) or not callable(automatic_secret_input):
+            raise TypeError("automatic secret-input callbacks must be callable")
         self.terminal_lock = threading.RLock() if terminal_lock is None else terminal_lock
         self.terminal_opener = terminal_opener
         self.popen = popen
         self.terminal_path_resolver = terminal_path_resolver
         self.terminal_input_flusher = terminal_input_flusher
         self.authorizer = authorizer
+        self.secret_provider = secret_provider
+        self.automatic_secret_input = automatic_secret_input
         self.terminal_handoff = (
             self._locked_terminal_handoff
             if terminal_handoff is None
@@ -791,6 +861,7 @@ class SecretPromptPresenter:
         key: tuple[str, str],
     ) -> None:
         prompt_episode = False
+        automatic_attempted = False
         try:
             while not self._stop.is_set():
                 try:
@@ -806,18 +877,66 @@ class SecretPromptPresenter:
                             None if self._active is None else self._active[0]
                         )
                     if active_viewer is not viewer:
-                        self.reporter(
-                            "secret input requested by remote pane for request "
-                            f"{recipient.request_id} on {recipient.request.machine_alias}; "
-                            "awaiting independent operator authorization"
-                        )
-                        self._queue.put((viewer, recipient))
+                        automatic_submitted = False
+                        if not automatic_attempted:
+                            try:
+                                automatic_submitted = self._try_automatic_secret(
+                                    viewer, recipient, signature
+                                )
+                            except Exception:
+                                automatic_attempted = True
+                                self.reporter(
+                                    "automatic stored sudo password submission failed for "
+                                    f"request {recipient.request_id} on "
+                                    f"{recipient.request.machine_alias}; falling back to "
+                                    "operator authorization"
+                                )
+                        if automatic_submitted:
+                            automatic_attempted = True
+                        else:
+                            self.reporter(
+                                "secret input requested by remote pane for request "
+                                f"{recipient.request_id} on "
+                                f"{recipient.request.machine_alias}; awaiting independent "
+                                "operator authorization"
+                            )
+                            self._queue.put((viewer, recipient))
                 elif signature is None:
                     prompt_episode = False
                 self._stop.wait(self.poll_seconds)
         finally:
             with self._watched_lock:
                 self._watched.discard(key)
+
+    def _try_automatic_secret(
+        self,
+        viewer: DetachedTmuxViewerProcess,
+        recipient: SecretInputRecipient,
+        signature: bytes,
+    ) -> bool:
+        if not self.automatic_secret_input():
+            return False
+        endpoint = next(
+            (
+                item.resolved
+                for item in recipient.connection_plan.endpoints
+                if item.resolved.endpoint_id == recipient.endpoint_id
+            ),
+            None,
+        )
+        if endpoint is None or not _sudo_prompt_matches(
+            signature, endpoint.resolved_user
+        ):
+            return False
+        secret = self.secret_provider(recipient.request.machine_alias)
+        if secret is None:
+            return False
+        viewer.submit_secret_line(secret)
+        self.reporter(
+            "stored sudo password submitted automatically for request "
+            f"{recipient.request_id} on {recipient.request.machine_alias}"
+        )
+        return True
 
     def _present_loop(self) -> None:
         while not self._stop.is_set():
