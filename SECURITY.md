@@ -81,10 +81,13 @@ full-screen interface before a trusted process reads.
 Manual secret input is a separate ownership boundary. After an exact request-,
 command-, route-, endpoint-, and viewer-bound authorization, Textual leaves
 application mode and stops reading the terminal before the trusted external
-viewer receives `/dev/tty`. In automatic mode, an exact default sudo prompt for
-the resolved SSH user may instead receive the owner-only stored per-machine
-password once. Manual bytes are not retained; stored bytes are kept only in the
-mode-`0600` credential file and a short-lived private tmux buffer.
+viewer receives `/dev/tty`. In automatic mode, the exact default sudo prompt or
+that machine's learned exact prompt may instead receive the owner-only stored
+password up to three times. An unknown first-use prompt requires a dedicated
+masked credential enrollment; entering a password explicitly trusts and saves
+that exact prompt for the logical machine. Manual Forward Input bytes are not
+retained; enrolled bytes are kept only in the mode-`0600` credential file and a
+short-lived private tmux buffer.
 
 ## Interactive remote execution
 
@@ -97,10 +100,14 @@ cannot open `/dev/tty` at all; prompt detection and terminal handoff are not
 offered for it.
 
 With Automation on, approving an interactive Codex request also authorizes up
-to three stored-password submissions when distinct prompt episodes emit the
-exact resolved-user sudo prompt. This matches sudo's ordinary retry behavior
-when a stored password has changed. Automatic mode never opens the Forward
-Input authorization; missing or unusable credentials leave the command
+to three stored-password submissions when distinct prompt episodes emit an
+exact default or per-machine learned prompt. A stored password may automatically
+learn a new exact prompt only when its visible text identifies itself as sudo;
+other unknown prompts require masked first-use enrollment. Learned prompts may
+not name the resolved user, so the approved interactive command and first-use
+trust decision remain the security boundary. This matches sudo's ordinary retry
+behavior when a stored password has changed. Automatic mode never opens the
+Forward Input authorization; cancelled or unusable credentials leave the command
 detached to fail or time out, with explicit `tmuxgate attach REQUEST_ID` still
 available. Prompt text cannot prove that the remote program really is sudo, so
 an accepted interactive command can deliberately imitate that prompt and

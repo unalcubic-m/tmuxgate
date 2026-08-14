@@ -36,9 +36,9 @@ being given a reusable interactive SSH shell. tmuxgate narrows that workflow:
   viewer. Existing remote sessions are not reused or modified.
 - stdout, stderr, exit status, job state, and checksums are collected through a
   durable, fail-closed lifecycle.
-- Exact default sudo prompts can receive an owner-only stored password
-  automatically. Automation never opens a Forward Input window; manual mode
-  retains the separate request-bound terminal handoff.
+- Default or per-machine learned sudo prompts can receive an owner-only stored
+  password automatically. First use learns the exact prompt and saves a masked
+  password entry; Automation never opens a Forward Input window.
 - A request may explicitly ask for `interactive` execution when the command
   genuinely needs a remote controlling terminal, such as `sudo` reading a
   password. Prompt detection and terminal handoff are offered only for those
@@ -340,8 +340,11 @@ the token.
 
 The embedded server exposes five typed tools:
 
-- `list_machines()` returns logical aliases, descriptions, and enabled status
-  only.
+- `list_machines()` returns logical aliases, stored descriptions, and enabled
+  status only. Run tools accept the exact alias or an unambiguous normalized
+  stored name, so `DockerCore`, `DockerCoreVM`, and `docker-core` can all select
+  a uniquely configured `dockercorevm` machine. Resolution can only produce an
+  alias returned by the broker; endpoints and SSH options are never accepted.
 - `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?,
   interactive?)` submits exact structured argv and waits for the broker result.
 - `run_script(machine, cwd, purpose, script?, script_base64?, environment?,
@@ -424,14 +427,18 @@ identical to a non-interactive job.
 **Codex approval is sufficient in automatic mode.** An interactive request is
 labelled in the approval summary (`TERMINAL`), carries the
 `INTERACTIVE_TERMINAL` safety indicator, and shows `interactive: true` in the
-full evidence document. With Automation on and a password stored for the
-logical machine, an exact default `[sudo] password for <resolved-user>:` prompt
-receives that password automatically for up to three distinct prompt episodes.
-This lets sudo finish with its ordinary incorrect-password result if a stored
-password has changed. Automation never opens Forward Input: missing credentials,
-non-sudo prompts, and exhausted automatic attempts remain detached and are
-reported through activity and the command result. `tmuxgate attach REQUEST_ID`
-remains available for deliberate recovery.
+full evidence document. With Automation on, the default
+`[sudo] password for <resolved-user>:` prompt or that machine's learned exact
+prompt receives its saved password for up to three distinct prompt episodes.
+When a stored password already exists and a new exact prompt identifies itself
+as sudo, tmuxgate learns it for that logical machine and continues immediately.
+Otherwise the first unknown password prompt opens one masked first-use sudo
+setup on the controlling terminal; entering the password trusts that exact
+prompt, submits it once, and atomically saves both for future requests. This is
+credential enrollment, not Forward Input. Empty input cancels. Exhausted
+automatic attempts remain detached and are reported through activity and the
+command result. `tmuxgate attach REQUEST_ID` remains available for deliberate
+recovery.
 
 With Automation off (`approval_mode = "always"`), stored passwords are not
 submitted. A request-bound authorization names the full request ID, machine,
@@ -444,8 +451,9 @@ endpoint, approved command identity, and viewer session:
 Denying it leaves the command detached and still running. Prompt handling is
 offered only for requests that asked for `interactive` execution.
 
-**What is and is not recorded.** Reusable passwords are stored separately in
-the owner-only mode-`0600` state file `sudo-credentials.json`; they never enter
+**What is and is not recorded.** Reusable passwords and machine-bound exact
+prompt profiles are stored separately in the owner-only mode-`0600` state file
+`sudo-credentials.json`; passwords never enter
 ordinary configuration, activity text, process arguments, captured
 `stdout`/`stderr`, the verified result spool, or durable job records. Automatic
 submission loads a private named tmux buffer through stdin, pastes it, and
@@ -462,7 +470,8 @@ cached by another session does not apply and the prompt appears again.
 
 tmuxgate still does not use `sudo -S`, command-line passwords, environment
 passwords, root SSH login, or broad `NOPASSWD` rules. Automatic input goes only
-to the already-bound interactive viewer's exact default sudo prompt.
+to the already-bound interactive viewer's exact default or learned machine
+prompt.
 
 > [!WARNING]
 > A terminal handoff gives the remote program your keystrokes. Suppressing echo
@@ -533,11 +542,12 @@ dashboard refresh, and a terminal below 72×20 hides evidence and disables the
 positive action while leaving the safe action visible.
 
 Remote password-like pane text is inspected only at the visible cursor row. In
-automatic mode, an exact resolved-user sudo prompt can receive the stored
-per-machine password for up to three fresh prompt episodes. Automatic mode
-never queues a terminal-input decision. If automatic input cannot be used or
-sudo rejects it repeatedly, activity reports the failure and the command stays
-detached until it exits or the operator deliberately runs
+automatic mode, the exact default or learned machine prompt can receive the
+stored password for up to three fresh prompt episodes. An unknown first-use
+prompt enters the dedicated masked credential enrollment described above.
+Automatic mode never queues a Forward Input decision. If automatic input cannot
+be used or sudo rejects it repeatedly, activity reports the failure and the
+command stays detached until it exits or the operator deliberately runs
 `tmuxgate attach REQUEST_ID`. With Automation off, a separate card identifies
 the full request ID, logical machine, endpoint, approved argv or script digest,
 and remote-input action. Plain mode requires `forward <full-request-id>`; the

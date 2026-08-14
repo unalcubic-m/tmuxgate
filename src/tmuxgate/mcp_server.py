@@ -42,6 +42,8 @@ MAX_MCP_REQUEST_BYTES = 24 * 1024 * 1024
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 10.0
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 DEFAULT_CONTROL_WORKERS = 4
+MAX_MACHINE_NAME_CHARACTERS = 256
+_GENERIC_MACHINE_NAME_SUFFIXES = ("machine", "server", "host", "vm")
 
 
 _T = TypeVar("_T")
@@ -349,6 +351,56 @@ def _environment(values: Mapping[str, str] | None) -> tuple[tuple[str, str], ...
     return tuple(values.items())
 
 
+def _machine_name_variants(value: object) -> frozenset[str]:
+    if not isinstance(value, str):
+        return frozenset()
+    name = value.strip()
+    if not name or len(name) > MAX_MACHINE_NAME_CHARACTERS:
+        return frozenset()
+    normalized = "".join(character for character in name.casefold() if character.isalnum())
+    if not normalized:
+        return frozenset()
+    variants = {normalized}
+    shortened = normalized
+    for suffix in _GENERIC_MACHINE_NAME_SUFFIXES:
+        if shortened.endswith(suffix) and len(shortened) > len(suffix):
+            variants.add(shortened[: -len(suffix)])
+    return frozenset(variants)
+
+
+def _resolve_machine_name(machine: object, records: object) -> str:
+    """Resolve a stored alias or human name to one broker-provided alias."""
+
+    requested = _machine_name_variants(machine)
+    if not requested:
+        raise ValidationError("machine name is required and must contain letters or digits")
+    if not isinstance(records, (list, tuple)):
+        raise ValidationError("configured machine names are unavailable")
+    exact = {
+        record.alias
+        for record in records
+        if isinstance(getattr(record, "alias", None), str)
+        and machine == record.alias
+    }
+    if len(exact) == 1:
+        return exact.pop()
+    matches = {
+        record.alias
+        for record in records
+        if isinstance(getattr(record, "alias", None), str)
+        and requested
+        & (
+            _machine_name_variants(record.alias)
+            | _machine_name_variants(getattr(record, "description", None))
+        )
+    }
+    if len(matches) == 1:
+        return matches.pop()
+    if matches:
+        raise ValidationError("machine name is ambiguous; use its exact logical alias")
+    raise ValidationError("machine name does not match a configured logical machine")
+
+
 def _validate_request_frame(request: RequestSpec) -> None:
     try:
         encoded_header_size(request.to_wire_header())
@@ -418,9 +470,17 @@ def create_mcp_server(
             return await asyncio.to_thread(function, *arguments, **keywords)
         return await call_pools.control(function, *arguments, **keywords)
 
+    async def resolve_machine(machine: str) -> str:
+        records = await control_call(broker_list_machines, broker_socket)
+        return _resolve_machine_name(machine, records)
+
     @server.tool(
         name="list_machines",
-        description="List configured logical machine aliases without endpoints or SSH details.",
+        description=(
+            "List configured logical machine aliases and stored descriptions without "
+            "endpoints or SSH details. Run tools accept either an alias or an unambiguous "
+            "stored machine name."
+        ),
         annotations=ToolAnnotations(
             readOnlyHint=True,
             destructiveHint=False,
@@ -454,8 +514,9 @@ def create_mcp_server(
             "only when the command genuinely needs a remote controlling "
             "terminal, for example a sudo password prompt. With tmuxgate "
             "Automation on, its stored per-machine sudo password is submitted "
-            "automatically for up to three sudo prompt episodes. Automation "
-            "never opens Forward Input; failures return through the command result."
+            "automatically for up to three default or learned prompt episodes. "
+            "First use learns the machine prompt and saves a masked password. "
+            "Automation never opens Forward Input; failures return through the result."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=False,
@@ -478,7 +539,7 @@ def create_mcp_server(
             if not purpose:
                 raise ValidationError("purpose is required")
             request = RequestSpec(
-                machine_alias=machine,
+                machine_alias=await resolve_machine(machine),
                 mode=ExecutionMode.ARGV,
                 cwd=cwd,
                 argv=tuple(argv),
@@ -504,7 +565,8 @@ def create_mcp_server(
             "inspect each stream's encoding. Set interactive=true only when the script "
             "genuinely needs a remote controlling terminal, for example a sudo password "
             "prompt. With tmuxgate Automation on, its stored per-machine sudo password "
-            "is submitted automatically for up to three sudo prompt episodes. "
+            "is submitted automatically for up to three default or learned prompt "
+            "episodes. First use learns the machine prompt and saves a masked password. "
             "Automation never opens Forward Input; failures return through the result."
         ),
         annotations=ToolAnnotations(
@@ -541,7 +603,7 @@ def create_mcp_server(
                 if base64.b64encode(payload).decode("ascii") != script_base64:
                     raise ValidationError("script_base64 is not canonical base64")
             request = RequestSpec(
-                machine_alias=machine,
+                machine_alias=await resolve_machine(machine),
                 mode=ExecutionMode.SCRIPT,
                 cwd=cwd,
                 script=payload,

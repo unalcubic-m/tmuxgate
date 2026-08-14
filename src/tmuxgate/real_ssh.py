@@ -46,11 +46,32 @@ _SECRET_PROMPT_RE = re.compile(
 MAX_AUTOMATIC_SECRET_ATTEMPTS = 3
 
 
-def _sudo_prompt_matches(signature: bytes, user: str) -> bool:
-    """Accept only sudo's default, exact user-bound password prompt."""
+def _sudo_prompt_matches(
+    signature: bytes,
+    user: str,
+    learned_prompt: bytes | None = None,
+) -> bool:
+    """Accept only exact supported sudo password prompts."""
 
     if not isinstance(signature, bytes) or not isinstance(user, str):
         return False
+    if learned_prompt is not None:
+        if not isinstance(learned_prompt, bytes):
+            return False
+        signature_base = re.fullmatch(
+            rb"(?P<base>.*?:)[ \t]*\*{0,256}[ \t]*\Z",
+            signature,
+        )
+        learned_base = re.fullmatch(
+            rb"(?P<base>.*?:)[ \t]*\*{0,256}[ \t]*\Z",
+            learned_prompt,
+        )
+        if (
+            signature_base is not None
+            and learned_base is not None
+            and signature_base.group("base") == learned_base.group("base")
+        ):
+            return True
     try:
         user_bytes = user.encode("ascii")
     except UnicodeEncodeError:
@@ -783,6 +804,10 @@ class SecretPromptPresenter:
             [SecretInputAuthorizationPrompt], OperatorDecision
         ],
         secret_provider: Callable[[str], bytes | None] = lambda machine: None,
+        prompt_provider: Callable[[str], bytes | None] = lambda machine: None,
+        credential_enroller: Callable[
+            [str, bytes], bytes | None
+        ] = lambda machine, prompt: None,
         automatic_secret_input: Callable[[], bool] = lambda: False,
         terminal_handoff: Callable[
             [SecretInputAuthorizationPrompt, Callable[[], None]], None
@@ -794,7 +819,15 @@ class SecretPromptPresenter:
             raise ValueError("prompt presenter timing is invalid")
         if not callable(authorizer):
             raise TypeError("prompt presenter authorizer must be callable")
-        if not callable(secret_provider) or not callable(automatic_secret_input):
+        if not all(
+            callable(callback)
+            for callback in (
+                secret_provider,
+                prompt_provider,
+                credential_enroller,
+                automatic_secret_input,
+            )
+        ):
             raise TypeError("automatic secret-input callbacks must be callable")
         self.terminal_lock = threading.RLock() if terminal_lock is None else terminal_lock
         self.terminal_opener = terminal_opener
@@ -803,6 +836,8 @@ class SecretPromptPresenter:
         self.terminal_input_flusher = terminal_input_flusher
         self.authorizer = authorizer
         self.secret_provider = secret_provider
+        self.prompt_provider = prompt_provider
+        self.credential_enroller = credential_enroller
         self.automatic_secret_input = automatic_secret_input
         self.terminal_handoff = (
             self._locked_terminal_handoff
@@ -864,6 +899,7 @@ class SecretPromptPresenter:
         prompt_episode = False
         automatic_attempts = 0
         automatic_failure_reported = False
+        enrollment_attempted = False
         try:
             while not self._stop.is_set():
                 try:
@@ -919,7 +955,36 @@ class SecretPromptPresenter:
                                     )
                             if automatic_submitted:
                                 automatic_attempts += 1
-                            elif not automatic_failure_reported:
+                            elif automatic_attempts == 0 and not enrollment_attempted:
+                                enrollment_attempted = True
+                                try:
+                                    enrolled_secret = self.credential_enroller(
+                                        recipient.request.machine_alias,
+                                        signature,
+                                    )
+                                    if enrolled_secret is not None:
+                                        if not isinstance(enrolled_secret, bytes):
+                                            raise TypeError(
+                                                "credential enroller returned non-bytes"
+                                            )
+                                        viewer.submit_secret_line(enrolled_secret)
+                                        automatic_attempts += 1
+                                        automatic_submitted = True
+                                        self.reporter(
+                                            "new sudo prompt and password enrolled for "
+                                            f"request {recipient.request_id} on "
+                                            f"{recipient.request.machine_alias}"
+                                        )
+                                except Exception:
+                                    if not automatic_failure_reported:
+                                        automatic_failure_reported = True
+                                        self.reporter(
+                                            "sudo credential enrollment failed for "
+                                            f"request {recipient.request_id} on "
+                                            f"{recipient.request.machine_alias}; Forward "
+                                            "Input is suppressed"
+                                        )
+                            if not automatic_submitted and not automatic_failure_reported:
                                 automatic_failure_reported = True
                                 self.reporter(
                                     "automatic mode could not use a stored sudo password "
@@ -957,8 +1022,11 @@ class SecretPromptPresenter:
             ),
             None,
         )
+        learned_prompt = self.prompt_provider(recipient.request.machine_alias)
         if endpoint is None or not _sudo_prompt_matches(
-            signature, endpoint.resolved_user
+            signature,
+            endpoint.resolved_user,
+            learned_prompt,
         ):
             return False
         secret = self.secret_provider(recipient.request.machine_alias)

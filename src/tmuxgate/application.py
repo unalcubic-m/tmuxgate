@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import getpass
 from pathlib import Path
 import signal
 import threading
 from typing import Callable
 
-from tmuxgate.approval import ApprovalDecision
+from tmuxgate.approval import ApprovalDecision, open_approval_terminal
 from tmuxgate.availability import MachineAvailabilityRegistry
 from tmuxgate.broker import BrokerServer
 from tmuxgate.broker_api import BrokerControlService
@@ -75,6 +76,60 @@ _RETAINED_SHUTDOWN_RESOURCES: list[ExitStack] = []
 
 class RecoveryBlockedError(RuntimeError):
     """Startup recovery found one or more jobs that may still be running."""
+
+
+def _enroll_sudo_credential(
+    operator: OperatorInterface,
+    store: SudoCredentialStore,
+    machine_name: str,
+    prompt: bytes,
+    *,
+    password_reader: Callable[..., str] = getpass.getpass,
+    terminal_opener: Callable[..., object] = open_approval_terminal,
+) -> bytes | None:
+    """Collect and persist one first-use password and exact machine prompt."""
+
+    if not isinstance(machine_name, str) or not isinstance(prompt, bytes):
+        raise TypeError("sudo credential enrollment identity is invalid")
+    if b"sudo" in prompt.lower():
+        stored = store.set_prompt(machine_name, prompt)
+        if stored is not None:
+            return stored
+    enrolled: list[bytes] = []
+
+    def session() -> None:
+        with terminal_opener() as terminal:
+            terminal.writer.write(
+                "\n[tmuxgate] First-use sudo setup\n"
+                f"Machine: {machine_name}\n"
+                f"Detected exact prompt: {prompt!r}\n"
+                "Entering a password trusts this exact prompt for this machine, "
+                "submits it now, and saves both for future automatic use.\n"
+                "Leave it empty to cancel. The password is hidden: "
+            )
+            terminal.writer.flush()
+            try:
+                password = password_reader("", stream=terminal.writer)
+            except (EOFError, KeyboardInterrupt):
+                terminal.writer.write("\nSudo setup cancelled.\n")
+                terminal.writer.flush()
+                return
+            if not password:
+                terminal.writer.write("Sudo setup cancelled.\n")
+                terminal.writer.flush()
+                return
+            store.set_credential(machine_name, password, prompt)
+            enrolled.append(password.encode("utf-8"))
+            terminal.writer.write(
+                "Sudo password and exact prompt saved; continuing automatically.\n"
+            )
+            terminal.writer.flush()
+
+    operator.run_terminal_session(
+        f"first-use sudo setup for {machine_name}",
+        session,
+    )
+    return enrolled[0] if enrolled else None
 
 
 class _ZeroFakeExecutor:
@@ -296,6 +351,15 @@ class UnifiedApplication:
                     terminal_lock=self._terminal,
                     authorizer=operator.request_secret_input_authorization,
                     secret_provider=credential_store.password_for,
+                    prompt_provider=credential_store.prompt_for,
+                    credential_enroller=lambda machine, prompt: (
+                        _enroll_sudo_credential(
+                            operator,
+                            credential_store,
+                            machine,
+                            prompt,
+                        )
+                    ),
                     automatic_secret_input=lambda: (
                         getattr(
                             operator,

@@ -304,8 +304,11 @@ The MCP surface contains exactly five tools:
   enabled state; endpoints, addresses, SSH identities/options, routes, keys,
   and host-key evidence remain private to the broker.
 - `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?,
-  interactive?)` validates and creates `RequestSpec(mode=ARGV)` without
-  shell-joining argv.
+  interactive?)` first resolves the supplied alias or normalized stored
+  description through the broker's sanitized machine list, then validates and
+  creates `RequestSpec(mode=ARGV)` without shell-joining argv. Generic display
+  suffixes such as `VM`, `server`, and `host` may be omitted when the result is
+  unique; unknown or ambiguous names fail closed.
 - `run_script(machine, cwd, purpose, script?, script_base64?, environment?,
   timeout_seconds?, interactive?)` requires exactly one UTF-8 text script or
   canonical base64 exact-byte script and creates `RequestSpec(mode=SCRIPT)`.
@@ -526,11 +529,12 @@ The interface tracks three synchronized foreground ownership states: `tui`,
 manual approval mode; automatic mode never queues it. A positive secret-input
 modal result atomically reserves
 `external` ownership for that exact prompt ID before its waiting worker is
-released. The SSH handoff reserves that same single slot under its own
-one-shot token, so an authentication session and a secret session can never
-own the terminal at once. No later modal can open during that reservation, and a stale or
-different prompt cannot consume it. The trusted presenter then asks the
-interface to run the already-bound viewer session. On the UI thread, the
+released. The SSH and first-use sudo setup handoffs reserve that same single
+slot under their own one-shot tokens, so authentication, enrollment, and a
+secret session can never own the terminal at once. No later modal can open
+during that reservation, and a stale or different prompt cannot consume it.
+The trusted presenter then asks the interface to run the already-bound viewer
+session. On the UI thread, the
 interface acquires the highest-priority `TerminalArbiter` lease and enters
 Textual's `App.suspend()` context. Textual stops its input reader and output,
 leaves alternate-screen/raw application mode, and restores the pre-TUI terminal
@@ -658,11 +662,12 @@ slots continue independently.
 sufficient and no tmuxgate execution confirmation is shown. When the dashboard
 has a password for the target machine, the same policy also enables automatic
 sudo input for up to three distinct prompt episodes. Repeated rejection lets
-sudo return its ordinary failure without opening terminal input.
+sudo return its ordinary failure without opening Forward Input.
 `approval_mode = "always"` disables stored-password submission and
 enables the execution and secret-input approval UI. Automatic mode suppresses
 the Forward Input UI even when a password is missing, rejected, or presented to
-a non-sudo prompt. Its compact decision card contains advisory
+a non-sudo prompt; first-use setup is a separate masked credential-enrollment
+boundary. Its compact decision card contains advisory
 purpose, logical machine, selected route and resolved identity, host-key status,
 working directory, a JSON-quoted shell-escaped argv view or script identity/source,
 environment, timeout, and human-readable advisories. Enter/`y` approves, `n`
@@ -678,18 +683,25 @@ process stdin, and client-supplied purpose text cannot answer it.
 Each SSH viewer runs in a separate owner-only local tmux server below the
 runtime directory. A broker-owned monitor checks only the visible cursor row of
 each viewer for a password or passphrase prompt; this deliberately ignores the
-nested remote tmux status row below it. In automatic mode, it accepts only the
-exact default `[sudo] password for <resolved-user>:` form (plus bounded literal
-sudo `pwfeedback` stars), loads the per-machine password through tmux stdin,
-pastes and deletes that private named buffer, and reports only that submission
-occurred. The secret never appears in a child argument, environment, activity,
+nested remote tmux status row below it. In automatic mode, it accepts the exact
+default `[sudo] password for <resolved-user>:` form or the exact prompt learned
+for that logical machine, plus bounded literal sudo `pwfeedback` stars. It loads
+the per-machine password through tmux stdin, pastes and deletes that private
+named buffer, and reports only that submission occurred. The secret never
+appears in a child argument, environment, activity,
 canonical stream, spool, or durable job record. One automatic submission is
 allowed per distinct prompt episode, capped at three per viewer. That bounded
 retry lets sudo finish its ordinary incorrect-password path without looping
 into account lockout.
 
-When automation is on, a missing credential, a different prompt, submission
-failure, or exhausted retry budget is reported without queuing Forward Input;
+When automation is on, an unknown prompt enters a one-time credential enrollment
+on the controlling terminal. If an existing password and the prompt text both
+identify sudo, tmuxgate learns the exact machine prompt without asking for the
+password again. Otherwise the operator sees the escaped exact prompt and enters
+a masked password; tmuxgate atomically stores schema-version-2 machine entries
+containing the password and base64-preserved prompt, migrating version-1
+password-only entries on their next write. Cancelling enrollment, submission
+failure, or an exhausted retry budget is reported without queuing Forward Input;
 the command stays detached to exit or time out. If automation is off, the
 presenter asks the operator to authorize the exact request, logical machine,
 approved command identity, connection plan, endpoint, and isolated viewer
@@ -820,9 +832,10 @@ control socket is removed. A separate post-enrollment master must then
 authenticate with the dedicated public key alone before the request receives a
 transport lease. A missing or rejected key therefore fails closed instead of
 falling back to another workstation identity or SSH password. SSH credentials
-are never stored. Sudo passwords may be stored separately in the owner-only
-mode-`0600` `sudo-credentials.json` state file; they are never part of SSH
-configuration, request evidence, results, or activity output.
+are never stored. Sudo passwords and learned exact prompt bytes may be stored
+separately in the owner-only mode-`0600` `sudo-credentials.json` state file;
+they are never part of SSH configuration, request evidence, results, or
+activity output.
 
 Only the enrollment master reaches the operator's terminal. The backend selects
 its start path from the invocation's own `interactive_terminal` policy: a
@@ -1026,8 +1039,9 @@ Prompt detection is offered only for an interactive request. `SshChannelRunner`
 watches a viewer only when the bound recipient's request asked for it, and
 `SecretPromptPresenter.watch` independently refuses a non-interactive recipient,
 so prompt-like text produced by a command that has no controlling terminal can
-never propose a handoff. An exact sudo prompt may consume the stored
-per-machine password when automation is on. Every other prompt requires the
+never propose a handoff. The exact default or learned machine prompt may consume
+the stored password when automation is on; an unknown prompt can invoke the
+first-use enrollment above. With automation off, every prompt requires the
 separate `SecretInputAuthorizationPrompt` decision described under the
 operator-interface boundary, which names the full request, machine, endpoint,
 approved command identity, and viewer session. Manual typed bytes are not
@@ -1092,7 +1106,11 @@ exit status, command output, viewer restoration, or completion.
 
 ## Route selection
 
-The client supplies only a validated logical machine alias. Before approval,
+The broker still receives only a validated logical machine alias. A Codex MCP
+caller may supply that alias or an unambiguous human form of its stored alias
+or description; the local MCP layer resolves it exclusively against the
+broker's sanitized machine list and never treats input as an address, endpoint,
+user, or SSH option. Before approval,
 the broker takes a local, read-only network snapshot. The implemented
 collector uses bounded, broker-owned `ip -j` and NetworkManager commands to
 read addresses, link flags/types, routes, the cached gateway neighbor,

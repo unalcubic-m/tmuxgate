@@ -901,7 +901,8 @@ class SudoCredentialScreen(ModalScreen[SudoCredentialAction | None]):
             yield Static("Reusable sudo password", markup=False, id="credential-title")
             yield Static(
                 "Stored in tmuxgate's owner-only state file and submitted only "
-                "to an exact sudo password prompt for this machine.",
+                "to the default or learned exact prompt for this machine. "
+                "Unknown prompts are learned during masked first-use setup.",
                 markup=False,
                 id="credential-help",
             )
@@ -1044,10 +1045,11 @@ class TmuxgateDashboardApp(App[None]):
                     "a  activity     r  requests   ?  help\n"
                     "q  stop tmuxgate\n\n"
                     "Automation defaults on: Codex approval is sufficient and "
-                    "stored sudo passwords are submitted to exact user-bound "
-                    "sudo prompts up to three times without a Forward Input "
-                    "window. Use the Dashboard button to restore manual tmuxgate "
-                    "approvals, and the Machines button to set or remove passwords. "
+                    "stored sudo passwords are submitted to default or learned "
+                    "machine prompts up to three times without Forward Input. "
+                    "The first unknown prompt runs one masked setup and saves its "
+                    "password and exact format. Use the Dashboard button to restore "
+                    "manual approvals, and Machines to set or remove passwords. "
                     "Exhausted-machine disable decisions use a "
                     "separate local-mutation modal.",
                     markup=False,

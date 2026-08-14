@@ -347,6 +347,73 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(token_path.stat().st_mode & 0o777, 0o600)
 
+    def test_first_use_sudo_enrollment_saves_prompt_and_hidden_password(self):
+        self.state_dir.mkdir(mode=0o700)
+        store = application.SudoCredentialStore(self.state_dir)
+        operator = mock.Mock()
+        operator.run_terminal_session.side_effect = lambda purpose, session: session()
+        output = io.StringIO()
+
+        secret = application._enroll_sudo_credential(
+            operator,
+            store,
+            "local",
+            b"[sudo: authenticate] Password:",
+            password_reader=lambda prompt, stream: "saved-secret",
+            terminal_opener=lambda: nullcontext(SimpleNamespace(writer=output)),
+        )
+
+        self.assertEqual(secret, b"saved-secret")
+        self.assertEqual(store.password_for("local"), b"saved-secret")
+        self.assertEqual(
+            store.prompt_for("local"),
+            b"[sudo: authenticate] Password:",
+        )
+        self.assertNotIn("saved-secret", output.getvalue())
+        self.assertIn("First-use sudo setup", output.getvalue())
+        operator.run_terminal_session.assert_called_once()
+
+    def test_existing_password_learns_identified_sudo_prompt_without_ui(self):
+        self.state_dir.mkdir(mode=0o700)
+        store = application.SudoCredentialStore(self.state_dir)
+        store.set_password("local", "existing-secret")
+        operator = mock.Mock()
+
+        secret = application._enroll_sudo_credential(
+            operator,
+            store,
+            "local",
+            b"[sudo: authenticate] Password:",
+        )
+
+        self.assertEqual(secret, b"existing-secret")
+        self.assertEqual(
+            store.prompt_for("local"),
+            b"[sudo: authenticate] Password:",
+        )
+        operator.run_terminal_session.assert_not_called()
+
+    def test_empty_first_use_sudo_enrollment_cancels_without_saving(self):
+        self.state_dir.mkdir(mode=0o700)
+        store = application.SudoCredentialStore(self.state_dir)
+        operator = mock.Mock()
+        operator.run_terminal_session.side_effect = lambda purpose, session: session()
+        output = io.StringIO()
+
+        secret = application._enroll_sudo_credential(
+            operator,
+            store,
+            "local",
+            b"Custom privileged Password:",
+            password_reader=lambda prompt, stream: "",
+            terminal_opener=lambda: nullcontext(SimpleNamespace(writer=output)),
+        )
+
+        self.assertIsNone(secret)
+        self.assertIsNone(store.password_for("local"))
+        self.assertIsNone(store.prompt_for("local"))
+        self.assertIn("cancelled", output.getvalue())
+
     def test_post_ready_mcp_exit_stops_and_fails_the_whole_application(self):
         broker = mock.Mock()
         broker.stop.return_value = True

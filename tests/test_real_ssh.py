@@ -26,6 +26,7 @@ from tmuxgate.real_ssh import (
     SshChannelRunner,
     SubprocessMasterBackend,
     _discard_pending_terminal_input,
+    _sudo_prompt_matches,
     secret_prompt_signature,
 )
 from tmuxgate.terminal import TerminalArbiter, TerminalUnavailableError
@@ -212,6 +213,41 @@ class InteractiveHandoffScopeTests(unittest.TestCase):
 
 
 class RealSshProcessTests(unittest.TestCase):
+    def test_automatic_sudo_matching_accepts_only_exact_supported_prompts(self):
+        accepted = (
+            (b"[sudo] password for operator:", None),
+            (b"[sudo] PASSWORD for operator: ***", None),
+            (
+                b"[sudo: authenticate] Password:",
+                b"[sudo: authenticate] Password:",
+            ),
+            (
+                b"[sudo: authenticate] Password: ***",
+                b"[sudo: authenticate] Password:",
+            ),
+        )
+        rejected = (
+            (b"operator@example's password:", None),
+            (b"Password:", None),
+            (b"[sudo: authenticate] Password:", None),
+            (b"[sudo: authenticate] Password:", b"Password:"),
+            (
+                b"prefix [sudo: authenticate] Password:",
+                b"[sudo: authenticate] Password:",
+            ),
+            (
+                b"[sudo: authenticate] Password: " + (b"*" * 257),
+                b"[sudo: authenticate] Password:",
+            ),
+        )
+
+        for prompt, learned in accepted:
+            with self.subTest(prompt=prompt, learned=learned):
+                self.assertTrue(_sudo_prompt_matches(prompt, "operator", learned))
+        for prompt, learned in rejected:
+            with self.subTest(prompt=prompt, learned=learned):
+                self.assertFalse(_sudo_prompt_matches(prompt, "operator", learned))
+
     def test_streaming_batch_enforces_limit_while_receiving(self):
         runner = SshChannelRunner()
         with tempfile.TemporaryFile("w+b") as destination:
@@ -385,6 +421,72 @@ class RealSshProcessTests(unittest.TestCase):
         finally:
             self.assertTrue(presenter.close())
 
+    def test_learned_sudo_password_is_submitted_without_operator_prompt(self):
+        viewer = ScriptedDetachedViewer("dadbdadbdadb")
+        viewer.prompt = b"[sudo: authenticate] Password:\n"
+        submitted = []
+        authorization_prompts = []
+        viewer.submit_secret_line = submitted.append
+
+        def unexpected_authorization(prompt):
+            authorization_prompts.append(prompt)
+            return OperatorDecision.for_prompt(prompt, ApprovalDecision.DENIED)
+
+        presenter = SecretPromptPresenter(
+            authorizer=unexpected_authorization,
+            secret_provider=lambda machine: b"stored-sudo-password",
+            prompt_provider=lambda machine: b"[sudo: authenticate] Password:",
+            automatic_secret_input=lambda: True,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer, secret_input_recipient(viewer))
+            deadline = time.monotonic() + 1
+            while not submitted and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(submitted, [b"stored-sudo-password"])
+            self.assertEqual(authorization_prompts, [])
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_unknown_prompt_enrolls_and_submits_once_without_forward_input(self):
+        viewer = ScriptedDetachedViewer("dadcdadcdadc")
+        viewer.prompt = b"Custom privileged password:\n"
+        submitted = []
+        enrollment_calls = []
+        authorization_prompts = []
+        viewer.submit_secret_line = submitted.append
+
+        def enroll(machine, prompt):
+            enrollment_calls.append((machine, prompt))
+            return b"newly-enrolled-password"
+
+        def unexpected_authorization(prompt):
+            authorization_prompts.append(prompt)
+            return OperatorDecision.for_prompt(prompt, ApprovalDecision.DENIED)
+
+        presenter = SecretPromptPresenter(
+            authorizer=unexpected_authorization,
+            credential_enroller=enroll,
+            automatic_secret_input=lambda: True,
+            poll_seconds=0.005,
+        )
+        try:
+            presenter.watch(viewer, secret_input_recipient(viewer))
+            deadline = time.monotonic() + 1
+            while not submitted and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(submitted, [b"newly-enrolled-password"])
+            self.assertEqual(
+                enrollment_calls,
+                [("app-server", b"Custom privileged password:")],
+            )
+            self.assertEqual(authorization_prompts, [])
+            time.sleep(0.05)
+            self.assertEqual(len(enrollment_calls), 1)
+        finally:
+            self.assertTrue(presenter.close())
+
     def test_non_sudo_password_prompt_never_receives_stored_secret(self):
         viewer = ScriptedDetachedViewer("dbdbdbdbdbdb")
         viewer.prompt = b"operator@example's password:\n"
@@ -472,6 +574,7 @@ class RealSshProcessTests(unittest.TestCase):
 
         viewer = RetryingViewer()
         submitted = []
+        enrollment_calls = []
         authorization_prompts = []
         notifications = []
         viewer.submit_secret_line = submitted.append
@@ -483,6 +586,9 @@ class RealSshProcessTests(unittest.TestCase):
         presenter = SecretPromptPresenter(
             authorizer=unexpected_authorization,
             secret_provider=lambda machine: b"old-stored-password",
+            credential_enroller=lambda machine, prompt: enrollment_calls.append(
+                (machine, prompt)
+            ),
             automatic_secret_input=lambda: True,
             reporter=notifications.append,
             poll_seconds=0.005,
@@ -503,6 +609,7 @@ class RealSshProcessTests(unittest.TestCase):
             self.assertTrue(
                 any("rejected repeatedly" in item for item in notifications)
             )
+            self.assertEqual(enrollment_calls, [])
         finally:
             self.assertTrue(presenter.close())
 
