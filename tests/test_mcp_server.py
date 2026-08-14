@@ -32,9 +32,10 @@ from tmuxgate.mcp_server import (
     OutputEncoding,
     _encode_output,
     _inline_stream,
+    _resolve_machine_name,
     create_mcp_server,
 )
-from tmuxgate.models import ExecutionMode
+from tmuxgate.models import ExecutionMode, ValidationError
 from tmuxgate.protocol import MAX_HEADER_BYTES
 from tmuxgate.runtime import create_broker_socket
 from tmuxgate.scheduler import RequestState
@@ -81,6 +82,41 @@ def reserve_tcp_port() -> int:
         return listener.getsockname()[1]
     finally:
         listener.close()
+
+
+class MachineNameResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.machines = (
+            SimpleNamespace(alias="dockercorevm", description="DockerCoreVM"),
+            SimpleNamespace(alias="ubuntu-server", description="Ubuntu server"),
+            SimpleNamespace(alias="build-host", description="DockerCore"),
+        )
+
+    def test_alias_and_stored_machine_names_resolve_to_exact_alias(self):
+        unambiguous = self.machines[:2]
+
+        self.assertEqual(
+            _resolve_machine_name("dockercorevm", unambiguous),
+            "dockercorevm",
+        )
+        self.assertEqual(
+            _resolve_machine_name("DockerCore", unambiguous),
+            "dockercorevm",
+        )
+        self.assertEqual(
+            _resolve_machine_name("docker-core", unambiguous),
+            "dockercorevm",
+        )
+        self.assertEqual(
+            _resolve_machine_name("Ubuntu", unambiguous),
+            "ubuntu-server",
+        )
+
+    def test_unknown_or_ambiguous_name_fails_closed(self):
+        with self.assertRaisesRegex(ValidationError, "does not match"):
+            _resolve_machine_name("192.0.2.1", self.machines)
+        with self.assertRaisesRegex(ValidationError, "ambiguous"):
+            _resolve_machine_name("DockerCore", self.machines)
 
 
 class BearerAuthMiddlewareTests(unittest.TestCase):
@@ -540,7 +576,7 @@ class McpBrokerIntegrationTests(unittest.TestCase):
                 argv_result = await client.call_tool(
                     "run_argv",
                     {
-                        "machine": "machine-a",
+                        "machine": "Machine A",
                         "cwd": "/tmp/path with spaces",
                         "argv": argv,
                         "purpose": "exercise exact argv",
@@ -551,7 +587,7 @@ class McpBrokerIntegrationTests(unittest.TestCase):
                 script_result = await client.call_tool(
                     "run_script",
                     {
-                        "machine": "machine-b",
+                        "machine": "Build",
                         "cwd": "/var/tmp",
                         "purpose": "exercise exact bytes",
                         "script_base64": base64.b64encode(script_bytes).decode("ascii"),
@@ -898,6 +934,11 @@ class McpBrokerIntegrationTests(unittest.TestCase):
             release_execution.wait()
             return FakeExecution(stdout=b"released")
 
+        control = BrokerControlService(
+            {"machine-a": SimpleNamespace(description="Application server")},
+            self.state,
+            self.spool,
+        )
         broker = BrokerServer(
             listener,
             allowed_machines=("machine-a",),
@@ -906,6 +947,7 @@ class McpBrokerIntegrationTests(unittest.TestCase):
             request_timeout_seconds=1.0,
             send_timeout_seconds=1.0,
             shutdown_timeout_seconds=0.1,
+            control_service=control,
         )
         port = reserve_tcp_port()
         embedded = EmbeddedMcpServer(
