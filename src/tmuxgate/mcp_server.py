@@ -454,7 +454,8 @@ def create_mcp_server(
             "only when the command genuinely needs a remote controlling "
             "terminal, for example a sudo password prompt. With tmuxgate "
             "Automation on, its stored per-machine sudo password is submitted "
-            "automatically; other prompts fall back to operator handoff."
+            "automatically for up to three sudo prompt episodes. Automation "
+            "never opens Forward Input; failures return through the command result."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=False,
@@ -503,7 +504,8 @@ def create_mcp_server(
             "inspect each stream's encoding. Set interactive=true only when the script "
             "genuinely needs a remote controlling terminal, for example a sudo password "
             "prompt. With tmuxgate Automation on, its stored per-machine sudo password "
-            "is submitted automatically; other prompts fall back to operator handoff."
+            "is submitted automatically for up to three sudo prompt episodes. "
+            "Automation never opens Forward Input; failures return through the result."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=False,

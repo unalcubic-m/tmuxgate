@@ -1045,9 +1045,10 @@ class TmuxgateDashboardApp(App[None]):
                     "q  stop tmuxgate\n\n"
                     "Automation defaults on: Codex approval is sufficient and "
                     "stored sudo passwords are submitted to exact user-bound "
-                    "sudo prompts. Use the Dashboard button to restore manual "
-                    "tmuxgate approvals, and the Machines button to set or remove "
-                    "passwords. Exhausted-machine disable decisions use a "
+                    "sudo prompts up to three times without a Forward Input "
+                    "window. Use the Dashboard button to restore manual tmuxgate "
+                    "approvals, and the Machines button to set or remove passwords. "
+                    "Exhausted-machine disable decisions use a "
                     "separate local-mutation modal.",
                     markup=False,
                     classes="panel",

@@ -552,7 +552,7 @@ class PlainTerminalInterfaceTests(unittest.TestCase):
             approval_terminal=ApprovalTerminal(
                 io.StringIO(f"forward {SECOND_REQUEST_ID}\n\n"), output
             ),
-            approval_mode="disabled",
+            approval_mode="always",
         )
         self.addCleanup(interface.close)
         self.assertIs(
@@ -577,7 +577,7 @@ class PlainTerminalInterfaceTests(unittest.TestCase):
             approval_terminal=ApprovalTerminal(
                 io.StringIO(f"forward {REQUEST_ID}\n"), io.StringIO()
             ),
-            approval_mode="disabled",
+            approval_mode="always",
         )
         self.addCleanup(approved.close)
         self.assertIs(
@@ -597,6 +597,17 @@ class PlainTerminalInterfaceTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(OperatorInterfaceError, "already submitted"):
             interface.request_execution_approval(prompt)
+        secret = SecretInputAuthorizationPrompt.create(
+            SECOND_REQUEST_ID,
+            request(),
+            build_plan(),
+            endpoint_id="home-lan",
+            viewer_session_id="tmuxgate-0123456789ab",
+        )
+        self.assertIs(
+            interface.request_secret_input_authorization(secret).decision,
+            ApprovalDecision.DENIED,
+        )
         self.assertTrue(interface.close())
         after_close = ExecutionApprovalPrompt.create(
             SECOND_REQUEST_ID,
