@@ -45,6 +45,9 @@ from tmuxgate.operator_interface import (
 )
 from tmuxgate import textual_interface as textual_interface_module
 from tmuxgate.textual_interface import (
+    BrokerConflictAction,
+    BrokerConflictDialogApp,
+    BrokerTakeoverConfirmationScreen,
     DashboardJob,
     DashboardMachine,
     DashboardRuntimeSnapshot,
@@ -66,6 +69,7 @@ from tmuxgate.textual_interface import (
     flush_textual_input,
     validate_textual_terminal,
 )
+from tmuxgate.runtime import BrokerAlreadyRunningError
 from tmuxgate.terminal import TerminalPriority
 from tmuxgate.settings import serialize_config
 from test_config import valid_config
@@ -173,6 +177,60 @@ class SuspendResumeTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             _resume_after(self._unguarded_suspension(events), session)
         self.assertEqual(events, ["suspend", "resume"])
+
+
+class BrokerConflictDialogTests(unittest.TestCase):
+    """Duplicate startup is visible and takeover remains independently armed."""
+
+    @staticmethod
+    def _error() -> BrokerAlreadyRunningError:
+        owner = SimpleNamespace(
+            pid=123,
+            process_start_ticks=456,
+            boot_id="00000000-0000-0000-0000-000000000000",
+        )
+        return BrokerAlreadyRunningError(Path("/runtime/broker.lock"), owner)
+
+    def test_safe_action_is_focused_and_status_is_an_explicit_result(self):
+        app = BrokerConflictDialogApp(self._error())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                self.assertEqual(
+                    app.focused.id,
+                    "broker-conflict-use-existing",
+                )
+                message = app.query_one("#broker-conflict-message", Static)
+                self.assertIn("Another tmuxgate broker", str(message.render()))
+                await pilot.click("#broker-conflict-status")
+                await pilot.pause()
+
+        asyncio.run(exercise())
+        self.assertIs(app.return_value, BrokerConflictAction.SHOW_STATUS)
+
+    def test_takeover_requires_a_second_armed_confirmation(self):
+        app = BrokerConflictDialogApp(self._error())
+
+        async def exercise() -> None:
+            with never_arms():
+                async with app.run_test(size=(100, 30)) as pilot:
+                    await pilot.click("#broker-conflict-takeover")
+                    await pilot.pause()
+                    screen = app.screen
+                    self.assertIsInstance(
+                        screen,
+                        BrokerTakeoverConfirmationScreen,
+                    )
+                    self.assertEqual(app.focused.id, "takeover-cancel")
+                    confirm = screen.query_one("#takeover-confirm", Button)
+                    self.assertTrue(confirm.disabled)
+                    await arm_now(screen, pilot)
+                    self.assertFalse(confirm.disabled)
+                    await pilot.click("#takeover-confirm")
+                    await pilot.pause()
+
+        asyncio.run(exercise())
+        self.assertIs(app.return_value, BrokerConflictAction.TAKEOVER)
 
 
 async def settle_armed(screen, pilot) -> None:

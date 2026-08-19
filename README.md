@@ -250,9 +250,14 @@ unified application. Stop it from the dashboard or with `Ctrl-C`; do not start
 a separate MCP process.
 
 Only one broker/runtime owner may be active for a configured state and runtime
-directory. A duplicate invocation exits before it reads secrets, recovers
-durable state, reconciles SSH sockets, or opens a listener. Inspect ownership
-without changing it, or explicitly perform a bounded safe recovery, with:
+directory. A duplicate default-TUI invocation opens a standalone conflict
+dialog with safe "Use existing / Exit", read-only status, and separately
+confirmed "Stop & start here" choices. The dialog itself owns no broker
+resource and appears before tmuxgate reads secrets, recovers durable state,
+reconciles SSH sockets, or opens a listener. Explicit `--plain` and
+noninteractive launches retain the full terminal diagnostic. Inspect ownership
+without changing it, or explicitly perform the same bounded safe recovery,
+with:
 
 ```bash
 tmuxgate runtime status

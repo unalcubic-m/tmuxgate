@@ -72,8 +72,15 @@ failure stops the already-started broker and unwinds owned resources; there is
 no silent broker-only mode. The lifecycle locks are the authoritative
 exclusion mechanism for issue #73. Their metadata binds PID, Linux boot ID,
 process start ticks, executable device/inode, UID, and one random instance ID.
-A contending process reports a clear already-running diagnostic only when the
-held record exactly matches the live process incarnation. Malformed metadata,
+A contending default-TUI process reports a standalone, non-owning conflict
+dialog only when the held record exactly matches the live process incarnation.
+The safe focused action exits and uses the existing broker; another action
+prints the read-only runtime status after the dialog closes. "Stop & start
+here" opens a second, armed confirmation and then uses the same bounded
+PIDFD/SIGTERM-only takeover before retrying startup once. The conflict dialog
+does not read secrets or durable state, reconcile sockets, open a listener, or
+accept work. Explicit `--plain`, a noninteractive terminal, or a dialog failure
+retains the complete stderr diagnostic and exits unavailable. Malformed metadata,
 PID reuse, mismatched identity, an active record without a matching lock, or
 disagreement between the two locks is ambiguous and is left untouched.
 Validated metadata on a free lock is reconciled as a stale crash remnant, while

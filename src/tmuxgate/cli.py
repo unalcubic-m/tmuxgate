@@ -68,6 +68,10 @@ from tmuxgate.settings import (
     set_machine_enabled,
 )
 from tmuxgate.terminal import TerminalArbiter, TerminalError, TerminalPriority
+from tmuxgate.textual_interface import (
+    BrokerConflictAction,
+    run_broker_conflict_dialog,
+)
 from tmuxgate.transport import MasterTransportPool, TransportError
 from tmuxgate.ssh import resolve_ssh_endpoint
 
@@ -850,6 +854,53 @@ def _runtime_takeover(args: argparse.Namespace) -> int:
     return 0
 
 
+def _startup_supports_broker_conflict_dialog(args: argparse.Namespace) -> bool:
+    return (
+        args.command in {None, "broker", "dashboard"}
+        and args.interface_mode == "tui"
+    )
+
+
+def _run_startup_handler(
+    args: argparse.Namespace,
+    handler: Callable[[argparse.Namespace], int],
+) -> int:
+    """Run startup with one safe duplicate-owner dialog/takeover opportunity."""
+
+    takeover_attempted = False
+    while True:
+        try:
+            return int(handler(args))
+        except BrokerAlreadyRunningError as exc:
+            if not _startup_supports_broker_conflict_dialog(args):
+                raise
+            if takeover_attempted:
+                raise RuntimeSecurityError(
+                    "a different broker acquired runtime ownership after the "
+                    "confirmed takeover; no second takeover was attempted"
+                )
+            try:
+                action = run_broker_conflict_dialog(exc)
+            except OperatorInterfaceError:
+                # A headless, redirected, background, or broken terminal retains
+                # the exact stderr diagnostic handled by main().
+                raise exc
+            if action is BrokerConflictAction.USE_EXISTING:
+                raise exc
+            if action is BrokerConflictAction.SHOW_STATUS:
+                return _runtime_status(args)
+            if action is not BrokerConflictAction.TAKEOVER:
+                raise exc
+            paths = _selected_runtime_paths(args, prepare=False)
+            owner = request_runtime_owner_shutdown(paths, timeout_seconds=10.0)
+            print(
+                f"tmuxgate: verified broker PID {owner.pid} released runtime "
+                "ownership; starting this tmuxgate instance. No SIGKILL was sent "
+                "and no socket was deleted."
+            )
+            takeover_attempted = True
+
+
 def _jobs_command(args: argparse.Namespace) -> int:
     state_dir = default_state_dir() if args.state_dir is None else Path(args.state_dir)
     # A live broker may be between creating and atomically publishing a state
@@ -1215,6 +1266,8 @@ def main(argv: list[str] | None = None) -> int:
         args.path = args.config
     try:
         handler = _unified_command if args.command is None else args.handler
+        if args.command in {None, "broker", "dashboard"}:
+            return _run_startup_handler(args, handler)
         return int(handler(args))
     except BrokerAlreadyRunningError as exc:
         print(f"tmuxgate: {exc}", file=sys.stderr)
