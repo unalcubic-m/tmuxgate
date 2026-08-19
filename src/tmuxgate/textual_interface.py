@@ -57,6 +57,7 @@ from .operator_interface import (
     SecretInputAuthorizationPrompt,
     SshRetryPrompt,
 )
+from .runtime import BrokerAlreadyRunningError
 from .terminal import TerminalArbiter, TerminalPriority
 
 
@@ -313,6 +314,227 @@ class _FailClosedDecisionScreen(ModalScreen[ApprovalDecision]):
             and not self._compact
         ):
             self._finish(ApprovalDecision.APPROVED)
+
+
+class BrokerConflictAction(StrEnum):
+    """Explicit local outcome selected by the duplicate-startup dialog."""
+
+    USE_EXISTING = "use-existing"
+    SHOW_STATUS = "show-status"
+    TAKEOVER = "takeover"
+
+
+class BrokerTakeoverConfirmationScreen(_FailClosedDecisionScreen):
+    """Second, armed confirmation before signaling the verified live owner."""
+
+    CSS = """
+    BrokerTakeoverConfirmationScreen {
+        align: center middle;
+        background: $background 80%;
+    }
+    #takeover-dialog {
+        width: 100%;
+        max-width: 100;
+        height: auto;
+        max-height: 100%;
+        border: heavy $error;
+        background: $surface;
+        padding: 1 2;
+    }
+    #takeover-heading { height: 3; text-style: bold; color: $error; }
+    #takeover-document { height: auto; max-height: 1fr; overflow-y: auto; padding: 1; }
+    #takeover-actions { height: 3; align-horizontal: right; }
+    #takeover-actions Button { margin-left: 1; min-width: 18; }
+    .decision-size-warning {
+        display: none;
+        height: 1fr;
+        content-align: center middle;
+        text-align: center;
+        color: $warning;
+        padding: 0 1;
+    }
+    BrokerTakeoverConfirmationScreen.compact-decision #takeover-dialog {
+        height: 100%;
+        padding: 0 1;
+    }
+    BrokerTakeoverConfirmationScreen.compact-decision #takeover-heading {
+        display: none;
+    }
+    """
+    BINDINGS = [Binding("escape", "safe_default", "Cancel", priority=True)]
+    SAFE_BUTTON_ID = "takeover-cancel"
+    POSITIVE_BUTTON_ID = "takeover-confirm"
+
+    def __init__(self, error: BrokerAlreadyRunningError) -> None:
+        if not isinstance(error, BrokerAlreadyRunningError):
+            raise TypeError("error must be a BrokerAlreadyRunningError")
+        super().__init__()
+        self.error = error
+
+    def compose(self) -> ComposeResult:
+        owner = self.error.owner
+        document = "\n".join(
+            (
+                f"Verified owner PID: {owner.pid}",
+                f"Lifecycle lock: {inert_text(self.error.path)}",
+                "",
+                "This sends SIGTERM only to the exactly verified broker owner, "
+                "waits for both lifecycle locks to be released, and then starts "
+                "this tmuxgate instance.",
+                "",
+                "It never sends SIGKILL and never deletes a held lock or an "
+                "unverified SSH control socket. If ownership changes or shutdown "
+                "cannot be proven, takeover fails closed.",
+            )
+        )
+        with Vertical(id="takeover-dialog"):
+            yield Static(
+                "Stop the existing tmuxgate broker?",
+                markup=False,
+                id="takeover-heading",
+            )
+            yield Static(
+                document,
+                markup=False,
+                id="takeover-document",
+                classes="decision-content",
+            )
+            yield Static("", markup=False, classes="decision-size-warning")
+            with Horizontal(id="takeover-actions"):
+                yield Button("Cancel", variant="primary", id="takeover-cancel")
+                yield Button(
+                    "Stop & start here",
+                    variant="error",
+                    id="takeover-confirm",
+                    disabled=True,
+                )
+
+
+class BrokerConflictDialogApp(App[BrokerConflictAction]):
+    """Non-owning startup dialog for one exactly verified live broker."""
+
+    TITLE = "tmuxgate"
+    SUB_TITLE = "another broker is running"
+    CSS = """
+    Screen {
+        align: center middle;
+        background: $background;
+    }
+    #broker-conflict-dialog {
+        width: 100%;
+        max-width: 110;
+        height: auto;
+        max-height: 100%;
+        border: heavy $warning;
+        background: $surface;
+        padding: 1 2;
+    }
+    #broker-conflict-heading {
+        height: 3;
+        text-style: bold;
+        color: $warning;
+    }
+    #broker-conflict-message {
+        height: auto;
+        max-height: 1fr;
+        overflow-y: auto;
+        padding: 1;
+    }
+    #broker-conflict-actions { height: 3; align-horizontal: right; }
+    #broker-conflict-actions Button { margin-left: 1; min-width: 18; }
+    """
+    BINDINGS = [
+        Binding("escape", "use_existing", "Use existing", priority=True),
+        Binding("q", "use_existing", "Use existing", priority=True),
+    ]
+
+    def __init__(self, error: BrokerAlreadyRunningError) -> None:
+        if not isinstance(error, BrokerAlreadyRunningError):
+            raise TypeError("error must be a BrokerAlreadyRunningError")
+        super().__init__()
+        self.error = error
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="broker-conflict-dialog"):
+            yield Static(
+                "Another tmuxgate broker is already running",
+                markup=False,
+                id="broker-conflict-heading",
+            )
+            yield Static(
+                str(self.error),
+                markup=False,
+                id="broker-conflict-message",
+            )
+            with Horizontal(id="broker-conflict-actions"):
+                yield Button(
+                    "Use existing / Exit",
+                    variant="primary",
+                    id="broker-conflict-use-existing",
+                )
+                yield Button(
+                    "Show runtime status",
+                    id="broker-conflict-status",
+                )
+                yield Button(
+                    "Stop & start here",
+                    variant="warning",
+                    id="broker-conflict-takeover",
+                )
+
+    def on_mount(self) -> None:
+        self.query_one("#broker-conflict-use-existing", Button).focus()
+        if self.is_headless:
+            return
+        try:
+            flush_textual_input()
+        except OperatorInterfaceError:
+            self.exit(BrokerConflictAction.USE_EXISTING)
+
+    def action_use_existing(self) -> None:
+        self.exit(BrokerConflictAction.USE_EXISTING)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "broker-conflict-use-existing":
+            self.exit(BrokerConflictAction.USE_EXISTING)
+        elif event.button.id == "broker-conflict-status":
+            self.exit(BrokerConflictAction.SHOW_STATUS)
+        elif event.button.id == "broker-conflict-takeover":
+            self.push_screen(
+                BrokerTakeoverConfirmationScreen(self.error),
+                self._complete_takeover_confirmation,
+            )
+
+    def _complete_takeover_confirmation(
+        self, decision: ApprovalDecision | None
+    ) -> None:
+        if decision is ApprovalDecision.APPROVED:
+            self.exit(BrokerConflictAction.TAKEOVER)
+        else:
+            self.query_one("#broker-conflict-use-existing", Button).focus()
+
+
+def run_broker_conflict_dialog(
+    error: BrokerAlreadyRunningError,
+) -> BrokerConflictAction:
+    """Show the duplicate-startup dialog without touching broker resources."""
+
+    if not isinstance(error, BrokerAlreadyRunningError):
+        raise TypeError("error must be a BrokerAlreadyRunningError")
+    validate_textual_terminal()
+    app = BrokerConflictDialogApp(error)
+    try:
+        result = app.run()
+    except BaseException as exc:
+        raise OperatorInterfaceError(
+            "the duplicate-startup dialog failed; using the plain diagnostic"
+        ) from exc
+    return (
+        result
+        if isinstance(result, BrokerConflictAction)
+        else BrokerConflictAction.USE_EXISTING
+    )
 
 
 class ExecutionApprovalScreen(_FailClosedDecisionScreen):

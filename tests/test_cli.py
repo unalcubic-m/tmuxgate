@@ -76,6 +76,118 @@ class CommandLineParsingTests(unittest.TestCase):
         self.assertIn("tmuxgate runtime status", message)
         self.assertIn("tmuxgate runtime takeover --yes", message)
 
+    def test_duplicate_startup_dialog_can_show_read_only_status(self):
+        owner = SimpleNamespace(
+            pid=123,
+            process_start_ticks=456,
+            boot_id="00000000-0000-0000-0000-000000000000",
+        )
+        error = BrokerAlreadyRunningError(Path("/runtime/broker.lock"), owner)
+        with (
+            mock.patch.object(cli, "_unified_command", side_effect=error),
+            mock.patch.object(
+                cli,
+                "run_broker_conflict_dialog",
+                return_value=cli.BrokerConflictAction.SHOW_STATUS,
+            ) as dialog,
+            mock.patch.object(cli, "_runtime_status", return_value=0) as status,
+        ):
+            result = cli.main([])
+
+        self.assertEqual(result, 0)
+        dialog.assert_called_once_with(error)
+        status.assert_called_once()
+
+    def test_duplicate_startup_dialog_can_take_over_once_and_retry(self):
+        owner = SimpleNamespace(
+            pid=123,
+            process_start_ticks=456,
+            boot_id="00000000-0000-0000-0000-000000000000",
+        )
+        error = BrokerAlreadyRunningError(Path("/runtime/broker.lock"), owner)
+        paths = SimpleNamespace()
+        output = io.StringIO()
+        with (
+            mock.patch.object(cli, "_unified_command", side_effect=(error, 0)) as run,
+            mock.patch.object(
+                cli,
+                "run_broker_conflict_dialog",
+                return_value=cli.BrokerConflictAction.TAKEOVER,
+            ) as dialog,
+            mock.patch.object(cli, "_selected_runtime_paths", return_value=paths),
+            mock.patch.object(
+                cli, "request_runtime_owner_shutdown", return_value=owner
+            ) as shutdown,
+            redirect_stdout(output),
+        ):
+            result = cli.main([])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_count, 2)
+        dialog.assert_called_once_with(error)
+        shutdown.assert_called_once_with(paths, timeout_seconds=10.0)
+        self.assertIn("starting this tmuxgate instance", output.getvalue())
+        self.assertIn("No SIGKILL was sent", output.getvalue())
+
+    def test_duplicate_startup_refuses_second_takeover_after_retry_race(self):
+        owner = SimpleNamespace(
+            pid=123,
+            process_start_ticks=456,
+            boot_id="00000000-0000-0000-0000-000000000000",
+        )
+        first_error = BrokerAlreadyRunningError(
+            Path("/runtime/broker.lock"), owner
+        )
+        second_error = BrokerAlreadyRunningError(
+            Path("/runtime/broker.lock"), owner
+        )
+        with (
+            mock.patch.object(
+                cli,
+                "_unified_command",
+                side_effect=(first_error, second_error),
+            ) as run,
+            mock.patch.object(
+                cli,
+                "run_broker_conflict_dialog",
+                return_value=cli.BrokerConflictAction.TAKEOVER,
+            ) as dialog,
+            mock.patch.object(cli, "_selected_runtime_paths") as paths,
+            mock.patch.object(
+                cli,
+                "request_runtime_owner_shutdown",
+                return_value=owner,
+            ) as shutdown,
+            redirect_stderr(io.StringIO()) as errors,
+        ):
+            result = cli.main([])
+
+        self.assertEqual(result, cli.EXIT_CONFIG)
+        self.assertEqual(run.call_count, 2)
+        dialog.assert_called_once_with(first_error)
+        paths.assert_called_once()
+        shutdown.assert_called_once()
+        self.assertIn("no second takeover was attempted", errors.getvalue())
+
+    def test_plain_duplicate_startup_never_opens_textual_dialog(self):
+        owner = SimpleNamespace(
+            pid=123,
+            process_start_ticks=456,
+            boot_id="00000000-0000-0000-0000-000000000000",
+        )
+        error = BrokerAlreadyRunningError(Path("/runtime/broker.lock"), owner)
+        errors = io.StringIO()
+        with (
+            mock.patch.object(cli, "_unified_command", side_effect=error),
+            mock.patch.object(cli, "run_broker_conflict_dialog") as dialog,
+            redirect_stderr(errors),
+        ):
+            result = cli.main(["--plain"])
+
+        self.assertEqual(result, cli.EXIT_UNAVAILABLE)
+        dialog.assert_not_called()
+        self.assertIn("Another tmuxgate broker is already running", errors.getvalue())
+
     def test_takeover_requires_explicit_confirmation_before_any_runtime_action(self):
         with (
             mock.patch.object(cli, "request_runtime_owner_shutdown") as shutdown,
