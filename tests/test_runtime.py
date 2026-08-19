@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import fcntl
 import os
 from pathlib import Path
 import re
@@ -12,7 +14,10 @@ from unittest import mock
 from tmuxgate.runtime import (
     BrokerListenerLifecycle,
     PeerCredentialError,
+    RuntimeOwnershipAmbiguousError,
+    RuntimeOwnershipStatus,
     RuntimeSecurityError,
+    acquire_runtime_ownership,
     acquire_broker_lock,
     acquire_state_lock,
     cleanup_socket_path,
@@ -29,11 +34,28 @@ from tmuxgate.runtime import (
     open_broker_listener,
     peer_credentials,
     prepare_runtime_layout,
+    request_runtime_owner_shutdown,
     require_same_uid,
+    resolve_runtime_paths,
 )
+from tmuxgate import runtime
 
 
 class RuntimePathTests(unittest.TestCase):
+    def test_read_only_path_resolution_and_status_create_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            paths = resolve_runtime_paths(
+                socket_path=base / "missing-runtime" / "broker.sock",
+                state_dir=base / "missing-state",
+            )
+
+            statuses = runtime.inspect_runtime_ownership(paths)
+
+            self.assertEqual([item.state for item in statuses], ["inactive", "inactive"])
+            self.assertFalse(paths.runtime_dir.exists())
+            self.assertFalse(paths.state_dir.exists())
+
     def test_default_socket_is_under_xdg_runtime_directory(self):
         path = default_socket_path({"XDG_RUNTIME_DIR": "/run/user/1234"})
         self.assertEqual(path, Path("/run/user/1234/tmuxgate/broker.sock"))
@@ -362,6 +384,220 @@ class BrokerLifecycleTests(unittest.TestCase):
 
             second = acquire_broker_lock(runtime_dir)
             second.close()
+            self.assertIn(b'"state":"released"', second.path.read_bytes())
+
+    def test_crash_metadata_is_reconciled_only_after_kernel_lock_is_free(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary) / "runtime"
+            ensure_private_directory(runtime_dir)
+            crashed = acquire_broker_lock(runtime_dir)
+            crashed_owner = replace(crashed.owner, pid=2_147_483_647)
+            crashed.close()
+            crashed.path.write_bytes(crashed_owner.to_bytes())
+
+            successor = acquire_broker_lock(runtime_dir)
+            try:
+                self.assertEqual(successor.reconciled_owner, crashed_owner)
+                self.assertNotEqual(successor.owner.instance_id, crashed_owner.instance_id)
+            finally:
+                successor.close()
+
+    def test_pid_reuse_metadata_is_not_mistaken_for_the_current_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary) / "runtime"
+            ensure_private_directory(runtime_dir)
+            original = acquire_broker_lock(runtime_dir)
+            reused = replace(
+                original.owner,
+                process_start_ticks=original.owner.process_start_ticks + 1,
+            )
+            original.close()
+            original.path.write_bytes(reused.to_bytes())
+
+            successor = acquire_broker_lock(runtime_dir)
+            try:
+                self.assertEqual(successor.reconciled_owner, reused)
+            finally:
+                successor.close()
+
+    def test_held_lock_with_mismatched_process_identity_is_ambiguous_and_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary) / "runtime"
+            ensure_private_directory(runtime_dir)
+            seeded = acquire_broker_lock(runtime_dir)
+            unrelated = replace(
+                seeded.owner,
+                executable_inode=seeded.owner.executable_inode + 1,
+            )
+            seeded.close()
+            seeded.path.write_bytes(unrelated.to_bytes())
+            descriptor = os.open(seeded.path, os.O_RDWR)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                before = seeded.path.read_bytes()
+                with self.assertRaisesRegex(
+                    RuntimeOwnershipAmbiguousError,
+                    "PID reuse or an unrelated process",
+                ):
+                    acquire_broker_lock(runtime_dir)
+                self.assertEqual(seeded.path.read_bytes(), before)
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+
+    def test_malformed_free_owner_metadata_fails_closed_and_is_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary) / "runtime"
+            ensure_private_directory(runtime_dir)
+            lock_path = runtime_dir / "broker.lock"
+            lock_path.write_bytes(b"not owner metadata\n")
+            lock_path.chmod(0o600)
+
+            with self.assertRaisesRegex(
+                RuntimeOwnershipAmbiguousError, "metadata is malformed"
+            ):
+                acquire_broker_lock(runtime_dir)
+
+            self.assertEqual(lock_path.read_bytes(), b"not owner metadata\n")
+
+    def test_two_concurrent_owners_have_one_winner_and_loser_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_dir = Path(temporary) / "runtime"
+            ensure_private_directory(runtime_dir)
+            barrier = threading.Barrier(2)
+            release = threading.Event()
+            finished = threading.Event()
+            outcomes: list[object] = []
+            guard = threading.Lock()
+
+            def compete() -> None:
+                barrier.wait(timeout=2)
+                try:
+                    outcome: object = acquire_broker_lock(runtime_dir)
+                except RuntimeSecurityError as exc:
+                    outcome = exc
+                with guard:
+                    outcomes.append(outcome)
+                    if len(outcomes) == 2:
+                        finished.set()
+                if not isinstance(outcome, BaseException):
+                    release.wait(timeout=2)
+                    outcome.close()
+
+            workers = [threading.Thread(target=compete, daemon=True) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            try:
+                self.assertTrue(finished.wait(timeout=2))
+                winners = [
+                    item for item in outcomes if not isinstance(item, BaseException)
+                ]
+                losers = [item for item in outcomes if isinstance(item, BaseException)]
+                self.assertEqual(len(winners), 1)
+                self.assertEqual(len(losers), 1)
+                self.assertIsInstance(losers[0], RuntimeSecurityError)
+                winner = winners[0]
+                self.assertEqual(winner.path.read_bytes(), winner.owner.to_bytes())
+            finally:
+                release.set()
+                for worker in workers:
+                    worker.join(timeout=2)
+
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+
+    def test_explicit_takeover_signals_only_one_verified_pidfd_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            paths = prepare_runtime_layout(
+                socket_path=base / "runtime" / "broker.sock",
+                state_dir=base / "state",
+            )
+            with acquire_runtime_ownership(paths) as ownership:
+                owner = ownership.state_lock.owner
+            active = (
+                RuntimeOwnershipStatus("active", paths.state_dir / "state.lock", owner, "active"),
+                RuntimeOwnershipStatus("active", paths.lock_path, owner, "active"),
+            )
+            inactive = (
+                RuntimeOwnershipStatus("inactive", paths.state_dir / "state.lock", None, "free"),
+                RuntimeOwnershipStatus("inactive", paths.lock_path, None, "free"),
+            )
+            pinned = os.open("/dev/null", os.O_RDONLY)
+            with (
+                mock.patch.object(
+                    runtime,
+                    "inspect_runtime_ownership",
+                    side_effect=(active, inactive),
+                ),
+                mock.patch.object(runtime, "_owner_process_state", return_value="matching"),
+                mock.patch.object(runtime.os, "pidfd_open", return_value=pinned),
+                mock.patch.object(
+                    runtime.signal,
+                    "pidfd_send_signal",
+                    create=True,
+                ) as send_signal,
+            ):
+                stopped = request_runtime_owner_shutdown(paths)
+
+            self.assertEqual(stopped, owner)
+            send_signal.assert_called_once_with(pinned, runtime.signal.SIGTERM, None, 0)
+
+    def test_takeover_rejects_unbounded_or_malformed_timeouts_before_inspection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            paths = prepare_runtime_layout(
+                socket_path=base / "runtime" / "broker.sock",
+                state_dir=base / "state",
+            )
+            with mock.patch.object(runtime, "inspect_runtime_ownership") as inspect:
+                for timeout in (0, -1, float("nan"), float("inf"), True):
+                    with self.subTest(timeout=timeout):
+                        with self.assertRaises(ValueError):
+                            request_runtime_owner_shutdown(paths, timeout_seconds=timeout)
+                with self.assertRaises(ValueError):
+                    request_runtime_owner_shutdown(
+                        paths,
+                        poll_interval_seconds=float("inf"),
+                    )
+            inspect.assert_not_called()
+
+    def test_unresponsive_owner_is_never_escalated_beyond_sigterm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            paths = prepare_runtime_layout(
+                socket_path=base / "runtime" / "broker.sock",
+                state_dir=base / "state",
+            )
+            with acquire_runtime_ownership(paths) as ownership:
+                owner = ownership.state_lock.owner
+            active = (
+                RuntimeOwnershipStatus("active", paths.state_dir / "state.lock", owner, "active"),
+                RuntimeOwnershipStatus("active", paths.lock_path, owner, "active"),
+            )
+            pinned = os.open("/dev/null", os.O_RDONLY)
+            with (
+                mock.patch.object(runtime, "inspect_runtime_ownership", return_value=active),
+                mock.patch.object(runtime, "_owner_process_state", return_value="matching"),
+                mock.patch.object(runtime.os, "pidfd_open", return_value=pinned),
+                mock.patch.object(
+                    runtime.signal,
+                    "pidfd_send_signal",
+                    create=True,
+                ) as send_signal,
+                mock.patch.object(runtime.os, "kill") as kill,
+                self.assertRaisesRegex(
+                    RuntimeOwnershipAmbiguousError,
+                    "was not killed",
+                ),
+            ):
+                request_runtime_owner_shutdown(
+                    paths,
+                    timeout_seconds=0.001,
+                    poll_interval_seconds=0.001,
+                )
+
+            send_signal.assert_called_once()
+            kill.assert_not_called()
 
     def test_singleton_lock_rejects_symlink_and_unsafe_mode(self):
         with tempfile.TemporaryDirectory() as temporary:

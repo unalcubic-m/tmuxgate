@@ -41,12 +41,19 @@ from tmuxgate.operator_interface import OperatorInterfaceError
 from tmuxgate.network_collect import collect_network_snapshot
 from tmuxgate.protocol import ProtocolError
 from tmuxgate.result import ExecutionResult, relay_transparent
+from tmuxgate.real_ssh import SubprocessMasterBackend
 from tmuxgate.runtime import (
+    BrokerAlreadyRunningError,
     RuntimeSecurityError,
+    acquire_runtime_ownership,
     acquire_state_lock,
+    cleanup_socket_path,
     default_socket_path,
     default_state_dir,
+    inspect_runtime_ownership,
     prepare_runtime_layout,
+    request_runtime_owner_shutdown,
+    resolve_runtime_paths,
 )
 from tmuxgate.scheduler import RequestState
 from tmuxgate.state import (
@@ -61,6 +68,8 @@ from tmuxgate.settings import (
     set_machine_enabled,
 )
 from tmuxgate.terminal import TerminalArbiter, TerminalError, TerminalPriority
+from tmuxgate.transport import MasterTransportPool, TransportError
+from tmuxgate.ssh import resolve_ssh_endpoint
 
 
 EXIT_USAGE = 64
@@ -225,6 +234,34 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
     jobs_parser.add_argument("--json", action="store_true")
     jobs_parser.set_defaults(handler=_jobs_command)
+
+    runtime_parser = subparsers.add_parser(
+        "runtime", help="inspect or safely recover broker runtime ownership"
+    )
+    runtime_subparsers = runtime_parser.add_subparsers(
+        dest="runtime_command", required=True
+    )
+    runtime_status_parser = runtime_subparsers.add_parser(
+        "status", help="show verified broker ownership without modifying it"
+    )
+    _add_local_paths(runtime_status_parser, inherit=True)
+    runtime_status_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
+    runtime_status_parser.set_defaults(handler=_runtime_status)
+    runtime_reconcile_parser = runtime_subparsers.add_parser(
+        "reconcile", help="retire only proven-stale broker and SSH artifacts"
+    )
+    _add_local_paths(runtime_reconcile_parser, config=True, inherit=True)
+    runtime_reconcile_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
+    runtime_reconcile_parser.set_defaults(handler=_runtime_reconcile)
+    runtime_takeover_parser = runtime_subparsers.add_parser(
+        "takeover",
+        help="explicitly request shutdown from one exactly verified live owner",
+    )
+    _add_local_paths(runtime_takeover_parser, inherit=True)
+    runtime_takeover_parser.add_argument("--state-dir", default=argparse.SUPPRESS)
+    runtime_takeover_parser.add_argument("--yes", action="store_true")
+    runtime_takeover_parser.add_argument("--timeout", type=float, default=10.0)
+    runtime_takeover_parser.set_defaults(handler=_runtime_takeover)
 
     recover_parser = subparsers.add_parser(
         "recover", help="reconcile one exact recovery-blocked request"
@@ -733,6 +770,86 @@ def _job_document(record: object) -> dict[str, object]:
     }
 
 
+def _selected_runtime_paths(args: argparse.Namespace, *, prepare: bool = True):
+    resolver = prepare_runtime_layout if prepare else resolve_runtime_paths
+    return resolver(
+        socket_path=args.socket,
+        state_dir=args.state_dir,
+    )
+
+
+def _runtime_status(args: argparse.Namespace) -> int:
+    paths = _selected_runtime_paths(args, prepare=False)
+    statuses = inspect_runtime_ownership(paths)
+    for item in statuses:
+        owner = ""
+        if item.owner is not None:
+            owner = (
+                f" pid={item.owner.pid} start_ticks="
+                f"{item.owner.process_start_ticks} boot_id={item.owner.boot_id}"
+            )
+        print(f"{item.path}: {item.state}{owner} ({item.detail})")
+    if any(item.state == "ambiguous" for item in statuses):
+        print(
+            "Runtime ownership is ambiguous. No artifact was modified; "
+            "do not manually delete lock or SSH control sockets.",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+    return 0
+
+
+def _runtime_reconcile(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    paths = _selected_runtime_paths(args)
+    with acquire_runtime_ownership(paths) as ownership:
+        pool = MasterTransportPool(
+            paths.control_dir,
+            backend=SubprocessMasterBackend(),
+            identity_revalidator=lambda endpoint: endpoint,
+            max_masters=config.broker.max_open_ssh_masters,
+            idle_timeout_seconds=config.broker.ssh_master_idle_timeout_seconds,
+        )
+        endpoints = tuple(
+            resolve_ssh_endpoint(machine, endpoint)
+            for machine in config.machines.values()
+            for endpoint in machine.endpoints
+        )
+        controls = pool.reconcile_startup(endpoints)
+        broker_socket = cleanup_socket_path(paths.socket_path)
+        messages = list(ownership.reconciled)
+        messages.extend(
+            f"reconciled stale SSH control socket {path}" for path in controls
+        )
+        if broker_socket:
+            messages.append(f"reconciled stale broker socket {paths.socket_path}")
+        if messages:
+            for message in messages:
+                print(f"tmuxgate: {message}")
+        else:
+            print("tmuxgate: no proven-stale runtime artifact needed reconciliation")
+    return 0
+
+
+def _runtime_takeover(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise ValidationError(
+            "runtime takeover requires --yes because it sends SIGTERM to the "
+            "exact verified broker owner"
+        )
+    paths = _selected_runtime_paths(args, prepare=False)
+    owner = request_runtime_owner_shutdown(
+        paths,
+        timeout_seconds=args.timeout,
+    )
+    print(
+        f"tmuxgate: verified broker PID {owner.pid} released runtime ownership. "
+        "No SIGKILL was sent and no socket was deleted. Start tmuxgate normally "
+        "to reconcile proven-stale artifacts and become the new owner."
+    )
+    return 0
+
+
 def _jobs_command(args: argparse.Namespace) -> int:
     state_dir = default_state_dir() if args.state_dir is None else Path(args.state_dir)
     # A live broker may be between creating and atomically publishing a state
@@ -1099,6 +1216,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         handler = _unified_command if args.command is None else args.handler
         return int(handler(args))
+    except BrokerAlreadyRunningError as exc:
+        print(f"tmuxgate: {exc}", file=sys.stderr)
+        return EXIT_UNAVAILABLE
     except RecoveryBlockedError as exc:
         print(f"tmuxgate: {exc}", file=sys.stderr)
         return EXIT_SOFTWARE
@@ -1118,6 +1238,7 @@ def main(argv: list[str] | None = None) -> int:
         StateError,
         SpoolError,
         TerminalError,
+        TransportError,
         OSError,
     ) as exc:
         print(f"tmuxgate: operation failed: {exc}", file=sys.stderr)

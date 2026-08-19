@@ -45,7 +45,7 @@ from tmuxgate.real_ssh import (
     SubprocessMasterBackend,
 )
 from tmuxgate.runtime import (
-    acquire_state_lock,
+    acquire_runtime_ownership,
     load_or_create_mcp_token,
     open_broker_listener,
     prepare_runtime_layout,
@@ -199,30 +199,8 @@ class UnifiedApplication:
             socket_path=self._socket_path,
             state_dir=self._state_dir,
         )
-        bearer_token = load_or_create_mcp_token(paths.state_dir)
-        credential_store = SudoCredentialStore(paths.state_dir)
-        if self._operator_interface is not None:
-            operator = self._operator_interface
-        elif self._textual:
-            operator = TextualOperatorInterface(
-                self._terminal,
-                approval_mode=config.broker.approval_mode,
-                credential_store=credential_store,
-            )
-        else:
-            operator = PlainTerminalInterface(
-                self._terminal,
-                dashboard=self._dashboard,
-                approval_mode=config.broker.approval_mode,
-            )
-        if isinstance(operator, TextualOperatorInterface):
-            def set_automatic_mode(enabled: bool) -> str:
-                mode = "disabled" if enabled else "always"
-                set_approval_mode(self._config_path, mode)
-                return mode
-
-            operator.bind_automation_setter(set_automatic_mode)
         clean = True
+        operator: OperatorInterface
         pool: MasterTransportPool | None = None
         prompt_presenter: SecretPromptPresenter | None = None
         broker: BrokerServer | None = None
@@ -249,11 +227,35 @@ class UnifiedApplication:
                 pass
 
         with ExitStack() as resources:
+            # Both locks precede token/state/spool access, operator activation,
+            # stale-master reconciliation, and every work-accepting listener.
+            ownership = resources.enter_context(acquire_runtime_ownership(paths))
+            for message in ownership.reconciled:
+                print(f"tmuxgate: {message}")
+            bearer_token = load_or_create_mcp_token(paths.state_dir)
+            credential_store = SudoCredentialStore(paths.state_dir)
+            if self._operator_interface is not None:
+                operator = self._operator_interface
+            elif self._textual:
+                operator = TextualOperatorInterface(
+                    self._terminal,
+                    approval_mode=config.broker.approval_mode,
+                    credential_store=credential_store,
+                )
+            else:
+                operator = PlainTerminalInterface(
+                    self._terminal,
+                    dashboard=self._dashboard,
+                    approval_mode=config.broker.approval_mode,
+                )
+            if isinstance(operator, TextualOperatorInterface):
+                def set_automatic_mode(enabled: bool) -> str:
+                    mode = "disabled" if enabled else "always"
+                    set_approval_mode(self._config_path, mode)
+                    return mode
+
+                operator.bind_automation_setter(set_automatic_mode)
             resources.callback(close_operator)
-            # The state-directory lock is the application singleton.  It must
-            # precede recovery so a second invocation (even with a different
-            # custom socket path) cannot rewrite live durable records.
-            resources.enter_context(acquire_state_lock(paths.state_dir))
             store = resources.enter_context(DurableStateStore(paths.state_dir))
             spool = resources.enter_context(ResultSpool(paths.state_dir))
             recovery = recover_startup(store)
@@ -262,14 +264,6 @@ class UnifiedApplication:
                 raise RecoveryBlockedError(
                     f"recovery blocks new approvals: {blocked}"
                 )
-            # The listener owns a second lock in its runtime directory.  The
-            # state lock serializes recovery; this runtime lock separately
-            # serializes stale-socket inspection and binding even when two
-            # invocations select different state directories.
-            lifecycle = resources.enter_context(
-                open_broker_listener(paths.socket_path)
-            )
-
             if self._fake:
                 def approver(request_id: str, request: RequestSpec) -> ApprovalDecision:
                     prompt = ExecutionApprovalPrompt.create(
@@ -335,6 +329,16 @@ class UnifiedApplication:
                     ),
                     key_manager=AutoSshKeyManager(),
                 )
+                startup_endpoints = tuple(
+                    resolve_ssh_endpoint(machine, endpoint)
+                    for machine in config.machines.values()
+                    for endpoint in machine.endpoints
+                )
+                for reconciled_path in pool.reconcile_startup(startup_endpoints):
+                    print(
+                        "tmuxgate: reconciled stale SSH control socket "
+                        f"{reconciled_path}"
+                    )
 
                 def close_pool() -> None:
                     assert pool is not None
@@ -430,6 +434,12 @@ class UnifiedApplication:
                 approval_discarder = executor.discard_approval
                 delivery_observer = executor.result_delivery_finished
 
+            lifecycle = resources.enter_context(
+                open_broker_listener(
+                    paths.socket_path,
+                    existing_lock=ownership.runtime_lock,
+                )
+            )
             control_service = BrokerControlService(
                 config.machines,
                 store,

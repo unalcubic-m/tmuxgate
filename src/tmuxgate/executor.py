@@ -354,7 +354,9 @@ class RealExecutor:
                     self.operator_interface.request_fallback(prompt),
                 )
                 if decision is not ApprovalDecision.APPROVED:
-                    raise TransportError("human denied the next approved fallback")
+                    raise TransportError(
+                        f"{failure}; human denied the next approved fallback"
+                    )
                 self._publish_connection(
                     request_id,
                     request,

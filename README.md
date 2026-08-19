@@ -249,6 +249,23 @@ form. `tmuxgate broker` is a deprecated compatibility alias for the same
 unified application. Stop it from the dashboard or with `Ctrl-C`; do not start
 a separate MCP process.
 
+Only one broker/runtime owner may be active for a configured state and runtime
+directory. A duplicate invocation exits before it reads secrets, recovers
+durable state, reconciles SSH sockets, or opens a listener. Inspect ownership
+without changing it, or explicitly perform a bounded safe recovery, with:
+
+```bash
+tmuxgate runtime status
+tmuxgate runtime reconcile
+tmuxgate runtime takeover --yes
+```
+
+`runtime takeover` signals only an owner whose two lifecycle locks contain the
+same verified process-incarnation identity. It sends `SIGTERM` through a Linux
+PID descriptor, never sends `SIGKILL`, and never deletes a held lock or an
+unverified SSH socket. If status reports ambiguous evidence, inspect it instead
+of manually deleting lock or control files.
+
 The stable dashboard keeps readiness and bounded operational state in place:
 
 ```text
@@ -385,8 +402,9 @@ encoding of `utf-8` does not make it trusted or durably verified.
 The former public `tmuxgate exec` and `tmuxgate script` commands have been
 removed. Their structured request and exact-byte client functionality remains
 internal to the MCP adapter and tests. `tmuxgate jobs`, `attach`, `collect`,
-`recover`, configuration commands, and fail-closed administrative surfaces
-remain available.
+`recover`, `runtime status`, `runtime reconcile`, `runtime takeover`,
+configuration commands, and fail-closed administrative surfaces remain
+available.
 
 ### Interactive commands and remote sudo
 

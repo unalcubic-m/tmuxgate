@@ -43,6 +43,7 @@ class FakeMasterBackend:
         self.fail_next_start = False
         self.fail_next_check = False
         self.fail_next_stop = False
+        self.die_during_next_stop = False
 
     def start_master(self, invocation, control_path):
         self.starts.append(invocation)
@@ -67,6 +68,12 @@ class FakeMasterBackend:
 
     def stop_master(self, invocation, control_path):
         self.stops.append(invocation)
+        if self.die_during_next_stop:
+            self.die_during_next_stop = False
+            master = self.sockets.pop(control_path, None)
+            if master is not None:
+                master.close()
+            raise RuntimeError("synthetic exit failure after master death")
         if self.fail_next_stop:
             self.fail_next_stop = False
             raise RuntimeError("synthetic master stop failure")
@@ -373,6 +380,46 @@ class MasterPoolTests(unittest.TestCase):
         self.assertEqual(self.backend.stops, [])
         replacement.release()
 
+    def test_startup_reconciliation_retires_a_proven_dead_configured_socket(self):
+        lease = self.acquire(0)
+        path = lease.transport.control_path
+        lease.release()
+        self.backend.expire(path, leave_path=True)
+        successor = self._successor_pool()
+
+        reconciled = successor.reconcile_startup((self.endpoints[0],))
+
+        self.assertEqual(reconciled, (path,))
+        self.assertFalse(path.exists())
+        replacement = self._acquire_from(successor, 0)
+        replacement.release()
+
+    def test_startup_reconciliation_leaves_unsafe_socket_untouched(self):
+        lease = self.acquire(0)
+        path = lease.transport.control_path
+        lease.release()
+        self.backend.expire(path, leave_path=True)
+        path.chmod(0o666)
+        successor = self._successor_pool()
+
+        with self.assertRaisesRegex(TransportError, "unsafe or ambiguous"):
+            successor.reconcile_startup((self.endpoints[0],))
+
+        self.assertTrue(path.exists())
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o666)
+
+    def test_startup_reconciliation_refuses_socket_without_current_identity(self):
+        lease = self.acquire(0)
+        path = lease.transport.control_path
+        lease.release()
+        successor = self._successor_pool()
+
+        with self.assertRaisesRegex(TransportError, "lacks current endpoint identity"):
+            successor.reconcile_startup(())
+
+        self.assertTrue(path.exists())
+        self.assertIn(path, self.backend.sockets)
+
     def test_a_pre_existing_non_socket_is_refused_and_never_removed(self):
         lease = self.acquire(0)
         path = lease.transport.control_path
@@ -427,6 +474,88 @@ class MasterPoolTests(unittest.TestCase):
             set(self.pool.retained_machine_names),
             {"hypervisor", "utility-server", "edge-server"},
         )
+
+    def test_proven_dead_idle_master_recovers_from_failed_stop_at_capacity(self):
+        paths = []
+        for index in range(3):
+            self.now = float(index)
+            lease = self.acquire(index, request_id=f"{index + 1:032x}")
+            paths.append(lease.transport.control_path)
+            lease.release()
+
+        self.backend.die_during_next_stop = True
+        replacement = self.acquire(3, request_id="4" * 32)
+
+        self.assertEqual(len(self.backend.stops), 1)
+        self.assertEqual(len(self.backend.checks), 5)
+        self.assertFalse(paths[0].exists())
+        self.assertEqual(
+            set(self.pool.retained_machine_names),
+            {"hypervisor", "utility-server", "edge-server"},
+        )
+        replacement.release()
+
+    def test_live_master_with_failed_stop_remains_retained_and_blocks_eviction(self):
+        paths = []
+        for index in range(3):
+            lease = self.acquire(index, request_id=f"{index + 1:032x}")
+            paths.append(lease.transport.control_path)
+            lease.release()
+
+        self.backend.fail_next_stop = True
+        with self.assertRaisesRegex(TransportError, "master is still live"):
+            self.acquire(3, request_id="4" * 32)
+
+        self.assertTrue(paths[0].exists())
+        self.assertEqual(len(self.backend.starts), 3)
+        self.assertEqual(len(self.backend.stops), 1)
+        self.assertEqual(
+            set(self.pool.retained_machine_names),
+            {"app-server", "hypervisor", "utility-server"},
+        )
+
+    def _fill_retained_pool(self):
+        paths = []
+        for index in range(3):
+            lease = self.acquire(index, request_id=f"{index + 1:032x}")
+            paths.append(lease.transport.control_path)
+            lease.release()
+        return paths
+
+    def test_wrong_mode_idle_control_socket_is_never_removed_during_eviction(self):
+        paths = self._fill_retained_pool()
+        paths[0].chmod(0o666)
+
+        with self.assertRaisesRegex(TransportError, "owned mode-0600"):
+            self.acquire(3, request_id="4" * 32)
+
+        self.assertTrue(paths[0].exists())
+        self.assertEqual(len(self.backend.stops), 0)
+        self.assertEqual(len(self.backend.starts), 3)
+
+    def test_wrong_type_idle_control_path_is_never_removed_during_eviction(self):
+        paths = self._fill_retained_pool()
+        self.backend.expire(paths[0], leave_path=False)
+        paths[0].write_bytes(b"not a socket")
+        paths[0].chmod(0o600)
+
+        with self.assertRaisesRegex(TransportError, "owned mode-0600"):
+            self.acquire(3, request_id="4" * 32)
+
+        self.assertEqual(paths[0].read_bytes(), b"not a socket")
+        self.assertEqual(len(self.backend.stops), 0)
+        self.assertEqual(len(self.backend.starts), 3)
+
+    def test_unowned_idle_control_socket_is_never_removed_during_eviction(self):
+        paths = self._fill_retained_pool()
+        self.pool.expected_uid += 1
+
+        with self.assertRaisesRegex(TransportError, "owned mode-0600"):
+            self.acquire(3, request_id="4" * 32)
+
+        self.assertTrue(paths[0].exists())
+        self.assertEqual(len(self.backend.stops), 0)
+        self.assertEqual(len(self.backend.starts), 3)
 
     def test_three_jobs_can_pin_same_or_different_masters(self):
         first = self.acquire(0)

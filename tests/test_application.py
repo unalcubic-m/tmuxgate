@@ -15,7 +15,13 @@ from unittest import mock
 from tmuxgate import application
 from tmuxgate.application import RecoveryBlockedError, UnifiedApplication
 from tmuxgate.mcp_server import McpServerError
-from tmuxgate.runtime import RuntimeSecurityError, acquire_state_lock
+from tmuxgate.runtime import (
+    BrokerAlreadyRunningError,
+    RuntimeSecurityError,
+    acquire_runtime_ownership,
+    acquire_state_lock,
+    prepare_runtime_layout,
+)
 from tmuxgate.textual_interface import TextualOperatorInterface
 from tmuxgate.transport import MasterTransportPool
 
@@ -193,6 +199,7 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
         )
         lease.release()
         self.assertEqual(pool.retained_machine_names, ("app-server",))
+        pool.reconcile_startup = mock.Mock(return_value=())
 
         broker = mock.Mock()
         broker.stop.return_value = True
@@ -242,7 +249,12 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
             ) as listener,
         ):
             app.run()
-        listener.assert_called_once_with(self.socket_path)
+        listener.assert_called_once()
+        self.assertEqual(listener.call_args.args, (self.socket_path,))
+        self.assertEqual(
+            listener.call_args.kwargs["existing_lock"].path,
+            self.socket_path.parent / "broker.lock",
+        )
 
     def test_textual_terminal_validation_precedes_listener_start(self):
         _write_config(self.config_path, approval_mode="always")
@@ -485,7 +497,7 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
         self.assertIn("New work is no longer accepted", message)
         self.assertIn("tmuxgate will return status 70", message)
         self.assertIn("run 'tmuxgate jobs' after exit", message)
-        with self.assertRaisesRegex(RuntimeSecurityError, "another state lifecycle"):
+        with self.assertRaisesRegex(RuntimeSecurityError, "state lifecycle"):
             acquire_state_lock(self.state_dir)
 
         retained = application._RETAINED_SHUTDOWN_RESOURCES.pop()
@@ -610,6 +622,7 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
         events: list[str] = []
         pool = mock.Mock()
         pool.close_idle.side_effect = lambda: events.append("pool.close")
+        pool.reconcile_startup.return_value = ()
         presenter = mock.Mock()
         presenter.close.side_effect = lambda: events.append("presenter.close") or True
         lifecycle = SimpleNamespace(listener=object(), socket_path=self.socket_path)
@@ -675,13 +688,37 @@ class UnifiedApplicationLifecycleTests(unittest.TestCase):
         with acquire_state_lock(self.state_dir):
             with mock.patch.object(application, "recover_startup") as recover:
                 with self.assertRaisesRegex(
-                    RuntimeSecurityError,
-                    "another state lifecycle",
+                    BrokerAlreadyRunningError,
+                    "Another tmuxgate broker",
                 ):
                     app.run()
 
         recover.assert_not_called()
         self.assertFalse(self.socket_path.exists())
+
+    def test_duplicate_owner_is_rejected_before_token_operator_or_services(self):
+        paths = prepare_runtime_layout(
+            socket_path=self.socket_path,
+            state_dir=self.state_dir,
+        )
+        app = self._application(lambda *args: None)
+        with acquire_runtime_ownership(paths):
+            with (
+                mock.patch.object(application, "load_or_create_mcp_token") as token,
+                mock.patch.object(application, "recover_startup") as recover,
+                mock.patch.object(application, "open_broker_listener") as listener,
+                mock.patch.object(application, "BrokerServer") as broker,
+                self.assertRaisesRegex(
+                    BrokerAlreadyRunningError,
+                    "No existing broker or SSH master was modified",
+                ),
+            ):
+                app.run()
+
+        token.assert_not_called()
+        recover.assert_not_called()
+        listener.assert_not_called()
+        broker.assert_not_called()
 
     def test_signal_handlers_request_stop_and_are_restored(self):
         app = self._application()

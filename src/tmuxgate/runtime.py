@@ -6,13 +6,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import errno
 import fcntl
+import json
+import math
 import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import socket
 import stat
 import struct
+import time
 
 
 SOCKET_DIRECTORY_NAME = "tmuxgate"
@@ -29,6 +33,8 @@ LOCK_MODE = 0o600
 TOKEN_MODE = 0o600
 PRIVATE_DIRECTORY_MODE = 0o700
 DEFAULT_LISTEN_BACKLOG = 16
+OWNER_METADATA_SCHEMA = 1
+MAX_OWNER_METADATA_BYTES = 4096
 
 
 class RuntimeSecurityError(RuntimeError):
@@ -37,6 +43,32 @@ class RuntimeSecurityError(RuntimeError):
 
 class PeerCredentialError(RuntimeSecurityError):
     """Peer credentials were unavailable, malformed, or unauthorized."""
+
+
+class BrokerAlreadyRunningError(RuntimeSecurityError):
+    """A verified live tmuxgate process holds a lifecycle lock."""
+
+    def __init__(
+        self,
+        path: Path,
+        owner: RuntimeOwnerRecord,
+        lifecycle_name: str = "broker",
+    ) -> None:
+        self.path = path
+        self.owner = owner
+        super().__init__(
+            "Another tmuxgate broker is already running and owns this runtime.\n"
+            f"Verified owner PID {owner.pid} already holds the "
+            f"{lifecycle_name} lifecycle lock {path}.\n"
+            "No existing broker or SSH master was modified.\n"
+            "Use the existing broker, run 'tmuxgate runtime status', or "
+            "explicitly stop/replace it with 'tmuxgate runtime takeover --yes' "
+            "before retrying."
+        )
+
+
+class RuntimeOwnershipAmbiguousError(RuntimeSecurityError):
+    """Runtime ownership could not be proven safe in either direction."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +90,54 @@ class RuntimePaths:
     mcp_token_path: Path
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeOwnerRecord:
+    """Exact Linux process incarnation recorded beside an advisory lock."""
+
+    instance_id: str
+    pid: int
+    uid: int
+    boot_id: str
+    process_start_ticks: int
+    executable_device: int
+    executable_inode: int
+    started_at_ns: int
+
+    def to_bytes(self) -> bytes:
+        document = {
+            "boot_id": self.boot_id,
+            "executable_device": self.executable_device,
+            "executable_inode": self.executable_inode,
+            "instance_id": self.instance_id,
+            "pid": self.pid,
+            "process_start_ticks": self.process_start_ticks,
+            "schema": OWNER_METADATA_SCHEMA,
+            "started_at_ns": self.started_at_ns,
+            "state": "active",
+            "uid": self.uid,
+        }
+        return (
+            json.dumps(
+                document,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+            + b"\n"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeOwnershipStatus:
+    """One race-bounded observation of a lifecycle lock."""
+
+    state: str
+    path: Path
+    owner: RuntimeOwnerRecord | None
+    detail: str
+
+
 _UCRED = struct.Struct("=iII")
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY
@@ -72,6 +152,12 @@ _LOCK_OPEN_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
 )
 _MCP_TOKEN_PATTERN = re.compile(rb"[0-9a-f]{64}\n\Z", re.ASCII)
+_INSTANCE_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
+_BOOT_ID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z",
+    re.ASCII,
+)
+_RELEASED_OWNER_METADATA = b'{"schema":1,"state":"released"}\n'
 
 
 def _expected_uid(value: int | None) -> int:
@@ -140,6 +226,39 @@ def default_state_dir(
     """Return the durable application state directory."""
 
     return default_state_home(environ) / STATE_DIRECTORY_NAME
+
+
+def resolve_runtime_paths(
+    socket_path: os.PathLike[str] | str | None = None,
+    *,
+    state_dir: os.PathLike[str] | str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> RuntimePaths:
+    """Derive runtime paths without creating or changing filesystem state."""
+
+    selected_socket = (
+        default_socket_path(environ)
+        if socket_path is None
+        else _absolute_path(socket_path, label="broker socket path")
+    )
+    if selected_socket.name in {"", ".", ".."}:
+        raise RuntimeSecurityError("broker socket path must name a file")
+    durable_state_dir = (
+        default_state_dir(environ)
+        if state_dir is None
+        else _absolute_path(state_dir, label="state directory")
+    )
+    runtime_dir = selected_socket.parent
+    return RuntimePaths(
+        runtime_dir=runtime_dir,
+        socket_path=selected_socket,
+        state_dir=durable_state_dir,
+        control_dir=runtime_dir / CONTROL_DIRECTORY_NAME,
+        viewer_dir=runtime_dir / VIEWER_DIRECTORY_NAME,
+        spool_dir=durable_state_dir / SPOOL_DIRECTORY_NAME,
+        lock_path=runtime_dir / BROKER_LOCK_FILE_NAME,
+        mcp_token_path=durable_state_dir / MCP_TOKEN_FILE_NAME,
+    )
 
 
 def _validate_directory_stat(
@@ -772,13 +891,249 @@ def _validate_lock_stat(
         )
 
 
+def _read_boot_id() -> str:
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii"
+        ).strip()
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeOwnershipAmbiguousError(
+            f"cannot read the Linux boot identity: {exc}"
+        ) from exc
+    if _BOOT_ID_PATTERN.fullmatch(value) is None:
+        raise RuntimeOwnershipAmbiguousError("Linux boot identity is malformed")
+    return value
+
+
+def _read_process_start_ticks(pid: int) -> int:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_bytes()
+    except FileNotFoundError:
+        raise ProcessLookupError(pid) from None
+    except OSError as exc:
+        raise RuntimeOwnershipAmbiguousError(
+            f"cannot inspect process {pid} start identity: {exc}"
+        ) from exc
+    closing = raw.rfind(b")")
+    if closing < 0:
+        raise RuntimeOwnershipAmbiguousError(
+            f"process {pid} start identity is malformed"
+        )
+    fields = raw[closing + 1 :].split()
+    # The suffix starts at proc(5) field 3 (state); starttime is field 22.
+    if len(fields) <= 19 or not fields[19].isdigit():
+        raise RuntimeOwnershipAmbiguousError(
+            f"process {pid} start identity is malformed"
+        )
+    return int(fields[19])
+
+
+def _read_process_executable(pid: int) -> tuple[int, int]:
+    try:
+        metadata = os.stat(f"/proc/{pid}/exe")
+    except FileNotFoundError:
+        raise ProcessLookupError(pid) from None
+    except OSError as exc:
+        raise RuntimeOwnershipAmbiguousError(
+            f"cannot inspect process {pid} executable identity: {exc}"
+        ) from exc
+    return metadata.st_dev, metadata.st_ino
+
+
+def _current_owner_record() -> RuntimeOwnerRecord:
+    pid = os.getpid()
+    executable_device, executable_inode = _read_process_executable(pid)
+    return RuntimeOwnerRecord(
+        instance_id=secrets.token_hex(16),
+        pid=pid,
+        uid=os.geteuid(),
+        boot_id=_read_boot_id(),
+        process_start_ticks=_read_process_start_ticks(pid),
+        executable_device=executable_device,
+        executable_inode=executable_inode,
+        started_at_ns=time.time_ns(),
+    )
+
+
+def _require_metadata_integer(
+    document: Mapping[str, object],
+    name: str,
+) -> int:
+    value = document.get(name)
+    if type(value) is not int or value < 0:
+        raise RuntimeOwnershipAmbiguousError(
+            f"runtime owner metadata has an invalid {name}"
+        )
+    return value
+
+
+def _decode_owner_metadata(
+    raw: bytes,
+) -> tuple[str, RuntimeOwnerRecord | None]:
+    if raw == _RELEASED_OWNER_METADATA:
+        return "released", None
+    if not raw:
+        return "legacy-empty", None
+    try:
+        document = json.loads(raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeOwnershipAmbiguousError(
+            "runtime owner metadata is malformed"
+        ) from exc
+    expected_keys = {
+        "boot_id",
+        "executable_device",
+        "executable_inode",
+        "instance_id",
+        "pid",
+        "process_start_ticks",
+        "schema",
+        "started_at_ns",
+        "state",
+        "uid",
+    }
+    if not isinstance(document, dict) or set(document) != expected_keys:
+        raise RuntimeOwnershipAmbiguousError(
+            "runtime owner metadata has an unexpected shape"
+        )
+    if document.get("schema") != OWNER_METADATA_SCHEMA:
+        raise RuntimeOwnershipAmbiguousError(
+            "runtime owner metadata has an unsupported schema"
+        )
+    if document.get("state") != "active":
+        raise RuntimeOwnershipAmbiguousError(
+            "runtime owner metadata has an invalid state"
+        )
+    instance_id = document.get("instance_id")
+    boot_id = document.get("boot_id")
+    if (
+        not isinstance(instance_id, str)
+        or _INSTANCE_ID_PATTERN.fullmatch(instance_id) is None
+    ):
+        raise RuntimeOwnershipAmbiguousError(
+            "runtime owner metadata has an invalid instance ID"
+        )
+    if not isinstance(boot_id, str) or _BOOT_ID_PATTERN.fullmatch(boot_id) is None:
+        raise RuntimeOwnershipAmbiguousError(
+            "runtime owner metadata has an invalid boot ID"
+        )
+    return (
+        "active",
+        RuntimeOwnerRecord(
+            instance_id=instance_id,
+            pid=_require_metadata_integer(document, "pid"),
+            uid=_require_metadata_integer(document, "uid"),
+            boot_id=boot_id,
+            process_start_ticks=_require_metadata_integer(
+                document, "process_start_ticks"
+            ),
+            executable_device=_require_metadata_integer(
+                document, "executable_device"
+            ),
+            executable_inode=_require_metadata_integer(
+                document, "executable_inode"
+            ),
+            started_at_ns=_require_metadata_integer(document, "started_at_ns"),
+        ),
+    )
+
+
+def _read_lock_metadata(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    raw = os.read(descriptor, MAX_OWNER_METADATA_BYTES + 1)
+    if len(raw) > MAX_OWNER_METADATA_BYTES:
+        raise RuntimeOwnershipAmbiguousError("runtime owner metadata is too large")
+    return raw
+
+
+def _write_lock_metadata(descriptor: int, raw: bytes) -> None:
+    if not raw or len(raw) > MAX_OWNER_METADATA_BYTES:
+        raise RuntimeOwnershipAmbiguousError("refusing invalid runtime owner metadata")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    os.ftruncate(descriptor, 0)
+    view = memoryview(raw)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise RuntimeOwnershipAmbiguousError(
+                "could not completely write runtime owner metadata"
+            )
+        view = view[written:]
+    os.fsync(descriptor)
+
+
+def _owner_process_state(owner: RuntimeOwnerRecord) -> str:
+    if owner.boot_id != _read_boot_id():
+        return "different"
+    try:
+        start_ticks = _read_process_start_ticks(owner.pid)
+        executable_device, executable_inode = _read_process_executable(owner.pid)
+    except ProcessLookupError:
+        return "absent"
+    try:
+        process_uid = os.stat(f"/proc/{owner.pid}").st_uid
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        raise RuntimeOwnershipAmbiguousError(
+            f"cannot inspect process {owner.pid} ownership: {exc}"
+        ) from exc
+    if (
+        process_uid != owner.uid
+        or start_ticks != owner.process_start_ticks
+        or executable_device != owner.executable_device
+        or executable_inode != owner.executable_inode
+    ):
+        return "different"
+    return "matching"
+
+
+def _same_process_incarnation(
+    left: RuntimeOwnerRecord,
+    right: RuntimeOwnerRecord,
+) -> bool:
+    return (
+        left.pid,
+        left.uid,
+        left.boot_id,
+        left.process_start_ticks,
+        left.executable_device,
+        left.executable_inode,
+    ) == (
+        right.pid,
+        right.uid,
+        right.boot_id,
+        right.process_start_ticks,
+        right.executable_device,
+        right.executable_inode,
+    )
+
+
 class BrokerSingletonLock:
     """An owner-only advisory lock held by a broker lifecycle owner."""
 
-    __slots__ = ("path", "_descriptor", "_closed")
+    __slots__ = (
+        "path",
+        "owner",
+        "reconciled_owner",
+        "reconciled_legacy_metadata",
+        "_descriptor",
+        "_closed",
+    )
 
-    def __init__(self, path: Path, descriptor: int) -> None:
+    def __init__(
+        self,
+        path: Path,
+        descriptor: int,
+        owner: RuntimeOwnerRecord,
+        *,
+        reconciled_owner: RuntimeOwnerRecord | None,
+        reconciled_legacy_metadata: bool,
+    ) -> None:
         self.path = path
+        self.owner = owner
+        self.reconciled_owner = reconciled_owner
+        self.reconciled_legacy_metadata = reconciled_legacy_metadata
         self._descriptor = descriptor
         self._closed = False
 
@@ -789,6 +1144,7 @@ class BrokerSingletonLock:
         *,
         expected_uid: int | None = None,
         lock_file_name: str = BROKER_LOCK_FILE_NAME,
+        owner: RuntimeOwnerRecord | None = None,
     ) -> BrokerSingletonLock:
         if lock_file_name == BROKER_LOCK_FILE_NAME:
             lifecycle_name = "broker"
@@ -804,14 +1160,24 @@ class BrokerSingletonLock:
         parent_descriptor = _open_private_directory(parent, expected_uid=uid)
         lock_path = parent / lock_file_name
         descriptor: int | None = None
+        created = False
         try:
             try:
-                descriptor = os.open(
-                    lock_file_name,
-                    _LOCK_OPEN_FLAGS,
-                    LOCK_MODE,
-                    dir_fd=parent_descriptor,
-                )
+                try:
+                    descriptor = os.open(
+                        lock_file_name,
+                        _LOCK_OPEN_FLAGS | os.O_EXCL,
+                        LOCK_MODE,
+                        dir_fd=parent_descriptor,
+                    )
+                    created = True
+                except FileExistsError:
+                    descriptor = os.open(
+                        lock_file_name,
+                        _LOCK_OPEN_FLAGS,
+                        LOCK_MODE,
+                        dir_fd=parent_descriptor,
+                    )
             except OSError as exc:
                 raise RuntimeSecurityError(
                     f"cannot securely open {lifecycle_name} lock {lock_path}: {exc}"
@@ -830,14 +1196,61 @@ class BrokerSingletonLock:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise RuntimeSecurityError(
-                    f"another {lifecycle_name} lifecycle already holds {lock_path}"
-                ) from exc
+                try:
+                    metadata_state, existing_owner = _decode_owner_metadata(
+                        _read_lock_metadata(descriptor)
+                    )
+                    if metadata_state != "active" or existing_owner is None:
+                        raise RuntimeOwnershipAmbiguousError(
+                            f"{lifecycle_name} lock is held but its owner metadata "
+                            f"is not active: {lock_path}. No runtime artifact was modified."
+                        )
+                    if _owner_process_state(existing_owner) == "matching":
+                        raise BrokerAlreadyRunningError(
+                            lock_path, existing_owner, lifecycle_name
+                        ) from exc
+                    raise RuntimeOwnershipAmbiguousError(
+                        f"{lifecycle_name} lock is held but its process identity "
+                        f"does not match the recorded owner: {lock_path}. "
+                        "PID reuse or an unrelated process is possible; no runtime "
+                        "artifact was modified. Run 'tmuxgate runtime status'."
+                    )
+                except BrokerAlreadyRunningError:
+                    raise
+                except RuntimeOwnershipAmbiguousError:
+                    raise
             except OSError as exc:
                 raise RuntimeSecurityError(
                     f"cannot acquire {lifecycle_name} singleton lock {lock_path}: {exc}"
                 ) from exc
-            return cls(lock_path, descriptor)
+            metadata_state, existing_owner = _decode_owner_metadata(
+                _read_lock_metadata(descriptor)
+            )
+            reconciled_owner: RuntimeOwnerRecord | None = None
+            reconciled_legacy = False
+            if metadata_state == "active":
+                assert existing_owner is not None
+                if _owner_process_state(existing_owner) == "matching":
+                    raise RuntimeOwnershipAmbiguousError(
+                        f"{lifecycle_name} lock is free but the recorded process is "
+                        f"still live: {lock_path}. No runtime artifact was modified."
+                    )
+                reconciled_owner = existing_owner
+            elif metadata_state == "legacy-empty" and not created:
+                reconciled_legacy = True
+            selected_owner = _current_owner_record() if owner is None else owner
+            if selected_owner.uid != uid:
+                raise RuntimeOwnershipAmbiguousError(
+                    "runtime owner UID does not match the lifecycle directory owner"
+                )
+            _write_lock_metadata(descriptor, selected_owner.to_bytes())
+            return cls(
+                lock_path,
+                descriptor,
+                selected_owner,
+                reconciled_owner=reconciled_owner,
+                reconciled_legacy_metadata=reconciled_legacy,
+            )
         except BaseException:
             if descriptor is not None:
                 os.close(descriptor)
@@ -854,9 +1267,12 @@ class BrokerSingletonLock:
             return
         self._closed = True
         try:
-            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            _write_lock_metadata(self._descriptor, _RELEASED_OWNER_METADATA)
         finally:
-            os.close(self._descriptor)
+            try:
+                fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(self._descriptor)
 
     def __enter__(self) -> BrokerSingletonLock:
         if self._closed:
@@ -871,16 +1287,22 @@ def acquire_broker_lock(
     runtime_dir: os.PathLike[str] | str,
     *,
     expected_uid: int | None = None,
+    owner: RuntimeOwnerRecord | None = None,
 ) -> BrokerSingletonLock:
     """Acquire the explicit broker singleton lifecycle lock."""
 
-    return BrokerSingletonLock.acquire(runtime_dir, expected_uid=expected_uid)
+    return BrokerSingletonLock.acquire(
+        runtime_dir,
+        expected_uid=expected_uid,
+        owner=owner,
+    )
 
 
 def acquire_state_lock(
     state_dir: os.PathLike[str] | str,
     *,
     expected_uid: int | None = None,
+    owner: RuntimeOwnerRecord | None = None,
 ) -> BrokerSingletonLock:
     """Acquire the durable-state lifecycle lock independently of the listener."""
 
@@ -888,6 +1310,286 @@ def acquire_state_lock(
         state_dir,
         expected_uid=expected_uid,
         lock_file_name=STATE_LOCK_FILE_NAME,
+        owner=owner,
+    )
+
+
+class RuntimeOwnership:
+    """Own the durable state and ephemeral runtime as one broker lifecycle."""
+
+    __slots__ = ("state_lock", "runtime_lock", "_closed")
+
+    def __init__(
+        self,
+        state_lock: BrokerSingletonLock,
+        runtime_lock: BrokerSingletonLock,
+    ) -> None:
+        self.state_lock = state_lock
+        self.runtime_lock = runtime_lock
+        self._closed = False
+
+    @property
+    def reconciled(self) -> tuple[str, ...]:
+        messages: list[str] = []
+        for lock in (self.state_lock, self.runtime_lock):
+            if lock.reconciled_owner is not None:
+                messages.append(
+                    f"reconciled stale owner metadata at {lock.path} "
+                    f"from PID {lock.reconciled_owner.pid}"
+                )
+            elif lock.reconciled_legacy_metadata:
+                messages.append(
+                    f"reconciled legacy empty lifecycle metadata at {lock.path}"
+                )
+        return tuple(messages)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        runtime_error: BaseException | None = None
+        try:
+            self.runtime_lock.close()
+        except BaseException as exc:
+            runtime_error = exc
+        try:
+            self.state_lock.close()
+        except BaseException:
+            if runtime_error is None:
+                raise
+        if runtime_error is not None:
+            raise runtime_error
+
+    def __enter__(self) -> RuntimeOwnership:
+        if self._closed:
+            raise RuntimeSecurityError("runtime ownership is already closed")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+
+def acquire_runtime_ownership(
+    paths: RuntimePaths,
+    *,
+    expected_uid: int | None = None,
+) -> RuntimeOwnership:
+    """Acquire both broker-owned trees before any component can accept work."""
+
+    if not isinstance(paths, RuntimePaths):
+        raise TypeError("paths must be RuntimePaths")
+    owner = _current_owner_record()
+    state_lock = acquire_state_lock(
+        paths.state_dir,
+        expected_uid=expected_uid,
+        owner=owner,
+    )
+    try:
+        runtime_lock = acquire_broker_lock(
+            paths.runtime_dir,
+            expected_uid=expected_uid,
+            owner=owner,
+        )
+    except BaseException:
+        state_lock.close()
+        raise
+    return RuntimeOwnership(state_lock, runtime_lock)
+
+
+def inspect_lifecycle_lock(
+    directory: os.PathLike[str] | str,
+    *,
+    lock_file_name: str,
+    expected_uid: int | None = None,
+) -> RuntimeOwnershipStatus:
+    """Observe one lifecycle lock without changing its metadata or owner."""
+
+    if lock_file_name not in {BROKER_LOCK_FILE_NAME, STATE_LOCK_FILE_NAME}:
+        raise ValueError("unsupported tmuxgate lifecycle lock name")
+    uid = _expected_uid(expected_uid)
+    parent = _absolute_path(directory, label="lifecycle directory")
+    try:
+        parent_descriptor = _open_private_directory(parent, expected_uid=uid)
+    except RuntimeSecurityError as exc:
+        cause: BaseException | None = exc
+        while cause is not None and not isinstance(cause, FileNotFoundError):
+            cause = cause.__cause__
+        if cause is None:
+            raise
+        return RuntimeOwnershipStatus(
+            "inactive", parent / lock_file_name, None, "directory does not exist"
+        )
+    descriptor: int | None = None
+    path = parent / lock_file_name
+    try:
+        try:
+            descriptor = os.open(
+                lock_file_name,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return RuntimeOwnershipStatus(
+                "inactive", path, None, "lock file does not exist"
+            )
+        opened = os.fstat(descriptor)
+        named = os.stat(
+            lock_file_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        _validate_lock_stat(path, opened, expected_uid=uid)
+        if not _same_object(opened, named):
+            raise RuntimeOwnershipAmbiguousError(
+                f"lifecycle lock changed while inspecting it: {path}"
+            )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            metadata_state, owner = _decode_owner_metadata(
+                _read_lock_metadata(descriptor)
+            )
+            if metadata_state != "active" or owner is None:
+                return RuntimeOwnershipStatus(
+                    "ambiguous",
+                    path,
+                    None,
+                    "lock is held but active owner metadata is unavailable",
+                )
+            process_state = _owner_process_state(owner)
+            if process_state == "matching":
+                return RuntimeOwnershipStatus(
+                    "active",
+                    path,
+                    owner,
+                    "verified live tmuxgate owner holds the lock",
+                )
+            return RuntimeOwnershipStatus(
+                "ambiguous",
+                path,
+                owner,
+                "lock is held but PID reuse or unrelated-process identity is possible",
+            )
+        metadata_state, owner = _decode_owner_metadata(_read_lock_metadata(descriptor))
+        if metadata_state == "active" and owner is not None:
+            return RuntimeOwnershipStatus(
+                "stale",
+                path,
+                owner,
+                "lock is free and stale owner metadata remains",
+            )
+        return RuntimeOwnershipStatus(
+            "inactive", path, None, "lock is free and no active owner is recorded"
+        )
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def inspect_runtime_ownership(paths: RuntimePaths) -> tuple[RuntimeOwnershipStatus, ...]:
+    """Inspect both durable-state and ephemeral-runtime owners."""
+
+    return (
+        inspect_lifecycle_lock(
+            paths.state_dir,
+            lock_file_name=STATE_LOCK_FILE_NAME,
+        ),
+        inspect_lifecycle_lock(
+            paths.runtime_dir,
+            lock_file_name=BROKER_LOCK_FILE_NAME,
+        ),
+    )
+
+
+def request_runtime_owner_shutdown(
+    paths: RuntimePaths,
+    *,
+    timeout_seconds: float = 10.0,
+    poll_interval_seconds: float = 0.05,
+) -> RuntimeOwnerRecord:
+    """Explicitly request SIGTERM from one exactly verified broker owner.
+
+    This never sends SIGKILL and never removes a lock, socket, or metadata
+    file.  The caller must start a replacement only after both kernel locks
+    have been observed free.
+    """
+
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+        or isinstance(poll_interval_seconds, bool)
+        or not isinstance(poll_interval_seconds, (int, float))
+        or not math.isfinite(poll_interval_seconds)
+        or poll_interval_seconds <= 0
+    ):
+        raise ValueError("takeover timeouts must be positive finite numbers")
+    statuses = inspect_runtime_ownership(paths)
+    if any(item.state == "ambiguous" for item in statuses):
+        raise RuntimeOwnershipAmbiguousError(
+            "runtime ownership is ambiguous; no process was signalled"
+        )
+    active = [item.owner for item in statuses if item.state == "active"]
+    if len(active) != len(statuses) or any(item is None for item in active):
+        raise RuntimeOwnershipAmbiguousError(
+            "a takeover requires the same verified live owner on both lifecycle locks; "
+            "no process was signalled"
+        )
+    owner = active[0]
+    assert owner is not None
+    if not all(
+        item is not None and _same_process_incarnation(owner, item)
+        for item in active[1:]
+    ):
+        raise RuntimeOwnershipAmbiguousError(
+            "lifecycle locks name different process incarnations; no process was signalled"
+        )
+    if _owner_process_state(owner) != "matching":
+        raise RuntimeOwnershipAmbiguousError(
+            "runtime owner changed before takeover; no process was signalled"
+        )
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is None or pidfd_send_signal is None:
+        raise RuntimeOwnershipAmbiguousError(
+            "safe pidfd takeover is unavailable; no process was signalled"
+        )
+    try:
+        pidfd = pidfd_open(owner.pid, 0)
+    except OSError as exc:
+        raise RuntimeOwnershipAmbiguousError(
+            f"could not pin the verified owner process: {exc}; no signal was sent"
+        ) from exc
+    try:
+        if _owner_process_state(owner) != "matching":
+            raise RuntimeOwnershipAmbiguousError(
+                "runtime owner changed while pinning it; no signal was sent"
+            )
+        pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+    finally:
+        os.close(pidfd)
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        current = inspect_runtime_ownership(paths)
+        if all(item.state in {"inactive", "stale"} for item in current):
+            return owner
+        if any(item.state == "ambiguous" for item in current):
+            raise RuntimeOwnershipAmbiguousError(
+                "runtime ownership became ambiguous after SIGTERM; no artifact was removed"
+            )
+        time.sleep(min(poll_interval_seconds, max(0.0, deadline - time.monotonic())))
+    raise RuntimeOwnershipAmbiguousError(
+        "verified broker did not release runtime ownership after SIGTERM; "
+        "it was not killed and no runtime artifact was removed"
     )
 
 
@@ -1096,6 +1798,7 @@ class BrokerListenerLifecycle:
         "_lock",
         "_bound_metadata",
         "_expected_uid",
+        "_owns_lock",
         "_closed",
     )
 
@@ -1107,12 +1810,14 @@ class BrokerListenerLifecycle:
         bound_metadata: os.stat_result,
         *,
         expected_uid: int,
+        owns_lock: bool = True,
     ) -> None:
         self.listener = listener
         self.socket_path = socket_path
         self._lock = lock
         self._bound_metadata = bound_metadata
         self._expected_uid = expected_uid
+        self._owns_lock = owns_lock
         self._closed = False
 
     @property
@@ -1135,7 +1840,8 @@ class BrokerListenerLifecycle:
                 expected_uid=self._expected_uid,
             )
         finally:
-            self._lock.close()
+            if self._owns_lock:
+                self._lock.close()
 
     def __enter__(self) -> BrokerListenerLifecycle:
         if self._closed:
@@ -1152,6 +1858,7 @@ def open_broker_listener(
     expected_uid: int | None = None,
     environ: Mapping[str, str] | None = None,
     backlog: int = DEFAULT_LISTEN_BACKLOG,
+    existing_lock: BrokerSingletonLock | None = None,
 ) -> BrokerListenerLifecycle:
     """Open a broker listener with a runtime-path lock held for its lifetime."""
 
@@ -1163,7 +1870,16 @@ def open_broker_listener(
         expected_uid=uid,
         environ=environ,
     )
-    lock = acquire_broker_lock(runtime_dir, expected_uid=uid)
+    if existing_lock is None:
+        lock = acquire_broker_lock(runtime_dir, expected_uid=uid)
+        owns_lock = True
+    else:
+        lock = existing_lock
+        owns_lock = False
+        if lock.closed or lock.path != runtime_dir / BROKER_LOCK_FILE_NAME:
+            raise RuntimeSecurityError(
+                "existing broker lock does not own the selected runtime directory"
+            )
     listener: socket.socket | None = None
     metadata: os.stat_result | None = None
     try:
@@ -1181,13 +1897,15 @@ def open_broker_listener(
             lock,
             metadata,
             expected_uid=uid,
+            owns_lock=owns_lock,
         )
     except BaseException:
         if listener is not None:
             listener.close()
         if metadata is not None:
             _unlink_created_socket(path, metadata, expected_uid=uid)
-        lock.close()
+        if owns_lock:
+            lock.close()
         raise
 
 
