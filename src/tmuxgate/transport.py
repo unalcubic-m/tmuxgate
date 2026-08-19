@@ -8,7 +8,7 @@ noninteractive client.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 import hashlib
@@ -39,6 +39,7 @@ from tmuxgate.ssh import (
 MAX_RETAINED_MASTERS = 3
 CONTROL_SOCKET_MODE = 0o600
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_CONTROL_SOCKET_NAME_RE = re.compile(r"master-[0-9a-f]{24}\.sock\Z", re.ASCII)
 
 
 class TransportError(RuntimeError):
@@ -516,6 +517,12 @@ class MasterTransportPool:
         return self.control_dir / f"master-{digest}.sock"
 
     def _control_socket_present(self, path: Path) -> bool:
+        if (
+            not path.is_absolute()
+            or path.parent != self.control_dir
+            or _CONTROL_SOCKET_NAME_RE.fullmatch(path.name) is None
+        ):
+            raise TransportError("SSH control path is outside the expected runtime root")
         try:
             metadata = os.lstat(path)
         except FileNotFoundError:
@@ -528,7 +535,18 @@ class MasterTransportPool:
             raise TransportError("SSH control socket is not an owned mode-0600 socket")
         return True
 
-    def _remove_socket_if_safe(self, path: Path) -> None:
+    def _remove_socket_if_safe(
+        self,
+        path: Path,
+        *,
+        expected: os.stat_result | None = None,
+    ) -> None:
+        if (
+            not path.is_absolute()
+            or path.parent != self.control_dir
+            or _CONTROL_SOCKET_NAME_RE.fullmatch(path.name) is None
+        ):
+            raise TransportError("refusing to remove a control path outside runtime")
         try:
             metadata = os.lstat(path)
         except FileNotFoundError:
@@ -539,7 +557,53 @@ class MasterTransportPool:
             or stat.S_IMODE(metadata.st_mode) != CONTROL_SOCKET_MODE
         ):
             raise TransportError("refusing to remove an unsafe control path")
+        if expected is not None and (
+            metadata.st_dev,
+            metadata.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
+            raise TransportError("refusing to remove a changed control socket")
         path.unlink()
+
+    def _retire_master_control(
+        self,
+        endpoint: ResolvedSshEndpoint,
+        path: Path,
+    ) -> None:
+        """Stop one master or retire only a proven-dead safe socket.
+
+        A failed ``ssh -O exit`` is not itself evidence that the master died.
+        The independent control check must establish that it is absent before
+        the exact validated socket object may be removed.  A live or
+        indeterminate master remains visible and managed so callers fail
+        closed instead of creating an untracked SSH process.
+        """
+
+        if not self._control_socket_present(path):
+            return
+        expected = os.lstat(path)
+        stop = build_master_control_invocation(endpoint, path, "exit")
+        stop_error: Exception | None = None
+        try:
+            self.backend.stop_master(stop, path)
+        except Exception as exc:
+            stop_error = exc
+
+        path_remains = path.exists() or path.is_symlink()
+        if not path_remains and stop_error is None:
+            return
+        try:
+            check = build_master_control_invocation(endpoint, path, "check")
+            live = self.backend.check_master(check, path)
+        except Exception as exc:
+            raise TransportError(
+                "SSH master shutdown was not confirmed; liveness is ambiguous"
+            ) from exc
+        if live:
+            raise TransportError(
+                "SSH master shutdown was not confirmed; master is still live"
+            ) from stop_error
+        if path_remains:
+            self._remove_socket_if_safe(path, expected=expected)
 
     def _reconcile_unowned_control_path(
         self, endpoint: ResolvedSshEndpoint, path: Path
@@ -569,22 +633,79 @@ class MasterTransportPool:
         if not present:
             # It vanished between the two probes, so the path is free.
             return
+        expected = os.lstat(path)
         check = build_master_control_invocation(endpoint, path, "check")
         if self.backend.check_master(check, path):
-            stop = build_master_control_invocation(endpoint, path, "exit")
-            self.backend.stop_master(stop, path)
-        self._remove_socket_if_safe(path)
+            self._retire_master_control(endpoint, path)
+        else:
+            self._remove_socket_if_safe(path, expected=expected)
         if path.exists() or path.is_symlink():
             raise TransportError("refusing a pre-existing master control path")
+
+    def reconcile_startup(
+        self,
+        endpoints: Iterable[ResolvedSshEndpoint],
+    ) -> tuple[Path, ...]:
+        """Retire only stale controls bound to current configured identities.
+
+        The caller must hold exclusive runtime ownership.  An unexpected path
+        cannot be addressed safely because tmuxgate lacks the endpoint identity
+        needed for an OpenSSH control check, so it remains untouched and blocks
+        startup with an operator-facing diagnostic.
+        """
+
+        expected: dict[Path, ResolvedSshEndpoint] = {}
+        for endpoint in endpoints:
+            if not isinstance(endpoint, ResolvedSshEndpoint):
+                raise TypeError("startup endpoints must be resolved SSH endpoints")
+            identity_digest = resolved_identity_sha256(endpoint)
+            path = self._control_path(endpoint.machine_name, identity_digest)
+            previous = expected.get(path)
+            if previous is not None and previous != endpoint:
+                raise TransportError(
+                    "configured SSH identities collide on one control path"
+                )
+            expected[path] = endpoint
+
+        entries = tuple(self.control_dir.iterdir())
+        for entry in entries:
+            if entry not in expected:
+                try:
+                    self._control_socket_present(entry)
+                except TransportError as exc:
+                    raise TransportError(
+                        f"unsafe or unexpected SSH control artifact was left untouched: {entry}"
+                    ) from exc
+                raise TransportError(
+                    "SSH control socket lacks current endpoint identity evidence and "
+                    f"was left untouched: {entry}. Restore the matching configuration "
+                    "and run 'tmuxgate runtime reconcile', or diagnose it without "
+                    "manually deleting the socket."
+                )
+
+        reconciled: list[Path] = []
+        for path, endpoint in expected.items():
+            if not path.exists() and not path.is_symlink():
+                continue
+            try:
+                self._reconcile_unowned_control_path(endpoint, path)
+            except TransportError as exc:
+                raise TransportError(
+                    f"unsafe or ambiguous SSH control artifact was left untouched: {path}"
+                ) from exc
+            reconciled.append(path)
+        return tuple(reconciled)
 
     def _stop(self, transport: MasterTransport) -> None:
         if transport.pinned_request_ids:
             raise TransportBusyError("cannot close a pinned SSH master")
-        invocation = build_master_control_invocation(
-            transport.endpoint, transport.control_path, "exit"
+        expected_path = self._control_path(
+            transport.machine_name,
+            transport.identity_sha256,
         )
-        self.backend.stop_master(invocation, transport.control_path)
-        self._remove_socket_if_safe(transport.control_path)
+        if transport.control_path != expected_path:
+            raise TransportError("retained SSH master has an unexpected control path")
+        self._retire_master_control(transport.endpoint, transport.control_path)
         self._transports.pop(transport.machine_name, None)
         self._publish_retained()
 
@@ -812,12 +933,8 @@ class MasterTransportPool:
                     raise TransportError(
                         "key manager returned an invalid enrollment outcome"
                     )
-                stop = build_master_control_invocation(
-                    current, path, "exit"
-                )
-                self.backend.stop_master(stop, path)
+                self._retire_master_control(current, path)
                 master_started = False
-                self._remove_socket_if_safe(path)
 
                 strict_start = build_master_start_invocation(
                     current,
@@ -846,10 +963,7 @@ class MasterTransportPool:
                     should_stop = False
             try:
                 if should_stop:
-                    stop = build_master_control_invocation(
-                        current, path, "exit"
-                    )
-                    self.backend.stop_master(stop, path)
+                    self._retire_master_control(current, path)
             except BaseException as stop_exc:
                 try:
                     socket_retained = self._control_socket_present(path)

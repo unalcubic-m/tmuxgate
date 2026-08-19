@@ -19,7 +19,13 @@ from tmuxgate.operator_interface import (
 from tmuxgate.transport import MasterTransportPool, SshMasterStartError
 from test_planning import PlannerHarness, request
 from test_remote_job import FakeRemoteBackend
-from test_transport import FakeKeyManager, FakeMasterBackend
+from test_connection_plan import build_plan
+from test_transport import (
+    FakeKeyManager,
+    FakeMasterBackend,
+    authorization,
+    machine_endpoint,
+)
 
 
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
@@ -182,6 +188,23 @@ class RealExecutorTests(unittest.TestCase):
             **kwargs,
         )
 
+    def fill_pool_with_other_idle_masters(self):
+        base = build_plan().selected.resolved
+        paths = []
+        for index in range(1, 4):
+            endpoint = machine_endpoint(base, index)
+            lease = self.pool.acquire(
+                authorization(
+                    endpoint.machine_name,
+                    endpoint,
+                    request_id=f"{index + 1:032x}",
+                ),
+                endpoint,
+            )
+            paths.append(lease.transport.control_path)
+            lease.release()
+        return tuple(paths)
+
     def test_full_fake_transport_and_remote_job_returns_exact_result_and_done(self):
         spec = request(("printf", "hello"))
         self.approve(spec)
@@ -217,6 +240,50 @@ class RealExecutorTests(unittest.TestCase):
         )
         self.assertIn("SSH transport was not established", record.failure_detail)
         self.assertIsNone(self.pool.pinned_request_id)
+
+    def test_noninteractive_request_recovers_a_proven_dead_idle_master(self):
+        stale_paths = self.fill_pool_with_other_idle_masters()
+        self.master_backend.die_during_next_stop = True
+        spec = request(("true",))
+        self.approve(spec)
+        backend = AutoCompletingBackend()
+
+        result = self.executor(backend)(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
+        self.assertFalse(stale_paths[0].exists())
+        self.assertIn("release-gate", backend.events)
+
+    def test_interactive_request_recovers_a_proven_dead_idle_master(self):
+        stale_paths = self.fill_pool_with_other_idle_masters()
+        self.master_backend.die_during_next_stop = True
+        spec = replace(request(("true",)), interactive=True)
+        self.approve(spec)
+        backend = AutoCompletingBackend()
+
+        result = self.executor(backend)(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
+        self.assertFalse(stale_paths[0].exists())
+        self.assertIn("release-gate", backend.events)
+
+    def test_live_unconfirmed_eviction_is_durably_proven_pre_remote(self):
+        stale_paths = self.fill_pool_with_other_idle_masters()
+        self.master_backend.fail_next_stop = True
+        spec = request(("true",))
+        self.approve(spec)
+        backend = AutoCompletingBackend()
+
+        result = self.executor(backend)(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertEqual(backend.events, [])
+        self.assertTrue(stale_paths[0].exists())
+        record = self.assert_durable_pre_remote_failure(
+            endpoint_id="home-lan",
+            detail_fragment="master is still live",
+        )
+        self.assertFalse(record.remote_mutation_started)
 
     def test_durable_pre_remote_failure_never_blocks_startup_recovery(self):
         spec = request(("true",))

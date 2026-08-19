@@ -48,17 +48,19 @@ inputs cannot become an alternate execution path.
 The unified lifecycle starts resources in fail-closed order:
 
 1. Load and validate the owner-only configuration as one immutable snapshot.
-2. Prepare private runtime/state directories and securely load or create the
-   MCP bearer-token file.
-3. Acquire the `state.lock` singleton in the state directory before opening or
-   recovering any durable state.
-4. Open durable state and the result spool, then perform startup recovery.
-5. After recovery succeeds, acquire a separate `broker.lock` singleton in the
-   socket's runtime directory, then inspect stale socket state and open the
-   Unix listener while retaining both locks. Distinct lock names preserve both
-   protections when the configured state and runtime directories are the same.
-6. Construct the shared terminal arbiter, planner, transport pool, prompt
+2. Prepare private runtime/state directories, then acquire `state.lock` and
+   `broker.lock` as one runtime-ownership operation. Both owner-only lock files
+   receive the same fsynced process-incarnation record before any secret,
+   durable state, recovery, stale socket, or listener operation begins.
+3. Securely load or create the MCP bearer-token and credential files, open
+   durable state and the result spool, then perform startup recovery.
+4. Construct the shared terminal arbiter, planner, transport pool, prompt
    presenter, executor, broker, and broker control service.
+5. Resolve the current configured SSH identities and reconcile only their
+   exact derived ControlMaster sockets before exposing a listener.
+6. Inspect stale broker-socket state and open the Unix listener while retaining
+   both lifecycle locks. Distinct lock names preserve both protections when the
+   configured state and runtime directories are the same.
 7. Start the broker, then start and await readiness of the MCP HTTP listener.
 8. Report only sanitized listener/token-path information and enter the
    selected dashboard loop. The Textual operator interface is the default;
@@ -67,11 +69,23 @@ The unified lifecycle starts resources in fail-closed order:
 Startup refuses to accept new approvals when durable recovery reports a
 possibly running or incompletely collected request. An MCP bind or startup
 failure stops the already-started broker and unwinds owned resources; there is
-no silent broker-only mode. The explicit singleton lock prevents a deprecated
-`broker` invocation or a second no-argument invocation that shares state from
-creating a parallel owner; the separate runtime lock serializes every stale
-socket check and bind even when competing invocations select different state
-directories.
+no silent broker-only mode. The lifecycle locks are the authoritative
+exclusion mechanism for issue #73. Their metadata binds PID, Linux boot ID,
+process start ticks, executable device/inode, UID, and one random instance ID.
+A contending process reports a clear already-running diagnostic only when the
+held record exactly matches the live process incarnation. Malformed metadata,
+PID reuse, mismatched identity, an active record without a matching lock, or
+disagreement between the two locks is ambiguous and is left untouched.
+Validated metadata on a free lock is reconciled as a stale crash remnant, while
+legacy empty metadata on a free private lock is migrated safely.
+
+`tmuxgate runtime status` is read-only. `tmuxgate runtime reconcile` acquires
+both locks before performing the same bounded stale-owner, SSH-control, and
+broker-socket reconciliation as normal startup. `tmuxgate runtime takeover`
+requires `--yes`, exact agreement between both active owner records, an exact
+live process-incarnation match, and PID-descriptor delivery of `SIGTERM`. It
+never unlinks a held lock, targets a numeric PID without that proof, or
+escalates to `SIGKILL`; a timeout remains visibly unresolved.
 
 `SIGINT`, `SIGTERM`, or dashboard quit sets the shared stop event. Shutdown is
 two-phase around MCP: it first tells the HTTP listener to stop accepting work,
@@ -79,7 +93,9 @@ then performs the broker's bounded worker shutdown so in-flight MCP handlers
 blocked in the internal Unix client can finish, and only then joins the MCP
 server. A clean shutdown subsequently closes the secret-prompt presenter,
 idle SSH masters, and dedicated MCP broker-call pools, followed by the broker
-listener, spool/state, and both singleton locks. If a bounded network component
+listener and spool/state. Each singleton writes and fsyncs an explicit released
+marker before it unlocks, so a subsequent owner can distinguish clean shutdown
+from crash residue. If a bounded network component
 does not stop cleanly, tmuxgate reports a software failure and retains its
 owned resources until process exit rather than closing them underneath live
 workers. That diagnostic names the component that did not stop, states that
@@ -924,6 +940,26 @@ command and cannot create durable remote-job state. No local transport,
 identity-validation, or control-path error is retried; a typed nonzero OpenSSH
 start exit remains opaque except for the terminal diagnostic and numeric
 status.
+
+Retiring a retained master follows the same evidence rule for capacity
+eviction, enrollment cleanup, failed-start cleanup, and final shutdown. If the
+OpenSSH `-O exit` command returns nonzero, tmuxgate independently probes the
+same control path. A positive probe proves the master is still live, so its
+pool entry and socket are retained and capacity remains charged. An ambiguous
+probe also fails closed. Only a definitive dead result permits removal, and
+even then the socket must still have the previously validated device/inode,
+owner, type, mode, exact control directory, and exact derived filename. This
+distinction lets issue #72 recover from the common case where the master exits
+but OpenSSH reports a nonzero status, without ever unlinking a genuinely live
+or unverified endpoint.
+
+Normal startup performs a bounded sweep before the broker listener opens. It
+resolves every currently configured endpoint, derives the complete expected
+control-path set, and applies the same live/dead/ambiguous reconciliation. A
+safe-looking socket without current identity evidence and every unexpected or
+unsafe filesystem entry remain untouched and abort startup with an operator
+diagnostic. Thus startup cannot erase another identity's socket merely because
+it is located below the private control directory.
 
 Fallback is offered only while enrollment is proven not to have started.
 Local key preparation, master authentication, and the read-only key inspection

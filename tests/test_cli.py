@@ -10,6 +10,7 @@ from unittest import mock
 from tmuxgate import cli
 from tmuxgate.models import ExecutionMode, RequestSpec, ResultFormat
 from tmuxgate.result import ExecutionResult, TransportStatus
+from tmuxgate.runtime import BrokerAlreadyRunningError
 from tmuxgate.scheduler import ApprovalDecision, RequestState
 
 
@@ -38,6 +39,52 @@ class CommandLineParsingTests(unittest.TestCase):
                 with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
                     parser.parse_args([command, "--help"])
                 self.assertEqual(raised.exception.code, 0)
+
+    def test_runtime_commands_route_to_tmuxgate_native_handlers(self):
+        commands = (
+            ("_runtime_status", ("status",)),
+            ("_runtime_reconcile", ("reconcile",)),
+            ("_runtime_takeover", ("takeover", "--yes")),
+        )
+        for handler_name, command in commands:
+            with self.subTest(command=command[0]), mock.patch.object(
+                cli, handler_name, return_value=0
+            ) as handler:
+                status = cli.main(["runtime", *command])
+
+            self.assertEqual(status, 0)
+            handler.assert_called_once()
+
+    def test_duplicate_startup_message_names_safe_operator_actions(self):
+        owner = SimpleNamespace(
+            pid=123,
+            process_start_ticks=456,
+            boot_id="00000000-0000-0000-0000-000000000000",
+        )
+        error = BrokerAlreadyRunningError(Path("/run/user/1000/tmuxgate/state.lock"), owner)
+        errors = io.StringIO()
+        with (
+            mock.patch.object(cli, "_unified_command", side_effect=error),
+            redirect_stderr(errors),
+        ):
+            status = cli.main([])
+
+        self.assertEqual(status, cli.EXIT_UNAVAILABLE)
+        message = errors.getvalue()
+        self.assertIn("Another tmuxgate broker is already running", message)
+        self.assertIn("No existing broker or SSH master was modified", message)
+        self.assertIn("tmuxgate runtime status", message)
+        self.assertIn("tmuxgate runtime takeover --yes", message)
+
+    def test_takeover_requires_explicit_confirmation_before_any_runtime_action(self):
+        with (
+            mock.patch.object(cli, "request_runtime_owner_shutdown") as shutdown,
+            redirect_stderr(io.StringIO()),
+        ):
+            status = cli.main(["runtime", "takeover"])
+
+        self.assertEqual(status, cli.EXIT_USAGE)
+        shutdown.assert_not_called()
 
     def test_global_config_path_applies_to_config_subcommand(self):
         commands = (
