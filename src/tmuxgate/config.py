@@ -38,6 +38,7 @@ class BrokerConfig:
     max_pending_requests: int = 16
     queue_policy: str = "fifo"
     ssh_master_idle_timeout_seconds: int = 600
+    reboot_recovery_timeout_seconds: int = 300
     approval_mode: str = "disabled"
 
     def __post_init__(self) -> None:
@@ -50,6 +51,12 @@ class BrokerConfig:
                 self.ssh_master_idle_timeout_seconds,
                 1,
                 86400,
+            ),
+            (
+                "reboot_recovery_timeout_seconds",
+                self.reboot_recovery_timeout_seconds,
+                1,
+                3600,
             ),
         )
         for name, value, minimum, maximum in values:
@@ -247,6 +254,7 @@ def _parse_broker(raw: object) -> BrokerConfig:
         "max_pending_requests",
         "queue_policy",
         "ssh_master_idle_timeout_seconds",
+        "reboot_recovery_timeout_seconds",
         "approval_mode",
     }
     _only(table, allowed, "broker")
@@ -270,12 +278,19 @@ def _parse_broker(raw: object) -> BrokerConfig:
     approval_mode = _string(
         table.get("approval_mode", "disabled"), "broker.approval_mode"
     )
+    reboot_timeout = _integer(
+        table.get("reboot_recovery_timeout_seconds", 300),
+        "broker.reboot_recovery_timeout_seconds",
+        1,
+        3600,
+    )
     return BrokerConfig(
         max_active_remote_commands=active,
         max_open_ssh_masters=masters,
         max_pending_requests=pending,
         queue_policy=policy,
         ssh_master_idle_timeout_seconds=idle,
+        reboot_recovery_timeout_seconds=reboot_timeout,
         approval_mode=approval_mode,
     )
 

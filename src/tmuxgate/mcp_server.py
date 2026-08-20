@@ -30,7 +30,7 @@ from tmuxgate.client import (
     read_verified_result as broker_read_verified_result,
     submit_request,
 )
-from tmuxgate.models import ExecutionMode, RequestSpec, ValidationError
+from tmuxgate.models import DisconnectPolicy, ExecutionMode, RequestSpec, ValidationError
 from tmuxgate.protocol import ProtocolError, encoded_header_size
 from tmuxgate.result import ExecutionResult
 from tmuxgate.scheduler import RequestState
@@ -219,6 +219,7 @@ class RunResult:
     transport_status: str
     remote_exit_status: int | None
     detail: str | None
+    result_code: str | None
     stdout_length: int
     stdout_sha256: str
     stdout: str | None
@@ -330,6 +331,7 @@ def _run_result(result: ExecutionResult) -> RunResult:
         transport_status=result.transport_status.value,
         remote_exit_status=result.remote_exit_status,
         detail=result.detail,
+        result_code=None if result.result_code is None else result.result_code.value,
         stdout_length=len(result.stdout),
         stdout_sha256=hashlib.sha256(result.stdout).hexdigest(),
         stdout=stdout,
@@ -515,8 +517,10 @@ def create_mcp_server(
             "terminal, for example a sudo password prompt. With tmuxgate "
             "Automation on, its stored per-machine sudo password is submitted "
             "automatically for up to three default or learned prompt episodes. "
-            "First use learns the machine prompt and saves a masked password. "
-            "Automation never opens Forward Input; failures return through the result."
+            "Missing or mismatched credentials fail without enrollment or Forward "
+            "Input. Set expect_full_reboot=true only for a command intended to reboot "
+            "the entire host; tmuxgate then verifies a changed Linux boot ID before "
+            "abandoning the uncollectable command result."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=False,
@@ -534,10 +538,13 @@ def create_mcp_server(
         environment: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
         interactive: bool = False,
+        expect_full_reboot: bool = False,
     ) -> RunResult:
         try:
             if not purpose:
                 raise ValidationError("purpose is required")
+            if type(expect_full_reboot) is not bool:
+                raise ValidationError("expect_full_reboot must be a bool")
             request = RequestSpec(
                 machine_alias=await resolve_machine(machine),
                 mode=ExecutionMode.ARGV,
@@ -547,6 +554,11 @@ def create_mcp_server(
                 timeout_seconds=timeout_seconds,
                 purpose=purpose,
                 interactive=interactive,
+                disconnect_policy=(
+                    DisconnectPolicy.EXPECT_FULL_REBOOT
+                    if expect_full_reboot
+                    else DisconnectPolicy.NORMAL
+                ),
             )
             _validate_request_frame(request)
             result = await run_call(
@@ -566,8 +578,9 @@ def create_mcp_server(
             "genuinely needs a remote controlling terminal, for example a sudo password "
             "prompt. With tmuxgate Automation on, its stored per-machine sudo password "
             "is submitted automatically for up to three default or learned prompt "
-            "episodes. First use learns the machine prompt and saves a masked password. "
-            "Automation never opens Forward Input; failures return through the result."
+            "episodes. Missing or mismatched credentials fail without enrollment or "
+            "Forward Input. Set expect_full_reboot=true only for a script intended to "
+            "reboot the entire host; abandonment requires a changed Linux boot ID."
         ),
         annotations=ToolAnnotations(
             readOnlyHint=False,
@@ -586,10 +599,13 @@ def create_mcp_server(
         environment: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
         interactive: bool = False,
+        expect_full_reboot: bool = False,
     ) -> RunResult:
         try:
             if not purpose:
                 raise ValidationError("purpose is required")
+            if type(expect_full_reboot) is not bool:
+                raise ValidationError("expect_full_reboot must be a bool")
             if (script is None) == (script_base64 is None):
                 raise ValidationError("provide exactly one of script or script_base64")
             if script is not None:
@@ -611,6 +627,11 @@ def create_mcp_server(
                 timeout_seconds=timeout_seconds,
                 purpose=purpose,
                 interactive=interactive,
+                disconnect_policy=(
+                    DisconnectPolicy.EXPECT_FULL_REBOOT
+                    if expect_full_reboot
+                    else DisconnectPolicy.NORMAL
+                ),
             )
             _validate_request_frame(request)
             result = await run_call(

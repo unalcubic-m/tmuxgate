@@ -31,6 +31,7 @@ from tmuxgate.config import (
     load_config_snapshot,
 )
 from tmuxgate.models import (
+    DisconnectPolicy,
     RequestSpec,
     ResultFormat,
     ValidationError,
@@ -168,6 +169,9 @@ def build_parser() -> argparse.ArgumentParser:
     broker_settings_parser.add_argument(
         "--max-active-remote-commands", type=int, default=None
     )
+    broker_settings_parser.add_argument(
+        "--reboot-recovery-timeout-seconds", type=int, default=None
+    )
     broker_settings_parser.add_argument("--path", default=argparse.SUPPRESS)
     broker_settings_parser.set_defaults(handler=_config_set_broker)
     add_parser = config_subparsers.add_parser(
@@ -276,8 +280,8 @@ def build_parser() -> argparse.ArgumentParser:
     after_reboot_parser = recover_subparsers.add_parser(
         "after-reboot",
         help=(
-            "record that a full machine reboot abandoned an uncertain or "
-            "uncollectable completed request"
+            "manually attest a reboot for a legacy/unmarked uncertain or "
+            "uncollectable request; EXPECT_FULL_REBOOT requests recover automatically"
         ),
     )
     after_reboot_parser.add_argument("request_id")
@@ -364,6 +368,10 @@ def _config_set_broker(args: argparse.Namespace) -> int:
         changes["approval_mode"] = args.approval_mode
     if args.max_active_remote_commands is not None:
         changes["max_active_remote_commands"] = args.max_active_remote_commands
+    if args.reboot_recovery_timeout_seconds is not None:
+        changes["reboot_recovery_timeout_seconds"] = (
+            args.reboot_recovery_timeout_seconds
+        )
     if not changes:
         raise ConfigError("set-broker requires at least one setting")
     updated = replace(config, broker=replace(config.broker, **changes))
@@ -372,6 +380,8 @@ def _config_set_broker(args: argparse.Namespace) -> int:
         "Broker settings updated: "
         f"approval_mode={updated.broker.approval_mode}, "
         f"max_active_remote_commands={updated.broker.max_active_remote_commands}."
+        f" reboot_recovery_timeout_seconds="
+        f"{updated.broker.reboot_recovery_timeout_seconds}."
     )
     print("Restart tmuxgate to load them.")
     return 0
@@ -874,6 +884,16 @@ def _run_startup_handler(
         except BrokerAlreadyRunningError as exc:
             if not _startup_supports_broker_conflict_dialog(args):
                 raise
+            # Duplicate startup is an operator decision. Automation mode must
+            # never open that dialog or implicitly request takeover.
+            try:
+                approval_mode = load_config(args.config).broker.approval_mode
+            except ConfigError:
+                # Unknown policy cannot safely authorize a human takeover
+                # ceremony. Preserve the verified duplicate-owner diagnostic.
+                raise exc
+            if approval_mode == "disabled":
+                raise
             if takeover_attempted:
                 raise RuntimeSecurityError(
                     "a different broker acquired runtime ownership after the "
@@ -963,6 +983,17 @@ def _confirm_reboot_recovery(record: object) -> bool:
     return response.rstrip("\r\n") == phrase
 
 
+def _require_manual_attestation_policy(record: object) -> None:
+    if (
+        getattr(record, "disconnect_policy", DisconnectPolicy.NORMAL)
+        is DisconnectPolicy.EXPECT_FULL_REBOOT
+    ):
+        raise StateConflictError(
+            "EXPECT_FULL_REBOOT recovery requires automatic changed-boot evidence; "
+            "manual attestation is forbidden"
+        )
+
+
 def _recover_after_reboot(args: argparse.Namespace) -> int:
     paths = prepare_runtime_layout(
         socket_path=args.socket,
@@ -979,6 +1010,7 @@ def _recover_after_reboot(args: argparse.Namespace) -> int:
                     "after-reboot recovery requires an exact recovery-blocked or "
                     "uncollected completion-proven request"
                 )
+            _require_manual_attestation_policy(record)
             if not _confirm_reboot_recovery(record):
                 print(
                     "tmuxgate: reboot recovery was not confirmed; no state changed",
@@ -1052,6 +1084,7 @@ def _recover_after_dead_pane(args: argparse.Namespace) -> int:
                 raise StateConflictError(
                     "after-dead-pane recovery requires an exact recovery-blocked request"
                 )
+            _require_manual_attestation_policy(record)
             if not _confirm_dead_pane_recovery(record):
                 print(
                     "tmuxgate: dead-pane recovery was not confirmed; no state changed",

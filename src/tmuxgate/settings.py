@@ -51,6 +51,7 @@ def serialize_config(config: AppConfig) -> bytes:
         f"max_pending_requests = {broker.max_pending_requests}",
         f"queue_policy = {_quote(broker.queue_policy)}",
         f"ssh_master_idle_timeout_seconds = {broker.ssh_master_idle_timeout_seconds}",
+        f"reboot_recovery_timeout_seconds = {broker.reboot_recovery_timeout_seconds}",
         f"approval_mode = {_quote(broker.approval_mode)}",
         "",
         "[mcp]",

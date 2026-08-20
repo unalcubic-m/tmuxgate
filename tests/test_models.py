@@ -1,7 +1,13 @@
 import unittest
 import os
 
-from tmuxgate.models import ExecutionMode, RequestSpec, ValidationError
+from tmuxgate.models import (
+    DisconnectPolicy,
+    ExecutionMode,
+    PREVIOUS_PROTOCOL_VERSION,
+    RequestSpec,
+    ValidationError,
+)
 
 
 class RequestSpecTests(unittest.TestCase):
@@ -50,6 +56,40 @@ class RequestSpecTests(unittest.TestCase):
         header["interactive"] = 1
         with self.assertRaises(ValidationError):
             RequestSpec.from_wire(header, b"")
+
+    def test_expected_reboot_policy_is_explicit_and_bound_to_identity(self):
+        normal = RequestSpec("host", ExecutionMode.ARGV, "/", argv=("reboot",))
+        reboot = RequestSpec(
+            "host",
+            ExecutionMode.ARGV,
+            "/",
+            argv=("reboot",),
+            disconnect_policy=DisconnectPolicy.EXPECT_FULL_REBOOT,
+        )
+        self.assertIs(normal.disconnect_policy, DisconnectPolicy.NORMAL)
+        self.assertEqual(
+            reboot.to_wire_header()["disconnect_policy"], "expect_full_reboot"
+        )
+        self.assertNotEqual(
+            normal.client_request_sha256(), reboot.client_request_sha256()
+        )
+        self.assertEqual(
+            RequestSpec.from_wire(reboot.to_wire_header(), b"").disconnect_policy,
+            DisconnectPolicy.EXPECT_FULL_REBOOT,
+        )
+
+    def test_previous_protocol_is_accepted_only_as_normal_disconnect(self):
+        request = RequestSpec("host", ExecutionMode.ARGV, "/", argv=("true",))
+        header = request.to_wire_header()
+        header["protocol"] = PREVIOUS_PROTOCOL_VERSION
+        del header["disconnect_policy"]
+        rebuilt = RequestSpec.from_wire(header, b"")
+        self.assertIs(rebuilt.disconnect_policy, DisconnectPolicy.NORMAL)
+
+        header["disconnect_policy"] = "expect_full_reboot"
+        with self.assertRaisesRegex(ValidationError, "unknown request fields"):
+            RequestSpec.from_wire(header, b"")
+        del header["disconnect_policy"]
         del header["interactive"]
         with self.assertRaises(ValidationError):
             RequestSpec.from_wire(header, b"")

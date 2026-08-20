@@ -18,7 +18,8 @@ import secrets
 from typing import Any
 
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
+PREVIOUS_PROTOCOL_VERSION = 3
 MAX_SCRIPT_BYTES = 16 * 1024 * 1024
 MAX_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 MAX_PURPOSE_CHARACTERS = 500
@@ -40,6 +41,13 @@ class ExecutionMode(StrEnum):
 class ResultFormat(StrEnum):
     TRANSPARENT = "transparent"
     JSON = "json"
+
+
+class DisconnectPolicy(StrEnum):
+    """How a post-start transport loss must be interpreted."""
+
+    NORMAL = "normal"
+    EXPECT_FULL_REBOOT = "expect_full_reboot"
 
 
 def validate_alias(value: object, *, field_name: str = "machine alias") -> str:
@@ -128,6 +136,7 @@ class RequestSpec:
     result_format: ResultFormat = ResultFormat.TRANSPARENT
     purpose: str | None = None
     interactive: bool = False
+    disconnect_policy: DisconnectPolicy = DisconnectPolicy.NORMAL
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "machine_alias", validate_alias(self.machine_alias))
@@ -191,6 +200,13 @@ class RequestSpec:
         # bool is the only accepted encoding.
         if type(self.interactive) is not bool:
             raise ValidationError("interactive must be a bool")
+        try:
+            disconnect_policy = DisconnectPolicy(self.disconnect_policy)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"unsupported disconnect policy: {self.disconnect_policy!r}"
+            ) from exc
+        object.__setattr__(self, "disconnect_policy", disconnect_policy)
 
         if mode is ExecutionMode.ARGV:
             if not argv:
@@ -204,6 +220,7 @@ class RequestSpec:
         return {
             "argv_b64": [_encode_filesystem_text(item) for item in self.argv],
             "cwd_b64": _encode_filesystem_text(self.cwd),
+            "disconnect_policy": self.disconnect_policy.value,
             "environment_b64": [
                 {"name": name, "value_b64": _encode_filesystem_text(value)}
                 for name, value in self.environment
@@ -220,6 +237,12 @@ class RequestSpec:
 
     @classmethod
     def from_wire(cls, header: Mapping[str, Any], payload: bytes) -> "RequestSpec":
+        protocol = header.get("protocol")
+        if type(protocol) is not int or protocol not in {
+            PREVIOUS_PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
+        }:
+            raise ValidationError("unsupported request protocol version")
         expected = {
             "argv_b64",
             "cwd_b64",
@@ -233,14 +256,14 @@ class RequestSpec:
             "timeout_seconds",
             "type",
         }
+        if protocol == PROTOCOL_VERSION:
+            expected.add("disconnect_policy")
         unknown = set(header) - expected
         missing = expected - set(header)
         if unknown:
             raise ValidationError(f"unknown request fields: {', '.join(sorted(unknown))}")
         if missing:
             raise ValidationError(f"missing request fields: {', '.join(sorted(missing))}")
-        if type(header["protocol"]) is not int or header["protocol"] != PROTOCOL_VERSION:
-            raise ValidationError("unsupported request protocol version")
         if header["type"] != "execute":
             raise ValidationError("unsupported request type")
         if not isinstance(header["argv_b64"], list):
@@ -276,6 +299,11 @@ class RequestSpec:
             result_format=header["result_format"],
             purpose=header["purpose"],
             interactive=header["interactive"],
+            disconnect_policy=(
+                header["disconnect_policy"]
+                if protocol == PROTOCOL_VERSION
+                else DisconnectPolicy.NORMAL
+            ),
         )
 
     @property

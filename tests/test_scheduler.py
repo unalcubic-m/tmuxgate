@@ -16,6 +16,28 @@ def request_id(number: int) -> str:
 
 
 class SequentialSchedulerTests(unittest.TestCase):
+    def test_restart_recovery_counts_against_capacity_without_global_state_block(self):
+        external = [1]
+        scheduler = SequentialScheduler(
+            max_pending_requests=4,
+            max_active_remote_commands=2,
+            external_active_count=lambda: external[0],
+        )
+        scheduler.submit(request_id(1), "recovering-peer")
+        scheduler.submit(request_id(2), "unrelated-machine")
+
+        first = scheduler.begin_next_approval()
+        self.assertEqual(first.request_id, request_id(1))
+        self.assertEqual(scheduler.active_count, 2)
+        with self.assertRaises(LeaseBusyError):
+            scheduler.begin_next_approval()
+
+        scheduler.approve(first.request_id)
+        scheduler.mark_pre_remote_failure(first.request_id, detail="local failure")
+        external[0] = 0
+        second = scheduler.begin_next_approval()
+        self.assertEqual(second.request_id, request_id(2))
+
     def test_three_isolated_leases_can_run_and_release_independently(self):
         scheduler = SequentialScheduler(
             max_pending_requests=4,

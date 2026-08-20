@@ -1872,6 +1872,10 @@ class TextualOperatorInterface(PlainTerminalInterface):
         )
 
     def _request(self, prompt: OperatorPrompt) -> OperatorDecision:
+        if self.approval_mode == "disabled":
+            raise OperatorInterfaceError(
+                "programming error: Textual human prompt queued in Automation mode"
+            )
         with self._queued_lock:
             pending = self._prompts.submit(prompt)
             queued = QueuedPrompt(self._submitted_sequence, prompt, pending)

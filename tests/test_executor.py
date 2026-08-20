@@ -1,17 +1,31 @@
+import asyncio
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
+from mcp import Client
+
+from tmuxgate.broker import BrokerServer
+from tmuxgate.broker_api import BrokerControlService
 from tmuxgate.executor import RealExecutor
-from tmuxgate.result import TransportStatus
+from tmuxgate.mcp_server import create_mcp_server
+from tmuxgate.models import DisconnectPolicy
+from tmuxgate.reboot_recovery import BootIdProbeError
+from tmuxgate.recovery_coordinator import ExpectedRebootRecoveryCoordinator
+from tmuxgate.result import ResultCode, TransportStatus
+from tmuxgate.runtime import create_broker_socket
 from tmuxgate.scheduler import RequestState
 from tmuxgate.spool import ResultSpool
 from tmuxgate.state import DurableStateStore, recover_startup
 from tmuxgate.approval import ApprovalDecision
 from tmuxgate.operator_interface import (
+    ActivityKind,
     ConnectionPhase,
     OperatorDecision,
+    PlainTerminalInterface,
     RemoteMutationState,
     RouteFallbackPrompt,
     SshRetryPrompt,
@@ -115,10 +129,101 @@ class CallbackOperatorInterface:
         self.activity.append(event)
 
 
+class NonPresentingTerminal:
+    def claim(self, **_keywords):
+        return nullcontext()
+
+    def poll_dashboard_line(self, **_keywords):
+        return None
+
+
+class ExecutorBootProbe:
+    def __init__(self, *, pre_boot_id, post_boot_id=None, pre_error=None):
+        self.pre_boot_id = pre_boot_id
+        self.post_boot_id = post_boot_id
+        self.pre_error = pre_error
+        self.pre_calls = []
+        self.post_calls = []
+
+    def capture_pre_reboot(self, transport):
+        self.pre_calls.append(transport)
+        if self.pre_error is not None:
+            raise self.pre_error
+        return self.pre_boot_id
+
+    def probe_after_disconnect(self, endpoint):
+        self.post_calls.append(endpoint)
+        if self.post_boot_id is None:
+            raise BootIdProbeError("reboot_probe_unavailable", "host unreachable")
+        return self.post_boot_id
+
+
+class SequencedExecutorBootProbe(ExecutorBootProbe):
+    def __init__(self, *, pre_boot_id, post_outcomes):
+        super().__init__(pre_boot_id=pre_boot_id)
+        self.post_outcomes = list(post_outcomes)
+
+    def probe_after_disconnect(self, endpoint):
+        self.post_calls.append(endpoint)
+        if not self.post_outcomes:
+            raise AssertionError("boot probe sequence was exhausted")
+        outcome = self.post_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class PromptForbiddenAutomationInterface:
+    """Automation boundary that proves the incident never asks an operator."""
+
+    approval_mode = "disabled"
+
+    def __init__(self):
+        self.prompt_calls = []
+        self.activity = []
+
+    def _forbid(self, prompt):
+        self.prompt_calls.append(prompt)
+        raise AssertionError("the reboot incident must not call an operator prompt")
+
+    request_execution_approval = _forbid
+    request_ssh_retry = _forbid
+    request_fallback = _forbid
+    request_secret_input_authorization = _forbid
+    request_machine_disable = _forbid
+
+    def run_external_terminal_session(self, prompt, session):
+        self._forbid(prompt)
+
+    def run_terminal_session(self, purpose, session):
+        self._forbid(purpose)
+
+    def publish_activity(self, event):
+        self.activity.append(event)
+
+
+class InvalidRetryAutomationInterface(PlainTerminalInterface):
+    def resolve_automation_prompt(self, prompt):
+        if isinstance(prompt, SshRetryPrompt):
+            object.__setattr__(prompt, "endpoint_id", "not-in-the-approved-plan")
+        return super().resolve_automation_prompt(prompt)
+
+
+class PostMutationFallbackAutomationInterface(PlainTerminalInterface):
+    def resolve_automation_prompt(self, prompt):
+        if isinstance(prompt, RouteFallbackPrompt):
+            object.__setattr__(
+                prompt,
+                "remote_mutation_state",
+                RemoteMutationState.MAY_HAVE_STARTED,
+            )
+        return super().resolve_automation_prompt(prompt)
+
+
 class RealExecutorTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        root = Path(self.temporary.name)
+        root = self.root = Path(self.temporary.name)
         (root / "control").mkdir(mode=0o700)
         (root / "state").mkdir(mode=0o700)
         self.master_backend = FakeMasterBackend()
@@ -161,20 +266,22 @@ class RealExecutorTests(unittest.TestCase):
         return record
 
     def executor(self, backend, **kwargs):
-        operator = CallbackOperatorInterface(
-            fallback_approver=kwargs.pop(
-                "fallback_approver",
-                lambda *args, **keywords: ApprovalDecision.DENIED,
-            ),
-            ssh_retry_approver=kwargs.pop(
-                "ssh_retry_approver",
-                lambda *args, **keywords: ApprovalDecision.DENIED,
-            ),
-            machine_disable_approver=kwargs.pop(
-                "machine_disable_approver",
-                lambda *args, **keywords: ApprovalDecision.DENIED,
-            ),
-        )
+        operator = kwargs.pop("operator_interface", None)
+        if operator is None:
+            operator = CallbackOperatorInterface(
+                fallback_approver=kwargs.pop(
+                    "fallback_approver",
+                    lambda *args, **keywords: ApprovalDecision.DENIED,
+                ),
+                ssh_retry_approver=kwargs.pop(
+                    "ssh_retry_approver",
+                    lambda *args, **keywords: ApprovalDecision.DENIED,
+                ),
+                machine_disable_approver=kwargs.pop(
+                    "machine_disable_approver",
+                    lambda *args, **keywords: ApprovalDecision.DENIED,
+                ),
+            )
         self.operator = operator
         return RealExecutor(
             planner=self.planner,
@@ -186,6 +293,16 @@ class RealExecutorTests(unittest.TestCase):
             poll_interval_seconds=0.001,
             detached_wait_seconds=0.001,
             **kwargs,
+        )
+
+    def reboot_coordinator(self, probe):
+        return ExpectedRebootRecoveryCoordinator(
+            state=self.state,
+            transports=self.pool,
+            boot_id_probe=probe,
+            identity_revalidator=lambda endpoint: endpoint,
+            timeout_seconds=2,
+            probe_interval_seconds=0.001,
         )
 
     def fill_pool_with_other_idle_masters(self):
@@ -752,6 +869,404 @@ class RealExecutorTests(unittest.TestCase):
             machine_disable_approver=unexpected_disable,
         )(REQUEST_ID, spec)
         self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+
+    def test_automation_retry_and_fallback_are_audited_before_next_start(self):
+        spec = request(("true",))
+        self.approve(spec)
+        interface = PlainTerminalInterface(
+            NonPresentingTerminal(),
+            approval_mode="disabled",
+        )
+        self.addCleanup(interface.close)
+        backend = RetryMasterBackend(failures=2)
+        original_start = backend.start_master
+
+        def audited_start(invocation, control_path):
+            audits = tuple(
+                event
+                for event in interface.activity_history
+                if event.kind is ActivityKind.BROKER_AUDIT
+            )
+            if len(backend.starts) == 1:
+                self.assertTrue(
+                    any("same-endpoint" in event.message for event in audits)
+                )
+            elif len(backend.starts) == 2:
+                self.assertTrue(
+                    any("route fallback" in event.message for event in audits)
+                )
+            return original_start(invocation, control_path)
+
+        backend.start_master = audited_start
+        self.pool.backend = backend
+        executor = self.executor(
+            AutoCompletingBackend(),
+            operator_interface=interface,
+        )
+
+        result = executor(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
+        self.assertEqual(len(backend.starts), 3)
+        self.assertIsNone(interface._prompts.next_prompt(timeout=0))
+
+    def test_invalid_automation_retry_binding_fails_structured_without_prompt(self):
+        spec = request(("true",))
+        self.approve(spec)
+        interface = InvalidRetryAutomationInterface(
+            NonPresentingTerminal(),
+            approval_mode="disabled",
+        )
+        self.addCleanup(interface.close)
+        backend = RetryMasterBackend(failures=1)
+        self.pool.backend = backend
+
+        result = self.executor(
+            FakeRemoteBackend(),
+            operator_interface=interface,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertEqual(result.result_code, ResultCode.AUTOMATION_POLICY_DENIED)
+        self.assertIn("invalid structured prompt binding", result.detail)
+        self.assertEqual(len(backend.starts), 1)
+        self.assertIsNone(interface._prompts.next_prompt(timeout=0))
+
+    def test_post_mutation_automation_fallback_fails_without_prompt(self):
+        spec = request(("true",))
+        self.approve(spec)
+        interface = PostMutationFallbackAutomationInterface(
+            NonPresentingTerminal(),
+            approval_mode="disabled",
+        )
+        self.addCleanup(interface.close)
+        backend = RetryMasterBackend(failures=2)
+        self.pool.backend = backend
+
+        result = self.executor(
+            FakeRemoteBackend(),
+            operator_interface=interface,
+        )(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertEqual(result.result_code, ResultCode.AUTOMATION_POLICY_DENIED)
+        self.assertIn("invalid structured prompt binding", result.detail)
+        self.assertEqual(len(backend.starts), 2)
+        self.assertIsNone(interface._prompts.next_prompt(timeout=0))
+
+    def test_automation_denies_machine_disable_without_mutating_configuration(self):
+        spec = request(("true",))
+        self.approve(spec)
+        interface = PlainTerminalInterface(
+            NonPresentingTerminal(),
+            approval_mode="disabled",
+        )
+        self.addCleanup(interface.close)
+        backend = RetryMasterBackend(failures=4)
+        self.pool.backend = backend
+        disabled = []
+        executor = self.executor(
+            FakeRemoteBackend(),
+            operator_interface=interface,
+            machine_disabler=disabled.append,
+            machine_enabled=lambda machine: True,
+        )
+
+        result = executor(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertEqual(result.result_code, ResultCode.AUTOMATION_POLICY_DENIED)
+        self.assertEqual(disabled, [])
+        self.assertIsNone(interface._prompts.next_prompt(timeout=0))
+
+    def test_expected_reboot_persists_pre_boot_identity_before_remote_stage(self):
+        spec = replace(
+            request(("systemctl", "reboot")),
+            disconnect_policy=DisconnectPolicy.EXPECT_FULL_REBOOT,
+        )
+        self.approve(spec)
+        backend = AutoCompletingBackend()
+        probe = ExecutorBootProbe(
+            pre_boot_id="11111111-2222-3333-4444-555555555555"
+        )
+        executor = self.executor(
+            backend,
+            reboot_recovery=self.reboot_coordinator(probe),
+        )
+
+        result = executor(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
+        self.assertEqual(len(probe.pre_calls), 1)
+        record = self.state.load(REQUEST_ID)
+        self.assertEqual(
+            record.reboot_recovery.pre_boot_id,
+            "11111111-2222-3333-4444-555555555555",
+        )
+        self.assertLess(
+            record.reboot_recovery.pre_boot_id_generation,
+            record.reboot_recovery.remote_start_generation,
+        )
+
+    def test_pre_boot_identity_failure_never_starts_requested_command(self):
+        spec = replace(
+            request(("systemctl", "reboot")),
+            disconnect_policy=DisconnectPolicy.EXPECT_FULL_REBOOT,
+        )
+        self.approve(spec)
+        backend = FakeRemoteBackend()
+        probe = ExecutorBootProbe(
+            pre_boot_id="11111111-2222-3333-4444-555555555555",
+            pre_error=BootIdProbeError(
+                "pre_reboot_boot_id_unavailable",
+                "pre-reboot boot ID is unavailable",
+            ),
+        )
+        executor = self.executor(
+            backend,
+            reboot_recovery=self.reboot_coordinator(probe),
+        )
+
+        result = executor(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertEqual(result.result_code, ResultCode.PRE_REBOOT_BOOT_ID_UNAVAILABLE)
+        self.assertEqual(backend.events, [])
+        self.assertEqual(
+            self.state.load(REQUEST_ID).state,
+            RequestState.FAILED_PRE_REMOTE,
+        )
+        self.assertIsNone(self.pool.pinned_request_id)
+
+    def test_changed_boot_after_disconnect_terminalizes_without_output_claim(self):
+        spec = replace(
+            request(("systemctl", "reboot")),
+            disconnect_policy=DisconnectPolicy.EXPECT_FULL_REBOOT,
+        )
+        self.approve(spec)
+        backend = FakeRemoteBackend()
+
+        def fail_stage(identity, submitted):
+            raise RuntimeError("simulated SSH reset")
+
+        backend.stage = fail_stage
+        probe = ExecutorBootProbe(
+            pre_boot_id="11111111-2222-3333-4444-555555555555",
+            post_boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+        executor = self.executor(
+            backend,
+            reboot_recovery=self.reboot_coordinator(probe),
+        )
+
+        result = executor(REQUEST_ID, spec)
+
+        self.assertEqual(
+            result.transport_status,
+            TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT,
+        )
+        self.assertEqual(result.result_code, ResultCode.ABANDONED_AFTER_VERIFIED_REBOOT)
+        self.assertEqual((result.stdout, result.stderr), (b"", b""))
+        self.assertIsNone(result.remote_exit_status)
+        self.assertEqual(
+            self.state.load(REQUEST_ID).state,
+            RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
+        )
+
+    def test_complete_automation_mcp_reboot_incident_recovers_fresh_master(self):
+        interface = PromptForbiddenAutomationInterface()
+        probe = SequencedExecutorBootProbe(
+            pre_boot_id="11111111-2222-3333-4444-555555555555",
+            post_outcomes=(
+                BootIdProbeError("reboot_probe_unavailable", "host is restarting"),
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            ),
+        )
+        coordinator = self.reboot_coordinator(probe)
+        backends = []
+
+        def backend_factory(_transport, _recipient):
+            index = len(backends)
+            backend = AutoCompletingBackend()
+            if index == 1:
+                def reset_during_stage(_identity, _submitted):
+                    raise RuntimeError("simulated SSH reset during full-host reboot")
+
+                backend.stage = reset_during_stage
+            backends.append(backend)
+            return backend
+
+        executor = RealExecutor(
+            planner=self.planner,
+            transports=self.pool,
+            state=self.state,
+            spool=self.spool,
+            backend_factory=backend_factory,
+            operator_interface=interface,
+            reboot_recovery=coordinator,
+            poll_interval_seconds=0.001,
+            detached_wait_seconds=0.001,
+        )
+        socket_path = self.root / "incident-broker.sock"
+        listener = create_broker_socket(socket_path)
+        control = BrokerControlService(
+            {
+                "app-server": SimpleNamespace(
+                    description="Application server",
+                    enabled=True,
+                )
+            },
+            self.state,
+            self.spool,
+        )
+        broker = BrokerServer(
+            listener,
+            allowed_machines=("app-server",),
+            approver=self.planner,
+            executor=executor,
+            request_timeout_seconds=2.0,
+            send_timeout_seconds=2.0,
+            delivery_observer=executor.result_delivery_finished,
+            control_service=control,
+            activity_publisher=interface.publish_activity,
+            external_active_count=lambda: coordinator.active_count,
+        )
+        broker.start()
+        self.addCleanup(broker.stop)
+
+        async def incident():
+            async with Client(create_mcp_server(socket_path)) as client:
+                warmup = await client.call_tool(
+                    "run_argv",
+                    {
+                        "machine": "app-server",
+                        "cwd": "/tmp",
+                        "argv": ["true"],
+                        "purpose": "establish a retained master",
+                    },
+                )
+                old_path = next(self.pool.control_dir.iterdir())
+                old_inode = old_path.stat().st_ino
+                reboot = await client.call_tool(
+                    "run_argv",
+                    {
+                        "machine": "app-server",
+                        "cwd": "/tmp",
+                        "argv": ["systemctl", "reboot"],
+                        "purpose": "reboot the complete host",
+                        "expect_full_reboot": True,
+                    },
+                )
+                post_reboot = await client.call_tool(
+                    "run_argv",
+                    {
+                        "machine": "app-server",
+                        "cwd": "/tmp",
+                        "argv": ["true"],
+                        "purpose": "verify the fresh post-reboot transport",
+                    },
+                )
+                return warmup, reboot, post_reboot, old_path, old_inode
+
+        try:
+            warmup, reboot, post_reboot, old_path, old_inode = asyncio.run(incident())
+        finally:
+            broker.stop()
+
+        self.assertFalse(warmup.is_error)
+        self.assertEqual(warmup.structured_content["transport_status"], "complete")
+        self.assertFalse(reboot.is_error)
+        self.assertEqual(
+            reboot.structured_content["transport_status"],
+            "abandoned_after_verified_reboot",
+        )
+        self.assertEqual(
+            reboot.structured_content["result_code"],
+            "abandoned_after_verified_reboot",
+        )
+        self.assertEqual(reboot.structured_content["stdout_length"], 0)
+        self.assertEqual(reboot.structured_content["stderr_length"], 0)
+        self.assertIsNone(reboot.structured_content["remote_exit_status"])
+        self.assertFalse(post_reboot.is_error)
+        self.assertEqual(
+            post_reboot.structured_content["transport_status"], "complete"
+        )
+        self.assertEqual(len(probe.post_calls), 2)
+        self.assertEqual(len(self.master_backend.starts), 2)
+        self.assertEqual(len(self.master_backend.stops), 1)
+        self.assertTrue(old_path.exists())
+        self.assertNotEqual(old_path.stat().st_ino, old_inode)
+        self.assertEqual(self.pool.pinned_request_ids, ())
+        self.assertEqual(interface.prompt_calls, [])
+        self.assertIsNone(self.pool.pinned_request_id)
+
+    def test_verified_reboot_allows_next_request_through_a_fresh_master(self):
+        reboot_spec = replace(
+            request(("systemctl", "reboot")),
+            disconnect_policy=DisconnectPolicy.EXPECT_FULL_REBOOT,
+        )
+        self.approve(reboot_spec)
+        backend = AutoCompletingBackend()
+        original_stage = backend.stage
+        stage_calls = []
+
+        def reset_first_stage(identity, submitted):
+            stage_calls.append(identity.request_id)
+            if len(stage_calls) == 1:
+                raise RuntimeError("simulated SSH reset")
+            return original_stage(identity, submitted)
+
+        backend.stage = reset_first_stage
+        probe = ExecutorBootProbe(
+            pre_boot_id="11111111-2222-3333-4444-555555555555",
+            post_boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+        interface = PlainTerminalInterface(
+            NonPresentingTerminal(),
+            approval_mode="disabled",
+        )
+        self.addCleanup(interface.close)
+        executor = self.executor(
+            backend,
+            operator_interface=interface,
+            reboot_recovery=self.reboot_coordinator(probe),
+        )
+
+        reboot_result = executor(REQUEST_ID, reboot_spec)
+        starts_after_reboot = len(self.master_backend.starts)
+        next_request_id = "f" * 32
+        verification = request(("uname", "-a"))
+        self.planner(next_request_id, verification)
+        verification_result = executor(next_request_id, verification)
+
+        self.assertEqual(
+            reboot_result.transport_status,
+            TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT,
+        )
+        self.assertEqual(verification_result.transport_status, TransportStatus.COMPLETE)
+        self.assertEqual(starts_after_reboot, 1)
+        self.assertEqual(len(self.master_backend.starts), 2)
+        self.assertEqual(self.pool.pinned_request_ids, ())
+        self.assertIsNone(interface._prompts.next_prompt(timeout=0))
+
+    def test_recovering_machine_is_rejected_before_planning(self):
+        probe = ExecutorBootProbe(
+            pre_boot_id="11111111-2222-3333-4444-555555555555"
+        )
+        coordinator = self.reboot_coordinator(probe)
+        coordinator.claim_expected_reboot("app-server", "f" * 32)
+        spec = request(("true",))
+        executor = self.executor(
+            AutoCompletingBackend(),
+            reboot_recovery=coordinator,
+        )
+
+        result = executor(REQUEST_ID, spec)
+
+        self.assertEqual(result.transport_status, TransportStatus.RECOVERY_IN_PROGRESS)
+        self.assertEqual(result.result_code, ResultCode.RECOVERY_IN_PROGRESS)
+        with self.assertRaises(FileNotFoundError):
+            self.state.load(REQUEST_ID)
 
     def test_post_arm_failure_is_incomplete_and_retains_transport_lease(self):
         spec = request(("true",))

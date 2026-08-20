@@ -36,9 +36,9 @@ being given a reusable interactive SSH shell. tmuxgate narrows that workflow:
   viewer. Existing remote sessions are not reused or modified.
 - stdout, stderr, exit status, job state, and checksums are collected through a
   durable, fail-closed lifecycle.
-- Default or per-machine learned sudo prompts can receive an owner-only stored
-  password automatically. First use learns the exact prompt and saves a masked
-  password entry; Automation never opens a Forward Input window.
+- The default or an already-enrolled exact per-machine sudo prompt can receive
+  an owner-only stored password automatically. Missing credentials and unknown
+  prompts fail immediately; Automation never opens enrollment or Forward Input.
 - A request may explicitly ask for `interactive` execution when the command
   genuinely needs a remote controlling terminal, such as `sudo` reading a
   password. Prompt detection and terminal handoff are offered only for those
@@ -59,6 +59,9 @@ Codex -> bearer-authenticated loopback HTTP -> embedded MCP server
 The MCP layer deliberately uses the existing Unix-socket client protocol. It
 does not bypass broker validation, approval, durable state, route planning,
 SSH/tmux isolation, result verification, or cleanup rules.
+Protocol version 4 binds the explicit disconnect policy into the request hash;
+the broker accepts exact version-3 frames only as the conservative `normal`
+policy for rolling local upgrades.
 
 ## Requirements
 
@@ -368,18 +371,20 @@ The embedded server exposes five typed tools:
   a uniquely configured `dockercorevm` machine. Resolution can only produce an
   alias returned by the broker; endpoints and SSH options are never accepted.
 - `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?,
-  interactive?)` submits exact structured argv and waits for the broker result.
+  interactive?, expect_full_reboot?)` submits exact structured argv and waits
+  for the broker result.
 - `run_script(machine, cwd, purpose, script?, script_base64?, environment?,
-  timeout_seconds?, interactive?)` requires exactly one UTF-8 script or
-  canonical base64 byte payload and waits for the broker result.
+  timeout_seconds?, interactive?, expect_full_reboot?)` requires exactly one
+  UTF-8 script or canonical base64 byte payload and waits for the broker result.
 - `list_jobs(states?, limit?, cursor?)` returns sanitized durable records with
   bounded, opaque-cursor pagination.
 - `read_verified_result(request_id, stream, offset?, limit?)` reads `stdout` or
   `stderr` only from a checksummed local spool that durable state marks as
   verified.
 
-Execution results include the request ID, transport status, remote exit status,
-byte lengths, and SHA-256 digests. Each stream of at most 64 KiB is classified
+Execution results include the request ID, transport status, optional stable
+`result_code`, remote exit status, byte lengths, and SHA-256 digests. Each
+stream of at most 64 KiB is classified
 independently: strictly valid UTF-8 is returned in `stdout` or `stderr` with the
 matching `*_encoding` set to `utf-8`; other bytes use canonical Base64 with
 encoding `base64`. Empty and control-character-containing valid UTF-8 remains
@@ -395,6 +400,17 @@ bounded execution and control worker pools keep long command waits from
 starving job and result queries. The broker reserves matching client-session
 capacity for the control pool, so saturated execution calls cannot consume the
 control path at the Unix-socket boundary either.
+
+Recovery and Automation failures use stable machine-readable codes:
+`recovery_in_progress`, `reboot_recovery_timeout`,
+`pre_reboot_boot_id_unavailable`, `boot_id_invalid`, `same_boot_observed`,
+`endpoint_identity_mismatch`, `host_key_mismatch`, `unsafe_control_path`,
+`ambiguous_master_state`, `reboot_probe_unavailable`,
+`request_binding_mismatch`, `unexpected_disconnect`,
+`automation_policy_denied`, `credential_unavailable`, and
+`credential_prompt_mismatch`. A truthful verified reboot uses
+`abandoned_after_verified_reboot`; it is distinct from command success and has
+no remote exit status or output claim.
 
 This is a breaking MCP response-schema migration. Consumers must replace
 `stdout_base64` and `stderr_base64` with the corresponding content and encoding
@@ -453,15 +469,12 @@ labelled in the approval summary (`TERMINAL`), carries the
 full evidence document. With Automation on, the default
 `[sudo] password for <resolved-user>:` prompt or that machine's learned exact
 prompt receives its saved password for up to three distinct prompt episodes.
-When a stored password already exists and a new exact prompt identifies itself
-as sudo, tmuxgate learns it for that logical machine and continues immediately.
-Otherwise the first unknown password prompt opens one masked first-use sudo
-setup on the controlling terminal; entering the password trusts that exact
-prompt, submits it once, and atomically saves both for future requests. This is
-credential enrollment, not Forward Input. Empty input cancels. Exhausted
-automatic attempts remain detached and are reported through activity and the
-command result. `tmuxgate attach REQUEST_ID` remains available for deliberate
-recovery.
+A missing password, unknown or mismatched prompt, submission failure, or
+exhausted attempt limit returns `credential_unavailable` or
+`credential_prompt_mismatch` immediately. Automation does not call `getpass`,
+open `/dev/tty`, suspend the TUI, enroll a credential, or offer Forward Input.
+Credentials remain an explicit dashboard/configuration ceremony performed
+outside a running command.
 
 With Automation off (`approval_mode = "always"`), stored passwords are not
 submitted. A request-bound authorization names the full request ID, machine,
@@ -505,25 +518,38 @@ prompt.
 
 ### Recovering after an intentional whole-host reboot
 
-An intentional reboot can end the SSH connection after remote completion is
-observed but before canonical output is copied into the verified local spool.
-If startup names that request as a recovery blocker, use this workflow only
-after confirming that the entire logical machine rebooted after the request's
-recorded start time:
+Set `expect_full_reboot = true` only when the submitted request is intended to
+reboot the whole host and destroy its current SSH session. This explicit policy
+is part of the canonical request hash; tmuxgate never infers it from argv or
+script text. Before the requested command starts, tmuxgate reads and strictly
+validates Linux `/proc/sys/kernel/random/boot_id` over the approved master and
+fsyncs that baseline with the exact request, generation, connection plan,
+endpoint, resolved SSH identity, and host-key alias.
 
-1. Stop the tmuxgate application completely. This retires its in-memory command
-   lease and dead SSH-master pin and releases the durable-state lock.
-2. Inspect the exact request with `tmuxgate jobs --json`. Do not use standalone
-   `cleanup`; it cannot establish the required reboot evidence.
-3. Run `tmuxgate recover after-reboot REQUEST_ID` and type the exact phrase shown
-   on the controlling terminal.
-4. Restart `tmuxgate`. A subsequent request can authenticate a fresh SSH master.
+After a disconnect, the broker uses bounded independent one-shot SSH probes
+with `ControlMaster=no`, `ControlPath=none`, strict known-host checking, and the
+original revalidated identity. Only a different canonical boot ID permits
+automatic abandonment. A reset that returns the same boot ID is not a reboot;
+tmuxgate attempts to resume observation/collection of the original guarded job
+and otherwise fails closed. Unreachable hosts are retried only until
+`broker.reboot_recovery_timeout_seconds` (default 300 seconds). While unresolved,
+the exact machine returns `recovery_in_progress`; unrelated machines can use
+remaining scheduler capacity.
 
-The recovery record is an audited abandonment, not a successful result. It
-does not contact the remote machine, publish output, invent an exit status, or
-prove that earlier command effects were rolled back. When completion had
-already been proven, its timestamp and exit status are preserved in the audit
-detail while the unverified result gates are cleared.
+Changed-boot evidence is durably committed before the old request pin is
+released. The old control path is then reconciled through the normal owner,
+mode, inode/device, file-type, and OpenSSH liveness checks. An unsafe or
+ambiguous path is left untouched and the machine stays blocked. Startup resumes
+incomplete evidence probes or evidence-complete cleanup without a terminal
+prompt, so the broker does not need to be stopped or restarted for a correctly
+marked Automation request.
+
+`abandoned_after_verified_reboot` is an audited terminal abandonment, not a
+successful command result. It has no fabricated exit status, completion time,
+stdout, stderr, local-spool claim, viewer-detach claim, or terminal-restoration
+claim. A verified reboot proves neither the rebooting command's exit status nor
+its earlier side effects. `tmuxgate recover after-reboot REQUEST_ID` remains for
+legacy records and normal interactive recovery when machine evidence is absent.
 
 ### Migrating from the earlier CLI workflow
 
@@ -565,13 +591,11 @@ dashboard refresh, and a terminal below 72×20 hides evidence and disables the
 positive action while leaving the safe action visible.
 
 Remote password-like pane text is inspected only at the visible cursor row. In
-automatic mode, the exact default or learned machine prompt can receive the
-stored password for up to three fresh prompt episodes. An unknown first-use
-prompt enters the dedicated masked credential enrollment described above.
-Automatic mode never queues a Forward Input decision. If automatic input cannot
-be used or sudo rejects it repeatedly, activity reports the failure and the
-command stays detached until it exits or the operator deliberately runs
-`tmuxgate attach REQUEST_ID`. With Automation off, a separate card identifies
+automatic mode, the exact default or previously enrolled machine prompt can receive the
+stored password for up to three fresh prompt episodes. Automatic mode never
+queues credential enrollment or a Forward Input decision; a missing stored
+password, unknown prompt, failed submission, or exhausted limit returns an
+immediate structured failure. With Automation off, a separate card identifies
 the full request ID, logical machine, endpoint, approved argv or script digest,
 and remote-input action. Plain mode requires `forward <full-request-id>`; the
 TUI shows the same binding in a Deny-default Forward Input modal.
@@ -580,14 +604,19 @@ If initial OpenSSH master setup exits, tmuxgate captures bounded complete stderr
 diagnostics as exact bytes for the structured operator decision without copying
 them into MCP or durable state. The plain and Textual views render those bytes
 inertly and expose their SHA-256 and exact hexadecimal evidence. At most one
-exact operator-confirmed retry is offered for each attempted approved endpoint
-before any remote command starts; Cancel is the default action.
+exact retry is available for each attempted approved endpoint before any remote
+command starts. Automation approves it synchronously only when its immutable
+request, plan, endpoint, host identity, mutation state, retry number, and
+binding are exact, and audits that decision before retrying. Normal mode retains
+the Cancel-default operator modal.
 The retry recollects local network evidence,
 re-resolves SSH policy, and proceeds only if the approved machine, ordered
 candidate eligibility, eligible endpoint order, and complete resolved SSH
 identities are unchanged. Volatile observation bytes may produce a new
-snapshot digest without invalidating those semantics. The retry is never
-automatic; a semantic change requires a fresh request and approval.
+snapshot digest without invalidating those semantics. A semantic change always
+requires a fresh request and approval. Automation similarly authorizes only the
+exact adjacent pre-mutation route fallback; it denies persistent machine
+disable without changing configuration.
 Before installing a missing dedicated public key, tmuxgate durably records the
 exact request, approved endpoint, and possible `authorized_keys` mutation. If
 enrollment or its verification then fails, the request ends with

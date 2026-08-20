@@ -12,7 +12,12 @@ import socket
 import time
 from typing import Any, BinaryIO
 
-from tmuxgate.models import PROTOCOL_VERSION, ValidationError, validate_request_id
+from tmuxgate.models import (
+    PREVIOUS_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+    ValidationError,
+    validate_request_id,
+)
 from tmuxgate.protocol import ProtocolError, receive_frame, send_frame
 
 
@@ -31,6 +36,29 @@ class TransportStatus(StrEnum):
     COMMAND_TIMEOUT = "command_timeout"
     RESULT_COLLECTION_FAILURE = "result_collection_failure"
     INTERNAL_ERROR = "internal_error"
+    RECOVERY_IN_PROGRESS = "recovery_in_progress"
+    ABANDONED_AFTER_VERIFIED_REBOOT = "abandoned_after_verified_reboot"
+
+
+class ResultCode(StrEnum):
+    """Stable machine-readable outcomes that refine transport status."""
+
+    RECOVERY_IN_PROGRESS = "recovery_in_progress"
+    REBOOT_RECOVERY_TIMEOUT = "reboot_recovery_timeout"
+    PRE_REBOOT_BOOT_ID_UNAVAILABLE = "pre_reboot_boot_id_unavailable"
+    BOOT_ID_INVALID = "boot_id_invalid"
+    SAME_BOOT_OBSERVED = "same_boot_observed"
+    ENDPOINT_IDENTITY_MISMATCH = "endpoint_identity_mismatch"
+    HOST_KEY_MISMATCH = "host_key_mismatch"
+    UNSAFE_CONTROL_PATH = "unsafe_control_path"
+    AMBIGUOUS_MASTER_STATE = "ambiguous_master_state"
+    AUTOMATION_POLICY_DENIED = "automation_policy_denied"
+    CREDENTIAL_UNAVAILABLE = "credential_unavailable"
+    CREDENTIAL_PROMPT_MISMATCH = "credential_prompt_mismatch"
+    UNEXPECTED_DISCONNECT = "unexpected_disconnect"
+    REBOOT_PROBE_UNAVAILABLE = "reboot_probe_unavailable"
+    REQUEST_BINDING_MISMATCH = "request_binding_mismatch"
+    ABANDONED_AFTER_VERIFIED_REBOOT = "abandoned_after_verified_reboot"
 
 
 LOCAL_EXIT_CODES: dict[TransportStatus, int] = {
@@ -43,6 +71,8 @@ LOCAL_EXIT_CODES: dict[TransportStatus, int] = {
     TransportStatus.COMMAND_TIMEOUT: 124,
     TransportStatus.RESULT_COLLECTION_FAILURE: 74,
     TransportStatus.INTERNAL_ERROR: 70,
+    TransportStatus.RECOVERY_IN_PROGRESS: 75,
+    TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT: 70,
 }
 
 
@@ -54,6 +84,7 @@ class ExecutionResult:
     stderr: bytes = b""
     remote_exit_status: int | None = None
     detail: str | None = None
+    result_code: ResultCode | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -87,6 +118,19 @@ class ExecutionResult:
             not isinstance(self.detail, str) or "\x00" in self.detail
         ):
             raise ValueError("result detail must be text without NUL")
+        if self.result_code is not None:
+            try:
+                code = ResultCode(self.result_code)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unsupported result code: {self.result_code!r}") from exc
+            object.__setattr__(self, "result_code", code)
+        if status is TransportStatus.COMPLETE and self.result_code is not None:
+            raise ValueError("complete command result must not carry a recovery result code")
+        if status is TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT:
+            if self.result_code is not ResultCode.ABANDONED_AFTER_VERIFIED_REBOOT:
+                raise ValueError("verified reboot abandonment requires its exact result code")
+            if self.stdout or self.stderr or self.remote_exit_status is not None:
+                raise ValueError("verified reboot abandonment cannot claim command output or exit")
 
     def transparent_exit_code(self) -> int:
         if self.transport_status is TransportStatus.COMPLETE:
@@ -99,6 +143,7 @@ class ExecutionResult:
             "detail": self.detail,
             "remote_exit_status": self.remote_exit_status,
             "request_id": self.request_id,
+            "result_code": None if self.result_code is None else self.result_code.value,
             "stderr_base64": base64.b64encode(self.stderr).decode("ascii"),
             "stderr_length": len(self.stderr),
             "stderr_sha256": hashlib.sha256(self.stderr).hexdigest(),
@@ -119,6 +164,7 @@ def _result_header(result: ExecutionResult) -> dict[str, Any]:
         "protocol": PROTOCOL_VERSION,
         "remote_exit_status": result.remote_exit_status,
         "request_id": result.request_id,
+        "result_code": None if result.result_code is None else result.result_code.value,
         "stderr_length": len(result.stderr),
         "stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
         "stdout_length": len(result.stdout),
@@ -251,7 +297,10 @@ def _require_exact_header(header: dict[str, Any], expected: set[str], name: str)
 
 
 def _require_protocol(value: object) -> None:
-    if type(value) is not int or value != PROTOCOL_VERSION:
+    if type(value) is not int or value not in {
+        PREVIOUS_PROTOCOL_VERSION,
+        PROTOCOL_VERSION,
+    }:
         raise ProtocolError("result uses an unsupported protocol version")
 
 
@@ -320,6 +369,7 @@ def receive_result(
         if not isinstance(state, str) or not state or "\x00" in state:
             raise ProtocolError("status state is invalid")
 
+    _require_protocol(frame.header.get("protocol"))
     fields = {
         "detail",
         "protocol",
@@ -332,8 +382,9 @@ def receive_result(
         "transport_status",
         "type",
     }
+    if frame.header["protocol"] == PROTOCOL_VERSION:
+        fields.add("result_code")
     _require_exact_header(frame.header, fields, "result start")
-    _require_protocol(frame.header["protocol"])
     if frame.header["type"] != "result-start" or frame.payload:
         raise ProtocolError("invalid result-start frame")
     request_id = frame.header["request_id"]
@@ -383,6 +434,7 @@ def receive_result(
             stderr=stderr,
             remote_exit_status=frame.header["remote_exit_status"],
             detail=frame.header["detail"],
+            result_code=frame.header.get("result_code"),
         )
     except ValueError as exc:
         raise ProtocolError(f"invalid result manifest: {exc}") from exc

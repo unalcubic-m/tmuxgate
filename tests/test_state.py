@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from tmuxgate.scheduler import ApprovalDecision, RequestState
-from tmuxgate.models import ExecutionMode, RequestSpec
+from tmuxgate.models import DisconnectPolicy, ExecutionMode, RequestSpec
 from tmuxgate.state import (
     DurableJobRecord,
     DurableStateStore,
@@ -370,7 +370,29 @@ class StartupRecoveryTests(unittest.TestCase):
         self.assertEqual(recovered.decision, ApprovalDecision.APPROVED)
         self.assertFalse(report.blocking_request_ids)
 
-    def test_possibly_running_job_blocks_all_new_approvals(self):
+    def test_previous_remote_active_record_is_normal_and_never_auto_verified(self):
+        store = self.make_store()
+        legacy = replace(
+            record(
+                state=RequestState.REMOTE_MAY_BE_RUNNING,
+                remote_mutation_started=True,
+                start_time="2026-07-19T12:02:00Z",
+            ),
+            record_version=2,
+            resolved_identity_sha256=None,
+        )
+        store.write(legacy)
+
+        report = recover_startup(store)
+
+        loaded = store.load(REQUEST_ID)
+        self.assertEqual(loaded.record_version, 2)
+        self.assertEqual(loaded.disconnect_policy, DisconnectPolicy.NORMAL)
+        self.assertIsNone(loaded.reboot_recovery)
+        self.assertEqual(report.expected_reboot_request_ids, ())
+        self.assertEqual(report.blocking_machine_aliases, ("app-server",))
+
+    def test_possibly_running_job_blocks_only_its_machine(self):
         store = self.make_store()
         store.write(
             record(
@@ -381,7 +403,8 @@ class StartupRecoveryTests(unittest.TestCase):
         )
         report = recover_startup(store)
         self.assertEqual(report.blocking_request_ids, (REQUEST_ID,))
-        self.assertFalse(report.safe_to_accept_new_approvals)
+        self.assertTrue(report.safe_to_accept_new_approvals)
+        self.assertEqual(report.blocking_machine_aliases, ("app-server",))
 
     def test_interrupted_key_enrollment_is_terminalized_without_claiming_command(self):
         for verified in (False, True):
@@ -498,7 +521,9 @@ class DurableLifecycleTransitionTests(unittest.TestCase):
             RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
         )
         self.assertIn("viewer transport", current.failure_detail)
-        self.assertFalse(recover_startup(store).safe_to_accept_new_approvals)
+        report = recover_startup(store)
+        self.assertTrue(report.safe_to_accept_new_approvals)
+        self.assertEqual(report.blocking_machine_aliases, ("app-server",))
         current = store.mark_completion_proven(current, exit_status=130)
         self.assertEqual(current.exit_status, 130)
         self.assertIsNone(current.failure_detail)
@@ -634,6 +659,29 @@ class DurableLifecycleTransitionTests(unittest.TestCase):
         with self.assertRaises(StateConflictError):
             store.mark_abandoned_after_operator_confirmed_dead_pane(recovery)
 
+    def test_manual_attestations_cannot_replace_expected_reboot_evidence(self):
+        store = self.make_store()
+        request = RequestSpec(
+            "app-server",
+            ExecutionMode.ARGV,
+            "/",
+            argv=("true",),
+            disconnect_policy=DisconnectPolicy.EXPECT_FULL_REBOOT,
+        )
+        expected = new_approved_job_record(REQUEST_ID, request, build_plan())
+        store.write(expected)
+        captured = store.record_pre_reboot_boot_id(
+            expected,
+            boot_id="11111111-2222-3333-4444-555555555555",
+        )
+        armed, _ = store.arm_remote_start(captured)
+        recovery = store.mark_recovery_required(armed, detail="expected disconnect")
+
+        with self.assertRaises(StateConflictError):
+            store.mark_abandoned_after_operator_confirmed_dead_pane(recovery)
+        with self.assertRaises(StateConflictError):
+            store.mark_abandoned_after_operator_confirmed_reboot(recovery)
+
     def test_canonical_proven_unstarted_evidence_releases_without_completion(self):
         store = self.make_store()
         current = self.armed(store)
@@ -742,7 +790,8 @@ class DurableLifecycleTransitionTests(unittest.TestCase):
             )
         )
         report = recover_startup(store)
-        self.assertFalse(report.safe_to_accept_new_approvals)
+        self.assertTrue(report.safe_to_accept_new_approvals)
+        self.assertEqual(report.blocking_machine_aliases, ("app-server",))
 
     def test_multiple_uncertain_records_are_all_reported_and_never_collapsed(self):
         store = self.make_store()
@@ -757,7 +806,8 @@ class DurableLifecycleTransitionTests(unittest.TestCase):
             )
         report = recover_startup(store)
         self.assertEqual(set(report.blocking_request_ids), {REQUEST_ID, SECOND_ID})
-        self.assertFalse(report.safe_to_accept_new_approvals)
+        self.assertTrue(report.safe_to_accept_new_approvals)
+        self.assertEqual(report.blocking_machine_aliases, ("app-server",))
 
 
 if __name__ == "__main__":

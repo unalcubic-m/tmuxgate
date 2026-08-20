@@ -955,6 +955,90 @@ class OperationalActivity:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class AutomationPolicyDecision:
+    decision: ApprovalDecision
+    reason: str
+
+
+class AutomationDecisionPolicy:
+    """Single fail-closed policy boundary for every operator decision kind."""
+
+    def decide(self, prompt: OperatorPrompt) -> AutomationPolicyDecision:
+        if isinstance(
+            prompt,
+            (
+                ExecutionApprovalPrompt,
+                SshRetryPrompt,
+                RouteFallbackPrompt,
+                MachineDisablePrompt,
+                SecretInputAuthorizationPrompt,
+            ),
+        ):
+            try:
+                # Frozen prompt objects validate at construction, but the
+                # policy boundary deliberately rechecks every canonical digest
+                # and state field at the exact moment an automatic decision is
+                # made.  This also fails closed against unsafe test doubles or
+                # memory-side mutation between construction and consumption.
+                prompt.__post_init__()
+            except (TypeError, ValueError) as exc:
+                raise OperatorInterfaceError(
+                    "automation rejected an invalid structured prompt binding"
+                ) from exc
+        if isinstance(prompt, ExecutionApprovalPrompt):
+            return AutomationPolicyDecision(
+                ApprovalDecision.APPROVED,
+                "automation approved the exact bound execution request",
+            )
+        if isinstance(prompt, SshRetryPrompt):
+            if (
+                prompt.retry_number != 1
+                or prompt.retry_limit != SSH_RETRY_LIMIT
+                or prompt.remote_command_state is not RemoteCommandState.NOT_STARTED
+                or prompt.remote_mutation_state is not RemoteMutationState.NOT_STARTED
+            ):
+                raise OperatorInterfaceError(
+                    "automation rejected an invalid structured SSH retry"
+                )
+            return AutomationPolicyDecision(
+                ApprovalDecision.APPROVED,
+                "automation approved the one exact same-endpoint pre-mutation retry",
+            )
+        if isinstance(prompt, RouteFallbackPrompt):
+            if (
+                prompt.remote_command_state is not RemoteCommandState.NOT_STARTED
+                or prompt.remote_mutation_state is not RemoteMutationState.NOT_STARTED
+            ):
+                raise OperatorInterfaceError(
+                    "automation rejected an invalid structured route fallback"
+                )
+            failed_index = _endpoint_index(
+                prompt.connection_plan, prompt.failed_endpoint_id
+            )
+            if _endpoint_index(
+                prompt.connection_plan, prompt.fallback_endpoint_id
+            ) != failed_index + 1:
+                raise OperatorInterfaceError(
+                    "automation rejected a non-adjacent route fallback"
+                )
+            return AutomationPolicyDecision(
+                ApprovalDecision.APPROVED,
+                "automation approved the next exact pre-mutation route fallback",
+            )
+        if isinstance(prompt, MachineDisablePrompt):
+            return AutomationPolicyDecision(
+                ApprovalDecision.DENIED,
+                "automation denied persistent machine disable without mutation",
+            )
+        if isinstance(prompt, SecretInputAuthorizationPrompt):
+            return AutomationPolicyDecision(
+                ApprovalDecision.DENIED,
+                "automation denied a human secret-input handoff",
+            )
+        raise OperatorInterfaceError("automation received an unsupported prompt type")
+
+
 class PendingDecision:
     """Thread-safe one-shot slot; cancellation and abandonment mean denial."""
 
@@ -1099,6 +1183,16 @@ class PromptQueue:
         with self._lock:
             self._pending.pop(prompt_id, None)
 
+    def deny_pending(self) -> int:
+        """Synchronously deny every submitted human prompt without closing."""
+
+        with self._lock:
+            pending = tuple(self._pending.values())
+        denied = 0
+        for item in pending:
+            denied += int(item.deny())
+        return denied
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
@@ -1139,11 +1233,43 @@ class OperatorInterface(Protocol):
         self, prompt: MachineDisablePrompt
     ) -> OperatorDecision: ...
 
+    def resolve_automation_prompt(self, prompt: OperatorPrompt) -> OperatorDecision: ...
+
     def publish_activity(self, event: OperationalActivity) -> None: ...
 
     def run_dashboard(self, stop: threading.Event, config: object) -> None: ...
 
     def close(self) -> bool: ...
+
+
+def resolve_operator_prompt(
+    interface: OperatorInterface,
+    prompt: OperatorPrompt,
+) -> OperatorDecision:
+    """Route one prompt to synchronous policy or the exact human method."""
+
+    try:
+        automation = getattr(interface, "approval_mode") == "disabled"
+    except BaseException:
+        automation = False
+    if automation:
+        resolver = getattr(interface, "resolve_automation_prompt", None)
+        if not callable(resolver):
+            raise OperatorInterfaceError(
+                "Automation operator interface lacks the central policy resolver"
+            )
+        return resolver(prompt)
+    if isinstance(prompt, ExecutionApprovalPrompt):
+        return interface.request_execution_approval(prompt)
+    if isinstance(prompt, SshRetryPrompt):
+        return interface.request_ssh_retry(prompt)
+    if isinstance(prompt, RouteFallbackPrompt):
+        return interface.request_fallback(prompt)
+    if isinstance(prompt, SecretInputAuthorizationPrompt):
+        return interface.request_secret_input_authorization(prompt)
+    if isinstance(prompt, MachineDisablePrompt):
+        return interface.request_machine_disable(prompt)
+    raise OperatorInterfaceError("unsupported operator prompt type")
 
 
 Dashboard = Callable[[threading.Event, TerminalArbiter, object], None]
@@ -1208,6 +1334,7 @@ class PlainTerminalInterface:
         self._presenter = self._present_prompt if presenter is None else presenter
         self._approval_mode = approval_mode
         self._approval_mode_lock = threading.Lock()
+        self._automation_policy = AutomationDecisionPolicy()
         self._prompts = PromptQueue()
         self._activity: deque[OperationalActivity] = deque(maxlen=activity_capacity)
         self._activity_lock = threading.Lock()
@@ -1235,8 +1362,14 @@ class PlainTerminalInterface:
             raise ValueError("approval_mode must be 'always' or 'disabled'")
         with self._approval_mode_lock:
             self._approval_mode = approval_mode
+        if approval_mode == "disabled":
+            self._prompts.deny_pending()
 
     def _request(self, prompt: OperatorPrompt) -> OperatorDecision:
+        if self.approval_mode == "disabled":
+            raise OperatorInterfaceError(
+                "programming error: a human prompt was submitted in Automation mode"
+            )
         pending = self._prompts.submit(prompt)
         try:
             return pending.wait()
@@ -1244,42 +1377,62 @@ class PlainTerminalInterface:
             pending.abandon()
             raise
 
+    def _resolve_automatic(self, prompt: OperatorPrompt) -> OperatorDecision:
+        automatic = self._automation_policy.decide(prompt)
+        # This append-only audit event is recorded before the caller can act on
+        # an approved retry or fallback decision.
+        self.publish_activity(
+            OperationalActivity.create(
+                ActivityKind.BROKER_AUDIT,
+                automatic.reason,
+                request_id=prompt.request_id,
+                machine_name=prompt.request.machine_alias,
+                details=(
+                    ("prompt_type", type(prompt).__name__),
+                    ("binding_sha256", prompt.binding_sha256),
+                    ("decision", automatic.decision.value),
+                ),
+            )
+        )
+        return self._prompts.decide_without_presentation(
+            prompt, automatic.decision
+        )
+
+    def resolve_automation_prompt(self, prompt: OperatorPrompt) -> OperatorDecision:
+        if self.approval_mode != "disabled":
+            raise OperatorInterfaceError(
+                "automatic prompt resolution requires Automation mode"
+            )
+        return self._resolve_automatic(prompt)
+
+    def _decide_or_request(self, prompt: OperatorPrompt) -> OperatorDecision:
+        if self.approval_mode != "disabled":
+            return self._request(prompt)
+        return self._resolve_automatic(prompt)
+
     def request_execution_approval(
         self, prompt: ExecutionApprovalPrompt
     ) -> OperatorDecision:
         if not isinstance(prompt, ExecutionApprovalPrompt):
             raise TypeError("prompt must be an ExecutionApprovalPrompt")
-        if self.approval_mode == "disabled":
-            return self._prompts.decide_without_presentation(
-                prompt, ApprovalDecision.APPROVED
-            )
-        return self._request(prompt)
+        return self._decide_or_request(prompt)
 
     def request_ssh_retry(self, prompt: SshRetryPrompt) -> OperatorDecision:
         if not isinstance(prompt, SshRetryPrompt):
             raise TypeError("prompt must be an SshRetryPrompt")
-        return self._request(prompt)
+        return self._decide_or_request(prompt)
 
     def request_fallback(self, prompt: RouteFallbackPrompt) -> OperatorDecision:
         if not isinstance(prompt, RouteFallbackPrompt):
             raise TypeError("prompt must be a RouteFallbackPrompt")
-        if self.approval_mode == "disabled":
-            return self._prompts.decide_without_presentation(
-                prompt, ApprovalDecision.APPROVED
-            )
-        return self._request(prompt)
+        return self._decide_or_request(prompt)
 
     def request_secret_input_authorization(
         self, prompt: SecretInputAuthorizationPrompt
     ) -> OperatorDecision:
         if not isinstance(prompt, SecretInputAuthorizationPrompt):
             raise TypeError("prompt must be a SecretInputAuthorizationPrompt")
-        if self.approval_mode == "disabled":
-            return self._prompts.decide_without_presentation(
-                prompt, ApprovalDecision.DENIED
-            )
-        # Manual approval mode retains an exact independent terminal decision.
-        return self._request(prompt)
+        return self._decide_or_request(prompt)
 
     def run_external_terminal_session(
         self,
@@ -1292,6 +1445,10 @@ class PlainTerminalInterface:
             raise TypeError("prompt must be a SecretInputAuthorizationPrompt")
         if not callable(session):
             raise TypeError("external terminal session must be callable")
+        if self.approval_mode == "disabled":
+            raise OperatorInterfaceError(
+                "Automation mode forbids external secret-input terminal sessions"
+            )
         with self.terminal.claim(
             priority=TerminalPriority.SECRET,
             purpose=f"secret input for request {prompt.request_id}",
@@ -1313,6 +1470,10 @@ class PlainTerminalInterface:
             raise TypeError("terminal session purpose must be a string")
         if not callable(session):
             raise TypeError("external terminal session must be callable")
+        if self.approval_mode == "disabled":
+            raise OperatorInterfaceError(
+                "Automation mode forbids prompt-capable terminal sessions"
+            )
         with self.terminal.claim(
             priority=TerminalPriority.INTERACTIVE, purpose=purpose
         ):
@@ -1323,7 +1484,7 @@ class PlainTerminalInterface:
     ) -> OperatorDecision:
         if not isinstance(prompt, MachineDisablePrompt):
             raise TypeError("prompt must be a MachineDisablePrompt")
-        return self._request(prompt)
+        return self._decide_or_request(prompt)
 
     def _presentation_loop(self) -> None:
         while not self._prompts.closed:
@@ -1457,6 +1618,8 @@ class PlainTerminalInterface:
 
 __all__ = [
     "ActivityKind",
+    "AutomationDecisionPolicy",
+    "AutomationPolicyDecision",
     "ConnectionPhase",
     "ExecutionApprovalPrompt",
     "MachineDisablePrompt",

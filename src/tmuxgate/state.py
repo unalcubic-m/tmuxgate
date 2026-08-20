@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from enum import StrEnum
 import hashlib
 import json
 import os
@@ -14,12 +15,18 @@ import stat
 import threading
 
 from tmuxgate.connection_plan import ConnectionPlan, PlannedEndpoint
-from tmuxgate.models import RequestSpec, validate_alias, validate_request_id
+from tmuxgate.models import (
+    DisconnectPolicy,
+    RequestSpec,
+    validate_alias,
+    validate_request_id,
+)
 from tmuxgate.runtime import PRIVATE_DIRECTORY_MODE, ensure_private_directory
 from tmuxgate.scheduler import ApprovalDecision, RequestState
 
 
-STATE_FORMAT_VERSION = 2
+STATE_FORMAT_VERSION = 3
+PREVIOUS_STATE_FORMAT_VERSION = 2
 STATE_FILE_MODE = 0o600
 STATE_JOBS_DIRECTORY_NAME = "jobs"
 MAX_STATE_FILE_BYTES = 1024 * 1024
@@ -27,12 +34,19 @@ MAX_STATE_FILE_BYTES = 1024 * 1024
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _ENDPOINT_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,62}\Z", re.ASCII)
 _SESSION_RE = re.compile(r"tmuxgate-[0-9a-f]{8,32}\Z", re.ASCII)
+_BOOT_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z",
+    re.ASCII,
+)
 _TEMP_RE = re.compile(r"\.([0-9a-f]{32})\.([0-9a-f]{32})\.tmp\Z", re.ASCII)
 _FINAL_RE = re.compile(r"([0-9a-f]{32})\.json\Z", re.ASCII)
 _REMOTE_ACTIVE_STATES = frozenset(
     {
         RequestState.REMOTE_MAY_BE_RUNNING,
         RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+        RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING,
+        RequestState.EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING,
+        RequestState.EXPECTED_REBOOT_RECOVERY_FAILED,
         RequestState.COMPLETION_PROVEN,
         RequestState.LOCAL_SPOOL_VERIFIED,
     }
@@ -43,10 +57,17 @@ _OPERATOR_ABANDONED_STATES = frozenset(
         RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE,
     }
 )
+_AUTOMATIC_ABANDONED_STATES = frozenset(
+    {RequestState.ABANDONED_AFTER_VERIFIED_REBOOT}
+)
 _PROVEN_UNSTARTED_STATES = frozenset(
     {RequestState.ABANDONED_AFTER_PROVEN_UNSTARTED}
 )
-_ABANDONED_STATES = _OPERATOR_ABANDONED_STATES | _PROVEN_UNSTARTED_STATES
+_ABANDONED_STATES = (
+    _OPERATOR_ABANDONED_STATES
+    | _PROVEN_UNSTARTED_STATES
+    | _AUTOMATIC_ABANDONED_STATES
+)
 _REMOTE_STARTED_STATES = _REMOTE_ACTIVE_STATES | _ABANDONED_STATES
 _REMOTE_MUTATION_STATES = _REMOTE_STARTED_STATES | frozenset(
     {
@@ -113,6 +134,12 @@ def _validate_timestamp(value: object, name: str, *, optional: bool = False) -> 
     return text
 
 
+def _parsed_timestamp(value: str) -> datetime:
+    """Parse a timestamp already accepted by `_validate_timestamp`."""
+
+    return datetime.fromisoformat(value[:-1] + "+00:00")
+
+
 def _canonical_json(document: Mapping[str, object]) -> bytes:
     return json.dumps(
         document,
@@ -125,6 +152,232 @@ def _canonical_json(document: Mapping[str, object]) -> bytes:
 
 def _sha256_document(document: Mapping[str, object]) -> str:
     return hashlib.sha256(_canonical_json(document)).hexdigest()
+
+
+class RebootRecoveryPhase(StrEnum):
+    PRE_BOOT_ID_CAPTURED = "pre_boot_id_captured"
+    VERIFICATION_PENDING = "verification_pending"
+    SAME_BOOT_OBSERVED = "same_boot_observed"
+    VERIFIED_CHANGED_BOOT = "verified_changed_boot"
+    CLEANUP_COMPLETE = "cleanup_complete"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class RebootRecoveryEvidence:
+    """Durable, exact evidence for one expected full-host reboot."""
+
+    request_id: str
+    machine_alias: str
+    connection_plan_sha256: str
+    endpoint_id: str
+    resolved_identity_sha256: str
+    host_key_alias: str
+    pre_boot_id: str
+    pre_boot_id_captured_at: str
+    pre_boot_id_generation: int
+    phase: RebootRecoveryPhase = RebootRecoveryPhase.PRE_BOOT_ID_CAPTURED
+    remote_start_time: str | None = None
+    remote_start_generation: int | None = None
+    post_boot_id: str | None = None
+    probe_attempts: int = 0
+    recovery_started_at: str | None = None
+    recovery_deadline_at: str | None = None
+    last_probe_at: str | None = None
+    verified_at: str | None = None
+    evidence_sha256: str | None = None
+    automatic_decision: str | None = None
+    automatic_reason: str | None = None
+    failure_code: str | None = None
+    cleanup_outcome: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            object.__setattr__(self, "request_id", validate_request_id(self.request_id))
+            object.__setattr__(self, "machine_alias", validate_alias(self.machine_alias))
+        except ValueError as exc:
+            raise StateCorruptionError(str(exc)) from exc
+        for name, value in (
+            ("connection_plan_sha256", self.connection_plan_sha256),
+            ("resolved_identity_sha256", self.resolved_identity_sha256),
+        ):
+            _validate_digest(value, name)
+        if (
+            not isinstance(self.endpoint_id, str)
+            or _ENDPOINT_ID_RE.fullmatch(self.endpoint_id) is None
+        ):
+            raise StateCorruptionError("reboot recovery endpoint_id is invalid")
+        _validate_text(self.host_key_alias, "reboot recovery host_key_alias")
+        for name, value, optional in (
+            ("pre_boot_id", self.pre_boot_id, False),
+            ("post_boot_id", self.post_boot_id, True),
+        ):
+            if value is None and optional:
+                continue
+            if not isinstance(value, str) or _BOOT_ID_RE.fullmatch(value) is None:
+                raise StateCorruptionError(f"{name} is not a canonical Linux boot ID")
+        for name, value, optional in (
+            ("pre_boot_id_captured_at", self.pre_boot_id_captured_at, False),
+            ("remote_start_time", self.remote_start_time, True),
+            ("recovery_started_at", self.recovery_started_at, True),
+            ("recovery_deadline_at", self.recovery_deadline_at, True),
+            ("last_probe_at", self.last_probe_at, True),
+            ("verified_at", self.verified_at, True),
+        ):
+            _validate_timestamp(value, name, optional=optional)
+        for name, value, optional in (
+            ("pre_boot_id_generation", self.pre_boot_id_generation, False),
+            ("remote_start_generation", self.remote_start_generation, True),
+        ):
+            if value is None and optional:
+                continue
+            if type(value) is not int or value < 1:
+                raise StateCorruptionError(f"{name} must be a positive integer")
+        if type(self.probe_attempts) is not int or self.probe_attempts < 0:
+            raise StateCorruptionError("probe_attempts must be a non-negative integer")
+        try:
+            phase = RebootRecoveryPhase(self.phase)
+        except (TypeError, ValueError) as exc:
+            raise StateCorruptionError("reboot recovery phase is invalid") from exc
+        object.__setattr__(self, "phase", phase)
+        for name, value in (
+            ("automatic_decision", self.automatic_decision),
+            ("automatic_reason", self.automatic_reason),
+            ("failure_code", self.failure_code),
+            ("cleanup_outcome", self.cleanup_outcome),
+        ):
+            _validate_text(value, name, optional=True)
+        _validate_digest(self.evidence_sha256, "evidence_sha256", optional=True)
+        if (self.remote_start_time is None) != (self.remote_start_generation is None):
+            raise StateCorruptionError("reboot recovery start time and generation must pair")
+        if (self.recovery_started_at is None) != (self.recovery_deadline_at is None):
+            raise StateCorruptionError("reboot recovery start and deadline must pair")
+        if (self.automatic_decision is None) != (self.automatic_reason is None):
+            raise StateCorruptionError("automatic reboot decision and reason must pair")
+        pre_capture = _parsed_timestamp(self.pre_boot_id_captured_at)
+        remote_start = (
+            None
+            if self.remote_start_time is None
+            else _parsed_timestamp(self.remote_start_time)
+        )
+        recovery_start = (
+            None
+            if self.recovery_started_at is None
+            else _parsed_timestamp(self.recovery_started_at)
+        )
+        recovery_deadline = (
+            None
+            if self.recovery_deadline_at is None
+            else _parsed_timestamp(self.recovery_deadline_at)
+        )
+        verified_at = (
+            None if self.verified_at is None else _parsed_timestamp(self.verified_at)
+        )
+        if remote_start is not None and pre_capture > remote_start:
+            raise StateCorruptionError("pre-reboot evidence follows remote start")
+        if recovery_start is not None:
+            assert recovery_deadline is not None
+            if remote_start is None or recovery_start < remote_start:
+                raise StateCorruptionError("reboot recovery precedes remote start")
+            if recovery_deadline <= recovery_start:
+                raise StateCorruptionError("reboot recovery deadline is not future")
+        if verified_at is not None:
+            if (
+                remote_start is None
+                or recovery_start is None
+                or recovery_deadline is None
+                or verified_at <= remote_start
+                or verified_at < recovery_start
+                or verified_at >= recovery_deadline
+            ):
+                raise StateCorruptionError(
+                    "verified reboot observation is outside its start/deadline bounds"
+                )
+        if phase in {
+            RebootRecoveryPhase.VERIFIED_CHANGED_BOOT,
+            RebootRecoveryPhase.CLEANUP_COMPLETE,
+        }:
+            if (
+                self.post_boot_id is None
+                or self.post_boot_id == self.pre_boot_id
+                or self.verified_at is None
+                or self.evidence_sha256 is None
+                or self.automatic_decision != "abandon_after_verified_reboot"
+            ):
+                raise StateCorruptionError("verified reboot evidence is incomplete")
+            if self.evidence_sha256 != self.computed_evidence_sha256():
+                raise StateCorruptionError("verified reboot evidence digest does not match")
+        if phase is RebootRecoveryPhase.SAME_BOOT_OBSERVED and (
+            self.post_boot_id is None or self.post_boot_id != self.pre_boot_id
+        ):
+            raise StateCorruptionError("same-boot phase lacks matching boot IDs")
+        if phase is RebootRecoveryPhase.CLEANUP_COMPLETE and self.cleanup_outcome is None:
+            raise StateCorruptionError("completed reboot cleanup lacks an outcome")
+        if phase is RebootRecoveryPhase.FAILED and self.failure_code is None:
+            raise StateCorruptionError("failed reboot recovery lacks a failure code")
+
+    def evidence_document(self) -> dict[str, object]:
+        return {
+            "automatic_decision": self.automatic_decision,
+            "automatic_reason": self.automatic_reason,
+            "connection_plan_sha256": self.connection_plan_sha256,
+            "disconnect_policy": DisconnectPolicy.EXPECT_FULL_REBOOT.value,
+            "endpoint_id": self.endpoint_id,
+            "host_key_alias": self.host_key_alias,
+            "last_probe_at": self.last_probe_at,
+            "machine_alias": self.machine_alias,
+            "post_boot_id": self.post_boot_id,
+            "pre_boot_id": self.pre_boot_id,
+            "pre_boot_id_captured_at": self.pre_boot_id_captured_at,
+            "pre_boot_id_generation": self.pre_boot_id_generation,
+            "probe_attempts": self.probe_attempts,
+            "recovery_deadline_at": self.recovery_deadline_at,
+            "recovery_started_at": self.recovery_started_at,
+            "remote_start_generation": self.remote_start_generation,
+            "remote_start_time": self.remote_start_time,
+            "request_id": self.request_id,
+            "resolved_identity_sha256": self.resolved_identity_sha256,
+            "verified_at": self.verified_at,
+        }
+
+    def computed_evidence_sha256(self) -> str:
+        return _sha256_document(self.evidence_document())
+
+    def payload_document(self) -> dict[str, object]:
+        return {
+            "automatic_decision": self.automatic_decision,
+            "automatic_reason": self.automatic_reason,
+            "cleanup_outcome": self.cleanup_outcome,
+            "connection_plan_sha256": self.connection_plan_sha256,
+            "endpoint_id": self.endpoint_id,
+            "evidence_sha256": self.evidence_sha256,
+            "failure_code": self.failure_code,
+            "host_key_alias": self.host_key_alias,
+            "last_probe_at": self.last_probe_at,
+            "machine_alias": self.machine_alias,
+            "phase": self.phase.value,
+            "post_boot_id": self.post_boot_id,
+            "pre_boot_id": self.pre_boot_id,
+            "pre_boot_id_captured_at": self.pre_boot_id_captured_at,
+            "pre_boot_id_generation": self.pre_boot_id_generation,
+            "probe_attempts": self.probe_attempts,
+            "recovery_deadline_at": self.recovery_deadline_at,
+            "recovery_started_at": self.recovery_started_at,
+            "remote_start_generation": self.remote_start_generation,
+            "remote_start_time": self.remote_start_time,
+            "request_id": self.request_id,
+            "resolved_identity_sha256": self.resolved_identity_sha256,
+            "verified_at": self.verified_at,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "RebootRecoveryEvidence":
+        if not isinstance(payload, Mapping):
+            raise StateCorruptionError("reboot recovery evidence must be an object")
+        expected = set(cls.__dataclass_fields__)
+        if set(payload) != expected:
+            raise StateCorruptionError("reboot recovery fields are not exactly recognized")
+        return cls(**payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +407,10 @@ class DurableJobRecord:
     terminal_restored: bool = False
     failure_detail: str | None = None
     local_spool_manifest_sha256: str | None = None
+    resolved_identity_sha256: str | None = None
+    disconnect_policy: DisconnectPolicy = DisconnectPolicy.NORMAL
+    reboot_recovery: RebootRecoveryEvidence | None = None
+    record_version: int = STATE_FORMAT_VERSION
 
     def __post_init__(self) -> None:
         try:
@@ -165,10 +422,31 @@ class DurableJobRecord:
         object.__setattr__(self, "machine_alias", machine_alias)
         if type(self.generation) is not int or self.generation < 1:
             raise StateCorruptionError("generation must be a positive integer")
+        if self.record_version not in {
+            PREVIOUS_STATE_FORMAT_VERSION,
+            STATE_FORMAT_VERSION,
+        }:
+            raise StateCorruptionError("unsupported state record version")
         _validate_digest(self.client_request_sha256, "client_request_sha256")
         _validate_digest(
             self.connection_plan_sha256, "connection_plan_sha256", optional=True
         )
+        _validate_digest(
+            self.resolved_identity_sha256,
+            "resolved_identity_sha256",
+            optional=True,
+        )
+        try:
+            disconnect_policy = DisconnectPolicy(self.disconnect_policy)
+        except (TypeError, ValueError) as exc:
+            raise StateCorruptionError("disconnect policy is invalid") from exc
+        object.__setattr__(self, "disconnect_policy", disconnect_policy)
+        if self.record_version == PREVIOUS_STATE_FORMAT_VERSION and (
+            disconnect_policy is not DisconnectPolicy.NORMAL
+            or self.resolved_identity_sha256 is not None
+            or self.reboot_recovery is not None
+        ):
+            raise StateCorruptionError("legacy state cannot claim reboot recovery evidence")
         if self.endpoint_id is not None and (
             not isinstance(self.endpoint_id, str)
             or _ENDPOINT_ID_RE.fullmatch(self.endpoint_id) is None
@@ -196,7 +474,6 @@ class DurableJobRecord:
             value is not None for value in resolved_fields
         ):
             raise StateCorruptionError("resolved connection identity must be all-or-none")
-
         if (self.remote_job_path is None) != (self.remote_tmux_session is None):
             raise StateCorruptionError("remote job path and tmux session must be paired")
         if self.remote_job_path is not None:
@@ -250,6 +527,10 @@ class DurableJobRecord:
             RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
             RequestState.REMOTE_MAY_BE_RUNNING,
             RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+            RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING,
+            RequestState.EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING,
+            RequestState.EXPECTED_REBOOT_RECOVERY_FAILED,
+            RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
             RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
             RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE,
             RequestState.ABANDONED_AFTER_PROVEN_UNSTARTED,
@@ -269,6 +550,10 @@ class DurableJobRecord:
             RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
             RequestState.REMOTE_MAY_BE_RUNNING,
             RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+            RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING,
+            RequestState.EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING,
+            RequestState.EXPECTED_REBOOT_RECOVERY_FAILED,
+            RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
             RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
             RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE,
             RequestState.ABANDONED_AFTER_PROVEN_UNSTARTED,
@@ -336,8 +621,61 @@ class DurableJobRecord:
         ):
             raise StateCorruptionError("released remote job lacks every completion gate")
 
+        reboot = self.reboot_recovery
+        if reboot is not None and not isinstance(reboot, RebootRecoveryEvidence):
+            raise StateCorruptionError("reboot_recovery must be structured evidence")
+        if disconnect_policy is DisconnectPolicy.NORMAL:
+            if reboot is not None or state in {
+                RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING,
+                RequestState.EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING,
+                RequestState.EXPECTED_REBOOT_RECOVERY_FAILED,
+                RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
+            }:
+                raise StateCorruptionError("normal disconnect policy claims reboot recovery")
+        else:
+            if self.record_version != STATE_FORMAT_VERSION:
+                raise StateCorruptionError("expected reboot requires current durable state")
+            if state in _REMOTE_STARTED_STATES and reboot is None:
+                raise StateCorruptionError("expected reboot remote state lacks pre-boot evidence")
+        if reboot is not None:
+            bindings = (
+                reboot.request_id == self.request_id,
+                reboot.machine_alias == self.machine_alias,
+                reboot.connection_plan_sha256 == self.connection_plan_sha256,
+                reboot.endpoint_id == self.endpoint_id,
+                reboot.resolved_identity_sha256 == self.resolved_identity_sha256,
+                reboot.host_key_alias == self.host_key_alias,
+            )
+            if not all(bindings):
+                raise StateCorruptionError("reboot evidence identity differs from its request")
+            if reboot.remote_start_time is not None and (
+                reboot.remote_start_time != self.start_time
+                or reboot.remote_start_generation is None
+                or reboot.remote_start_generation > self.generation
+            ):
+                raise StateCorruptionError("reboot evidence remote start binding is invalid")
+        phase_for_state = {
+            RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING: {
+                RebootRecoveryPhase.VERIFICATION_PENDING,
+                RebootRecoveryPhase.SAME_BOOT_OBSERVED,
+            },
+            RequestState.EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING: {
+                RebootRecoveryPhase.VERIFIED_CHANGED_BOOT
+            },
+            RequestState.EXPECTED_REBOOT_RECOVERY_FAILED: {
+                RebootRecoveryPhase.FAILED
+            },
+            RequestState.ABANDONED_AFTER_VERIFIED_REBOOT: {
+                RebootRecoveryPhase.CLEANUP_COMPLETE
+            },
+        }
+        if state in phase_for_state and (
+            reboot is None or reboot.phase not in phase_for_state[state]
+        ):
+            raise StateCorruptionError("reboot recovery state and evidence phase differ")
+
     def payload_document(self) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "client_request_sha256": self.client_request_sha256,
             "completion_time": self.completion_time,
             "connection_plan_sha256": self.connection_plan_sha256,
@@ -351,7 +689,7 @@ class DurableJobRecord:
             "local_spool_verified": self.local_spool_verified,
             "local_spool_manifest_sha256": self.local_spool_manifest_sha256,
             "machine_alias": self.machine_alias,
-            "record_version": STATE_FORMAT_VERSION,
+            "record_version": self.record_version,
             "remote_job_path": self.remote_job_path,
             "remote_mutation_started": self.remote_mutation_started,
             "remote_tmux_session": self.remote_tmux_session,
@@ -365,9 +703,23 @@ class DurableJobRecord:
             "updated_at": self.updated_at,
             "viewer_detached": self.viewer_detached,
         }
+        if self.record_version == STATE_FORMAT_VERSION:
+            document.update(
+                {
+                    "disconnect_policy": self.disconnect_policy.value,
+                    "reboot_recovery": (
+                        None
+                        if self.reboot_recovery is None
+                        else self.reboot_recovery.payload_document()
+                    ),
+                    "resolved_identity_sha256": self.resolved_identity_sha256,
+                }
+            )
+        return document
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "DurableJobRecord":
+        version = payload.get("record_version")
         expected = {
             "client_request_sha256", "completion_time", "connection_plan_sha256",
             "created_at", "decision", "endpoint_id", "exit_status", "failure_detail",
@@ -378,10 +730,18 @@ class DurableJobRecord:
             "resolved_user", "start_time", "state", "terminal_restored", "updated_at",
             "viewer_detached",
         }
+        if version == STATE_FORMAT_VERSION:
+            expected.update(
+                {
+                    "disconnect_policy",
+                    "reboot_recovery",
+                    "resolved_identity_sha256",
+                }
+            )
+        elif version != PREVIOUS_STATE_FORMAT_VERSION:
+            raise StateCorruptionError("unsupported state record version")
         if set(payload) != expected:
             raise StateCorruptionError("state payload fields are not exactly recognized")
-        if payload["record_version"] != STATE_FORMAT_VERSION:
-            raise StateCorruptionError("unsupported state record version")
         return cls(
             request_id=payload["request_id"],
             generation=payload["generation"],
@@ -408,6 +768,23 @@ class DurableJobRecord:
             viewer_detached=payload["viewer_detached"],
             terminal_restored=payload["terminal_restored"],
             failure_detail=payload["failure_detail"],
+            resolved_identity_sha256=(
+                payload["resolved_identity_sha256"]
+                if version == STATE_FORMAT_VERSION
+                else None
+            ),
+            disconnect_policy=(
+                payload["disconnect_policy"]
+                if version == STATE_FORMAT_VERSION
+                else DisconnectPolicy.NORMAL
+            ),
+            reboot_recovery=(
+                None
+                if version != STATE_FORMAT_VERSION
+                or payload["reboot_recovery"] is None
+                else RebootRecoveryEvidence.from_payload(payload["reboot_recovery"])
+            ),
+            record_version=version,
         )
 
 
@@ -424,6 +801,8 @@ class StartupRecoveryReport:
     interrupted_pre_remote_ids: tuple[str, ...]
     blocking_request_ids: tuple[str, ...]
     safe_to_accept_new_approvals: bool
+    blocking_machine_aliases: tuple[str, ...] = ()
+    expected_reboot_request_ids: tuple[str, ...] = ()
 
 
 class DurableStateStore:
@@ -688,6 +1067,9 @@ class DurableStateStore:
             resolved_hostname=selected.resolved_hostname,
             resolved_port=selected.resolved_port,
             host_key_alias=selected.host_key_alias,
+            resolved_identity_sha256=_sha256_document(
+                selected.canonical_document()
+            ),
             updated_at=timestamp,
         )
         self.write(retargeted)
@@ -713,6 +1095,17 @@ class DurableStateStore:
                 "remote start requires a planned guarded job identity and connection plan"
             )
         timestamp = now()
+        reboot = record.reboot_recovery
+        if record.disconnect_policy is DisconnectPolicy.EXPECT_FULL_REBOOT:
+            if reboot is None:
+                raise StateConflictError(
+                    "expected reboot start requires durable pre-boot evidence"
+                )
+            reboot = replace(
+                reboot,
+                remote_start_time=record.start_time or timestamp,
+                remote_start_generation=record.generation + 1,
+            )
         armed = replace(
             record,
             generation=record.generation + 1,
@@ -720,10 +1113,295 @@ class DurableStateStore:
             remote_mutation_started=True,
             start_time=record.start_time or timestamp,
             updated_at=timestamp,
+            reboot_recovery=reboot,
         )
         self.write(armed)
         payload_digest = _sha256_document(armed.payload_document())
         return armed, RemoteStartPermit(armed.request_id, armed.generation, payload_digest)
+
+    def record_pre_reboot_boot_id(
+        self,
+        record: DurableJobRecord,
+        *,
+        boot_id: str,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Fsync exact pre-reboot evidence before the command start boundary."""
+
+        if record.disconnect_policy is not DisconnectPolicy.EXPECT_FULL_REBOOT:
+            raise StateConflictError("pre-reboot evidence requires expected reboot policy")
+        if record.state not in {
+            RequestState.APPROVED_PRE_REMOTE,
+            RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+        }:
+            raise StateConflictError("pre-reboot evidence must precede remote command start")
+        if record.reboot_recovery is not None:
+            raise StateConflictError("pre-reboot evidence is already recorded")
+        if not isinstance(boot_id, str) or _BOOT_ID_RE.fullmatch(boot_id) is None:
+            raise ValueError("boot_id must be one canonical lowercase Linux boot ID")
+        if any(
+            value is None
+            for value in (
+                record.connection_plan_sha256,
+                record.endpoint_id,
+                record.resolved_identity_sha256,
+                record.host_key_alias,
+            )
+        ):
+            raise StateConflictError("pre-reboot evidence lacks an exact resolved identity")
+        timestamp = now()
+        next_generation = record.generation + 1
+        evidence = RebootRecoveryEvidence(
+            request_id=record.request_id,
+            machine_alias=record.machine_alias,
+            connection_plan_sha256=record.connection_plan_sha256,
+            endpoint_id=record.endpoint_id,
+            resolved_identity_sha256=record.resolved_identity_sha256,
+            host_key_alias=record.host_key_alias,
+            pre_boot_id=boot_id,
+            pre_boot_id_captured_at=timestamp,
+            pre_boot_id_generation=next_generation,
+        )
+        captured = replace(
+            record,
+            generation=next_generation,
+            updated_at=timestamp,
+            reboot_recovery=evidence,
+        )
+        self.write(captured)
+        return captured
+
+    def begin_expected_reboot_verification(
+        self,
+        record: DurableJobRecord,
+        *,
+        deadline_at: str,
+        detail: str,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Persist the bounded recovery window after the expected disconnect."""
+
+        if record.state not in {
+            RequestState.REMOTE_MAY_BE_RUNNING,
+            RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+            RequestState.COMPLETION_PROVEN,
+            RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING,
+        } or record.reboot_recovery is None:
+            raise StateConflictError("expected reboot verification lacks an armed request")
+        _validate_timestamp(deadline_at, "recovery_deadline_at")
+        if not isinstance(detail, str) or not detail or "\x00" in detail:
+            raise ValueError("recovery detail must be non-empty text without NUL")
+        timestamp = now()
+        reboot = replace(
+            record.reboot_recovery,
+            phase=RebootRecoveryPhase.VERIFICATION_PENDING,
+            recovery_started_at=record.reboot_recovery.recovery_started_at or timestamp,
+            recovery_deadline_at=record.reboot_recovery.recovery_deadline_at or deadline_at,
+            failure_code=None,
+        )
+        pending = replace(
+            record,
+            generation=record.generation + 1,
+            state=RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING,
+            updated_at=timestamp,
+            failure_detail=detail,
+            reboot_recovery=reboot,
+        )
+        self.write(pending)
+        return pending
+
+    def record_expected_reboot_probe_failure(
+        self,
+        record: DurableJobRecord,
+        *,
+        failure_code: str,
+        detail: str,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        if (
+            record.state is not RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING
+            or record.reboot_recovery is None
+        ):
+            raise StateConflictError("reboot probe attempt requires pending verification")
+        _validate_text(failure_code, "failure_code")
+        _validate_text(detail, "recovery detail")
+        timestamp = now()
+        reboot = replace(
+            record.reboot_recovery,
+            phase=RebootRecoveryPhase.VERIFICATION_PENDING,
+            probe_attempts=record.reboot_recovery.probe_attempts + 1,
+            last_probe_at=timestamp,
+            failure_code=failure_code,
+        )
+        attempted = replace(
+            record,
+            generation=record.generation + 1,
+            updated_at=timestamp,
+            failure_detail=detail,
+            reboot_recovery=reboot,
+        )
+        self.write(attempted)
+        return attempted
+
+    def record_same_boot_observed(
+        self,
+        record: DurableJobRecord,
+        *,
+        boot_id: str,
+        detail: str,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        if (
+            record.state is not RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING
+            or record.reboot_recovery is None
+        ):
+            raise StateConflictError("same-boot evidence requires pending verification")
+        if boot_id != record.reboot_recovery.pre_boot_id:
+            raise StateConflictError("same-boot evidence does not match the pre-boot ID")
+        _validate_text(detail, "recovery detail")
+        timestamp = now()
+        reboot = replace(
+            record.reboot_recovery,
+            phase=RebootRecoveryPhase.SAME_BOOT_OBSERVED,
+            post_boot_id=boot_id,
+            probe_attempts=record.reboot_recovery.probe_attempts + 1,
+            last_probe_at=timestamp,
+            failure_code="same_boot_observed",
+        )
+        observed = replace(
+            record,
+            generation=record.generation + 1,
+            updated_at=timestamp,
+            failure_detail=detail,
+            reboot_recovery=reboot,
+        )
+        self.write(observed)
+        return observed
+
+    def mark_expected_reboot_verified(
+        self,
+        record: DurableJobRecord,
+        *,
+        post_boot_id: str,
+        reason: str,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Commit changed-boot evidence before any lease or pin release."""
+
+        if (
+            record.state is not RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING
+            or record.reboot_recovery is None
+        ):
+            raise StateConflictError("verified reboot requires pending verification")
+        if (
+            not isinstance(post_boot_id, str)
+            or _BOOT_ID_RE.fullmatch(post_boot_id) is None
+            or post_boot_id == record.reboot_recovery.pre_boot_id
+        ):
+            raise StateConflictError("verified reboot requires a changed canonical boot ID")
+        _validate_text(reason, "automatic_reason")
+        timestamp = now()
+        evidence_without_digest = replace(
+            record.reboot_recovery,
+            phase=RebootRecoveryPhase.VERIFICATION_PENDING,
+            post_boot_id=post_boot_id,
+            probe_attempts=record.reboot_recovery.probe_attempts + 1,
+            last_probe_at=timestamp,
+            verified_at=timestamp,
+            automatic_decision="abandon_after_verified_reboot",
+            automatic_reason=reason,
+            failure_code=None,
+            cleanup_outcome="pending",
+        )
+        evidence = replace(
+            evidence_without_digest,
+            phase=RebootRecoveryPhase.VERIFIED_CHANGED_BOOT,
+            evidence_sha256=evidence_without_digest.computed_evidence_sha256(),
+        )
+        verified = replace(
+            record,
+            generation=record.generation + 1,
+            state=RequestState.EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING,
+            updated_at=timestamp,
+            completion_time=None,
+            exit_status=None,
+            local_spool_verified=False,
+            local_spool_manifest_sha256=None,
+            viewer_detached=False,
+            terminal_restored=False,
+            failure_detail=reason,
+            reboot_recovery=evidence,
+        )
+        self.write(verified)
+        return verified
+
+    def fail_expected_reboot_recovery(
+        self,
+        record: DurableJobRecord,
+        *,
+        failure_code: str,
+        detail: str,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        if (
+            record.state is not RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING
+            or record.reboot_recovery is None
+        ):
+            raise StateConflictError("failed reboot recovery requires pending verification")
+        _validate_text(failure_code, "failure_code")
+        _validate_text(detail, "recovery detail")
+        timestamp = now()
+        reboot = replace(
+            record.reboot_recovery,
+            phase=RebootRecoveryPhase.FAILED,
+            failure_code=failure_code,
+            automatic_decision="fail_closed",
+            automatic_reason=detail,
+        )
+        failed = replace(
+            record,
+            generation=record.generation + 1,
+            state=RequestState.EXPECTED_REBOOT_RECOVERY_FAILED,
+            updated_at=timestamp,
+            failure_detail=detail,
+            reboot_recovery=reboot,
+        )
+        self.write(failed)
+        return failed
+
+    def complete_expected_reboot_cleanup(
+        self,
+        record: DurableJobRecord,
+        *,
+        cleanup_outcome: str,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Record exact transport cleanup after changed-boot evidence is durable."""
+
+        if (
+            record.state is not RequestState.EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING
+            or record.reboot_recovery is None
+        ):
+            raise StateConflictError("reboot cleanup requires committed changed-boot evidence")
+        _validate_text(cleanup_outcome, "cleanup_outcome")
+        timestamp = now()
+        reboot = replace(
+            record.reboot_recovery,
+            phase=RebootRecoveryPhase.CLEANUP_COMPLETE,
+            cleanup_outcome=cleanup_outcome,
+        )
+        abandoned = replace(
+            record,
+            generation=record.generation + 1,
+            state=RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
+            updated_at=timestamp,
+            failure_detail=(
+                f"{record.failure_detail}; transport cleanup: {cleanup_outcome}"
+            ),
+            reboot_recovery=reboot,
+        )
+        self.write(abandoned)
+        return abandoned
 
     def arm_key_enrollment(
         self,
@@ -860,6 +1538,10 @@ class DurableStateStore:
         result.
         """
 
+        if record.disconnect_policy is not DisconnectPolicy.NORMAL:
+            raise StateConflictError(
+                "expected-reboot requests require automatic changed-boot evidence"
+            )
         if record.state not in {
             RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
             RequestState.COMPLETION_PROVEN,
@@ -935,6 +1617,10 @@ class DurableStateStore:
         proof, or terminal-restoration proof and performs no remote operation.
         """
 
+        if record.disconnect_policy is not DisconnectPolicy.NORMAL:
+            raise StateConflictError(
+                "dead-pane observation cannot replace expected-reboot evidence"
+            )
         if record.state is not RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING:
             raise StateConflictError(
                 "operator-confirmed dead-pane abandonment requires recovery state"
@@ -1041,6 +1727,7 @@ class DurableStateStore:
         if record.state not in {
             RequestState.REMOTE_MAY_BE_RUNNING,
             RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+            RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING,
         }:
             raise StateConflictError("completion requires a possibly-running state")
         if (
@@ -1231,12 +1918,14 @@ def new_approved_job_record(
         resolved_hostname=selected.resolved_hostname,
         resolved_port=selected.resolved_port,
         host_key_alias=selected.host_key_alias,
+        resolved_identity_sha256=_sha256_document(selected.canonical_document()),
         remote_job_path=f"~/.cache/tmuxgate/jobs/{request_id}",
         remote_tmux_session=f"tmuxgate-{request_id[:12]}",
         decision=ApprovalDecision.APPROVED,
         state=RequestState.APPROVED_PRE_REMOTE,
         created_at=timestamp,
         updated_at=timestamp,
+        disconnect_policy=request.disconnect_policy,
     )
 
 
@@ -1286,12 +1975,25 @@ def recover_startup(
         records[index] = recovered
         interrupted.append(record.request_id)
 
-    blocking = tuple(
-        record.request_id for record in records if record.state in _REMOTE_ACTIVE_STATES
+    blocking_records = tuple(
+        record for record in records if record.state in _REMOTE_ACTIVE_STATES
+    )
+    blocking = tuple(record.request_id for record in blocking_records)
+    expected_reboot = tuple(
+        record.request_id
+        for record in blocking_records
+        if record.disconnect_policy is DisconnectPolicy.EXPECT_FULL_REBOOT
     )
     return StartupRecoveryReport(
         records=tuple(records),
         interrupted_pre_remote_ids=tuple(interrupted),
         blocking_request_ids=blocking,
-        safe_to_accept_new_approvals=not blocking,
+        # Recovery now blocks only the affected machine.  The application must
+        # attach a broker-owned coordinator before it accepts work for those
+        # aliases, but unrelated machines remain safe.
+        safe_to_accept_new_approvals=True,
+        blocking_machine_aliases=tuple(
+            sorted({record.machine_alias for record in blocking_records})
+        ),
+        expected_reboot_request_ids=expected_reboot,
     )

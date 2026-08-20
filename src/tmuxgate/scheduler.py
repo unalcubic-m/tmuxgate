@@ -13,6 +13,7 @@ approved or possibly-running commands at a time.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
 
@@ -53,6 +54,12 @@ class RequestState(StrEnum):
     KEY_ENROLLMENT_VERIFIED_PRE_REMOTE = "key-enrollment-verified-pre-remote"
     REMOTE_MAY_BE_RUNNING = "remote-may-be-running"
     RECOVERY_REQUIRED_POSSIBLY_RUNNING = "recovery-required-possibly-running"
+    EXPECTED_REBOOT_VERIFICATION_PENDING = "expected-reboot-verification-pending"
+    EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING = (
+        "expected-reboot-verified-cleanup-pending"
+    )
+    EXPECTED_REBOOT_RECOVERY_FAILED = "expected-reboot-recovery-failed"
+    ABANDONED_AFTER_VERIFIED_REBOOT = "abandoned-after-verified-reboot"
     ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT = (
         "abandoned-after-operator-confirmed-reboot"
     )
@@ -80,6 +87,8 @@ class LeaseReleaseReason(StrEnum):
     PRE_REMOTE_FAILURE = "pre-remote-failure"
     REMOTE_SETUP_FAILURE = "remote-setup-failure"
     VERIFIED_COMPLETION = "verified-completion"
+    VERIFIED_REBOOT_ABANDONMENT = "verified-reboot-abandonment"
+    RECOVERY_TRANSFERRED = "recovery-transferred"
 
 
 _LEASE_HELD_STATES = frozenset(
@@ -88,6 +97,8 @@ _LEASE_HELD_STATES = frozenset(
         RequestState.APPROVED_PRE_REMOTE,
         RequestState.REMOTE_MAY_BE_RUNNING,
         RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+        RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING,
+        RequestState.EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING,
         RequestState.COMPLETION_PROVEN,
         RequestState.LOCAL_SPOOL_VERIFIED,
     }
@@ -97,6 +108,8 @@ _REMOTE_LIFECYCLE_STATES = frozenset(
     {
         RequestState.REMOTE_MAY_BE_RUNNING,
         RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+        RequestState.EXPECTED_REBOOT_VERIFICATION_PENDING,
+        RequestState.EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING,
         RequestState.COMPLETION_PROVEN,
         RequestState.LOCAL_SPOOL_VERIFIED,
     }
@@ -108,6 +121,8 @@ _RESULT_READY_STATES = frozenset(
         RequestState.FAILED_PRE_REMOTE,
         RequestState.FAILED_REMOTE_SETUP,
         RequestState.LEASE_RELEASED,
+        RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
+        RequestState.EXPECTED_REBOOT_RECOVERY_FAILED,
     }
 )
 
@@ -152,6 +167,7 @@ class SequentialScheduler:
         self,
         max_pending_requests: int = 16,
         max_active_remote_commands: int = 1,
+        external_active_count: Callable[[], int] = lambda: 0,
     ) -> None:
         if (
             isinstance(max_pending_requests, bool)
@@ -167,6 +183,9 @@ class SequentialScheduler:
             raise ValueError("max_active_remote_commands must be from 1 to 3")
         self.max_pending_requests = max_pending_requests
         self.max_active_remote_commands = max_active_remote_commands
+        if not callable(external_active_count):
+            raise TypeError("external_active_count must be callable")
+        self._external_active_count = external_active_count
         self._requests: dict[str, ScheduledRequest] = {}
         self._pending: deque[str] = deque()
         self._lease_owners: set[str] = set()
@@ -184,12 +203,18 @@ class SequentialScheduler:
 
     @property
     def active_count(self) -> int:
-        return len(self._lease_owners)
+        return len(self._lease_owners) + self._validated_external_active_count()
+
+    def _validated_external_active_count(self) -> int:
+        value = self._external_active_count()
+        if type(value) is not int or value < 0:
+            raise SchedulerError("external active recovery count is invalid")
+        return value
 
     @property
     def can_begin_approval(self) -> bool:
         return bool(self._pending) and (
-            len(self._lease_owners) < self.max_active_remote_commands
+            self.active_count < self.max_active_remote_commands
         )
 
     @property
@@ -244,7 +269,7 @@ class SequentialScheduler:
     def begin_next_approval(self) -> ScheduledRequest | None:
         """Reserve the lease for the FIFO head immediately before approval."""
 
-        if len(self._lease_owners) >= self.max_active_remote_commands:
+        if self.active_count >= self.max_active_remote_commands:
             raise LeaseBusyError("all remote-command lease slots are active")
         if not self._pending:
             return None
@@ -382,6 +407,45 @@ class SequentialScheduler:
             state=RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
             failure_detail=detail,
         )
+        self._assert_invariants()
+        return record
+
+    def mark_abandoned_after_verified_reboot(
+        self, request_id: str, *, detail: str
+    ) -> ScheduledRequest:
+        """Release only after the executor committed changed-boot evidence."""
+
+        record = self._require_state(request_id, RequestState.REMOTE_MAY_BE_RUNNING)
+        self._require_lease_owner(request_id)
+        if not isinstance(detail, str) or not detail or "\x00" in detail:
+            raise ValueError("verified reboot detail must be non-empty text without NUL")
+        record = self._replace(
+            request_id,
+            state=RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
+            remote_may_be_running=False,
+            lease_release_reason=LeaseReleaseReason.VERIFIED_REBOOT_ABANDONMENT,
+            failure_detail=detail,
+        )
+        self._release_owner(request_id)
+        self._assert_invariants()
+        return record
+
+    def mark_recovery_transferred(
+        self, request_id: str, *, detail: str
+    ) -> ScheduledRequest:
+        """Move an unresolved reboot lease to the restart-survivable coordinator."""
+
+        record = self._require_state(request_id, RequestState.REMOTE_MAY_BE_RUNNING)
+        self._require_lease_owner(request_id)
+        if not isinstance(detail, str) or not detail or "\x00" in detail:
+            raise ValueError("transferred recovery detail must be non-empty text without NUL")
+        record = self._replace(
+            request_id,
+            state=RequestState.EXPECTED_REBOOT_RECOVERY_FAILED,
+            lease_release_reason=LeaseReleaseReason.RECOVERY_TRANSFERRED,
+            failure_detail=detail,
+        )
+        self._release_owner(request_id)
         self._assert_invariants()
         return record
 

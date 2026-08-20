@@ -32,6 +32,7 @@ from tmuxgate.operator_interface import (
     OperatorInterface,
     PlainTerminalInterface,
     require_operator_decision,
+    resolve_operator_prompt,
 )
 from tmuxgate.planning import BoundRequestPlanner
 from tmuxgate.real_remote import (
@@ -44,6 +45,8 @@ from tmuxgate.real_ssh import (
     SshChannelRunner,
     SubprocessMasterBackend,
 )
+from tmuxgate.reboot_recovery import RealBootIdProbe
+from tmuxgate.recovery_coordinator import ExpectedRebootRecoveryCoordinator
 from tmuxgate.runtime import (
     acquire_runtime_ownership,
     load_or_create_mcp_token,
@@ -274,7 +277,7 @@ class UnifiedApplication:
                     )
                     return require_operator_decision(
                         prompt,
-                        operator.request_execution_approval(prompt),
+                        resolve_operator_prompt(operator, prompt),
                     )
                 selected_executor = _ZeroFakeExecutor()
                 def approval_discarder(request_id: str) -> None:
@@ -295,7 +298,7 @@ class UnifiedApplication:
                     )
                     return require_operator_decision(
                         prompt,
-                        operator.request_execution_approval(prompt),
+                        resolve_operator_prompt(operator, prompt),
                     )
 
                 planner = BoundRequestPlanner(
@@ -334,7 +337,23 @@ class UnifiedApplication:
                     for machine in config.machines.values()
                     for endpoint in machine.endpoints
                 )
-                for reconciled_path in pool.reconcile_startup(startup_endpoints):
+                expected_reboot_records = tuple(
+                    record
+                    for record in recovery.records
+                    if record.request_id in recovery.expected_reboot_request_ids
+                )
+                protected_paths = tuple(
+                    pool.expected_control_path(
+                        record.machine_alias,
+                        record.resolved_identity_sha256,
+                    )
+                    for record in expected_reboot_records
+                    if record.resolved_identity_sha256 is not None
+                )
+                for reconciled_path in pool.reconcile_startup(
+                    startup_endpoints,
+                    protected_paths=protected_paths,
+                ):
                     print(
                         "tmuxgate: reconciled stale SSH control socket "
                         f"{reconciled_path}"
@@ -353,7 +372,9 @@ class UnifiedApplication:
                 resources.callback(close_pool)
                 prompt_presenter = SecretPromptPresenter(
                     terminal_lock=self._terminal,
-                    authorizer=operator.request_secret_input_authorization,
+                    authorizer=lambda prompt: resolve_operator_prompt(
+                        operator, prompt
+                    ),
                     secret_provider=credential_store.password_for,
                     prompt_provider=credential_store.prompt_for,
                     credential_enroller=lambda machine, prompt: (
@@ -394,6 +415,86 @@ class UnifiedApplication:
 
                 resources.callback(close_prompt_presenter)
                 channels = SshChannelRunner(prompt_presenter=prompt_presenter)
+                reboot_coordinator = ExpectedRebootRecoveryCoordinator(
+                    state=store,
+                    transports=pool,
+                    boot_id_probe=RealBootIdProbe(channels),
+                    identity_revalidator=revalidate,
+                    timeout_seconds=config.broker.reboot_recovery_timeout_seconds,
+                )
+                reboot_coordinator.register_startup(recovery.records)
+                recovery_threads: list[threading.Thread] = []
+
+                def resume_expected_reboot(
+                    record,
+                    endpoint: ResolvedSshEndpoint,
+                ) -> None:
+                    try:
+                        result = reboot_coordinator.recover(record, endpoint)
+                        operator.publish_activity(
+                            OperationalActivity.create(
+                                ActivityKind.STATUS,
+                                (
+                                    "Expected reboot recovery finished with "
+                                    f"{result.transport_status.value}."
+                                ),
+                                request_id=record.request_id,
+                                machine_name=record.machine_alias,
+                                endpoint_id=record.endpoint_id,
+                            )
+                        )
+                    except BaseException as exc:
+                        operator.publish_activity(
+                            OperationalActivity.create(
+                                ActivityKind.ERROR,
+                                f"Expected reboot recovery failed closed: {exc}",
+                                request_id=record.request_id,
+                                machine_name=record.machine_alias,
+                                endpoint_id=record.endpoint_id,
+                            )
+                        )
+
+                for record in expected_reboot_records:
+                    endpoint = next(
+                        (
+                            item
+                            for item in startup_endpoints
+                            if item.machine_name == record.machine_alias
+                            and item.endpoint_id == record.endpoint_id
+                        ),
+                        None,
+                    )
+                    if endpoint is None:
+                        operator.publish_activity(
+                            OperationalActivity.create(
+                                ActivityKind.ERROR,
+                                "Expected reboot recovery has no matching configured endpoint.",
+                                request_id=record.request_id,
+                                machine_name=record.machine_alias,
+                                endpoint_id=record.endpoint_id,
+                            )
+                        )
+                        continue
+                    thread = threading.Thread(
+                        target=resume_expected_reboot,
+                        args=(record, endpoint),
+                        name=f"tmuxgate-reboot-{record.request_id[:8]}",
+                        daemon=True,
+                    )
+                    recovery_threads.append(thread)
+                    thread.start()
+
+                def close_reboot_coordinator() -> None:
+                    reboot_coordinator.close()
+                    for thread in recovery_threads:
+                        thread.join(timeout=5)
+                        if thread.is_alive():
+                            owned_components_clean[0] = False
+                            report_error(
+                                "tmuxgate: expected reboot recovery worker did not stop"
+                            )
+
+                resources.callback(close_reboot_coordinator)
                 collection_dir = prepare_collection_directory(
                     paths.state_dir / "collections"
                 )
@@ -429,6 +530,7 @@ class UnifiedApplication:
                     ),
                     machine_disabler=machine_disabler,
                     machine_enabled=availability.is_enabled,
+                    reboot_recovery=reboot_coordinator,
                 )
                 selected_executor = executor
                 approval_discarder = executor.discard_approval
@@ -461,6 +563,11 @@ class UnifiedApplication:
                 delivery_observer=delivery_observer,
                 control_service=control_service,
                 activity_publisher=operator.publish_activity,
+                external_active_count=(
+                    (lambda: 0)
+                    if self._fake
+                    else (lambda: reboot_coordinator.active_count)
+                ),
             )
             call_pools = resources.enter_context(
                 BrokerCallPools(run_worker_count, control_worker_count)
@@ -483,6 +590,7 @@ class UnifiedApplication:
                     RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
                     RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE,
                     RequestState.ABANDONED_AFTER_PROVEN_UNSTARTED,
+                    RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
                     RequestState.DONE,
                 }
 
@@ -522,7 +630,13 @@ class UnifiedApplication:
                         else operator.terminal_ownership_state.value
                     )
                     return DashboardRuntimeSnapshot(
-                        ready=services_ready[0],
+                        ready=(
+                            services_ready[0]
+                            and not (
+                                operator.approval_mode == "disabled"
+                                and operator.pending_prompt_count > 0
+                            )
+                        ),
                         listener=f"http://{config.mcp.host}:{config.mcp.port}/mcp",
                         approval_mode=operator.approval_mode,
                         machines=machines,

@@ -35,7 +35,7 @@ from tmuxgate.mcp_server import (
     _resolve_machine_name,
     create_mcp_server,
 )
-from tmuxgate.models import ExecutionMode, ValidationError
+from tmuxgate.models import DisconnectPolicy, ExecutionMode, ValidationError
 from tmuxgate.protocol import MAX_HEADER_BYTES
 from tmuxgate.runtime import create_broker_socket
 from tmuxgate.scheduler import RequestState
@@ -263,6 +263,7 @@ class McpToolSchemaTests(unittest.TestCase):
                 "environment",
                 "timeout_seconds",
                 "interactive",
+                "expect_full_reboot",
             },
         )
         # Interactive execution must be an explicit, typed, non-default choice.
@@ -271,6 +272,14 @@ class McpToolSchemaTests(unittest.TestCase):
             self.assertEqual(schema["type"], "boolean")
             self.assertIs(schema["default"], False)
             self.assertNotIn("interactive", tools[name].input_schema["required"])
+            reboot_schema = tools[name].input_schema["properties"][
+                "expect_full_reboot"
+            ]
+            self.assertEqual(reboot_schema["type"], "boolean")
+            self.assertIs(reboot_schema["default"], False)
+            self.assertNotIn(
+                "expect_full_reboot", tools[name].input_schema["required"]
+            )
         self.assertEqual(
             set(tools["read_verified_result"].input_schema["required"]),
             {"request_id", "stream"},
@@ -307,6 +316,7 @@ class McpToolSchemaTests(unittest.TestCase):
                 "request_id",
                 "transport_status",
                 "remote_exit_status",
+                "result_code",
                 "detail",
                 "stdout_length",
                 "stdout_sha256",
@@ -582,6 +592,7 @@ class McpBrokerIntegrationTests(unittest.TestCase):
                         "purpose": "exercise exact argv",
                         "environment": environment,
                         "timeout_seconds": 19,
+                        "expect_full_reboot": True,
                     },
                 )
                 script_result = await client.call_tool(
@@ -653,11 +664,16 @@ class McpBrokerIntegrationTests(unittest.TestCase):
         self.assertEqual(dict(argv_request.environment), environment)
         self.assertEqual(argv_request.timeout_seconds, 19)
         self.assertEqual(argv_request.purpose, "exercise exact argv")
+        self.assertEqual(
+            argv_request.disconnect_policy,
+            DisconnectPolicy.EXPECT_FULL_REBOOT,
+        )
         script_request = self.executor.calls[1][1]
         self.assertIs(script_request.mode, ExecutionMode.SCRIPT)
         self.assertEqual(script_request.machine_alias, "machine-b")
         self.assertEqual(script_request.script, script_bytes)
         self.assertEqual(script_request.purpose, "exercise exact bytes")
+        self.assertEqual(script_request.disconnect_policy, DisconnectPolicy.NORMAL)
 
     def test_list_jobs_and_read_verified_result_use_durable_verified_state(self):
         async def invoke_tools():

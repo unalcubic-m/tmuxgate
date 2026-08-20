@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from tmuxgate import cli
-from tmuxgate.models import ExecutionMode, RequestSpec, ResultFormat
+from tmuxgate.models import DisconnectPolicy, ExecutionMode, RequestSpec, ResultFormat
 from tmuxgate.result import ExecutionResult, TransportStatus
 from tmuxgate.runtime import BrokerAlreadyRunningError
 from tmuxgate.scheduler import ApprovalDecision, RequestState
@@ -65,6 +65,13 @@ class CommandLineParsingTests(unittest.TestCase):
         errors = io.StringIO()
         with (
             mock.patch.object(cli, "_unified_command", side_effect=error),
+            mock.patch.object(
+                cli,
+                "load_config",
+                return_value=SimpleNamespace(
+                    broker=SimpleNamespace(approval_mode="always")
+                ),
+            ),
             redirect_stderr(errors),
         ):
             status = cli.main([])
@@ -85,6 +92,13 @@ class CommandLineParsingTests(unittest.TestCase):
         error = BrokerAlreadyRunningError(Path("/runtime/broker.lock"), owner)
         with (
             mock.patch.object(cli, "_unified_command", side_effect=error),
+            mock.patch.object(
+                cli,
+                "load_config",
+                return_value=SimpleNamespace(
+                    broker=SimpleNamespace(approval_mode="always")
+                ),
+            ),
             mock.patch.object(
                 cli,
                 "run_broker_conflict_dialog",
@@ -109,6 +123,13 @@ class CommandLineParsingTests(unittest.TestCase):
         output = io.StringIO()
         with (
             mock.patch.object(cli, "_unified_command", side_effect=(error, 0)) as run,
+            mock.patch.object(
+                cli,
+                "load_config",
+                return_value=SimpleNamespace(
+                    broker=SimpleNamespace(approval_mode="always")
+                ),
+            ),
             mock.patch.object(
                 cli,
                 "run_broker_conflict_dialog",
@@ -149,6 +170,13 @@ class CommandLineParsingTests(unittest.TestCase):
             ) as run,
             mock.patch.object(
                 cli,
+                "load_config",
+                return_value=SimpleNamespace(
+                    broker=SimpleNamespace(approval_mode="always")
+                ),
+            ),
+            mock.patch.object(
+                cli,
                 "run_broker_conflict_dialog",
                 return_value=cli.BrokerConflictAction.TAKEOVER,
             ) as dialog,
@@ -168,6 +196,32 @@ class CommandLineParsingTests(unittest.TestCase):
         paths.assert_called_once()
         shutdown.assert_called_once()
         self.assertIn("no second takeover was attempted", errors.getvalue())
+
+    def test_automation_duplicate_startup_never_opens_dialog_or_takes_over(self):
+        owner = SimpleNamespace(
+            pid=123,
+            process_start_ticks=456,
+            boot_id="00000000-0000-0000-0000-000000000000",
+        )
+        error = BrokerAlreadyRunningError(Path("/runtime/broker.lock"), owner)
+        with (
+            mock.patch.object(cli, "_unified_command", side_effect=error),
+            mock.patch.object(
+                cli,
+                "load_config",
+                return_value=SimpleNamespace(
+                    broker=SimpleNamespace(approval_mode="disabled")
+                ),
+            ),
+            mock.patch.object(cli, "run_broker_conflict_dialog") as dialog,
+            mock.patch.object(cli, "request_runtime_owner_shutdown") as shutdown,
+            redirect_stderr(io.StringIO()),
+        ):
+            result = cli.main([])
+
+        self.assertEqual(result, cli.EXIT_UNAVAILABLE)
+        dialog.assert_not_called()
+        shutdown.assert_not_called()
 
     def test_plain_duplicate_startup_never_opens_textual_dialog(self):
         owner = SimpleNamespace(
@@ -679,6 +733,43 @@ class FailClosedSurfaceTests(unittest.TestCase):
         self.assertEqual(status, 77)
         store.mark_abandoned_after_operator_confirmed_dead_pane.assert_not_called()
         self.assertIn("no state changed", errors.getvalue())
+
+    def test_expected_reboot_manual_recovery_never_requests_attestation(self):
+        record = SimpleNamespace(
+            request_id=REQUEST_ID,
+            machine_alias="app-server",
+            endpoint_id="home-lan",
+            start_time="2026-08-20T10:00:00.000000Z",
+            generation=5,
+            failure_detail="expected reboot recovery remains ambiguous",
+            state=RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+            disconnect_policy=DisconnectPolicy.EXPECT_FULL_REBOOT,
+        )
+        paths = SimpleNamespace(runtime_dir=Path("/runtime"), state_dir=Path("/state"))
+
+        for command in ("after-reboot", "after-dead-pane"):
+            with self.subTest(command=command):
+                store = mock.MagicMock()
+                store.__enter__.return_value = store
+                store.__exit__.return_value = False
+                store.load.return_value = record
+                with (
+                    mock.patch(
+                        "tmuxgate.cli.prepare_runtime_layout", return_value=paths
+                    ),
+                    mock.patch(
+                        "tmuxgate.cli.acquire_state_lock", return_value=nullcontext()
+                    ),
+                    mock.patch("tmuxgate.cli.DurableStateStore", return_value=store),
+                    mock.patch("tmuxgate.cli._confirm_reboot_recovery") as reboot,
+                    mock.patch("tmuxgate.cli._confirm_dead_pane_recovery") as dead,
+                    redirect_stderr(io.StringIO()),
+                ):
+                    status = cli.main(["recover", command, REQUEST_ID])
+
+                self.assertEqual(status, cli.EXIT_UNAVAILABLE)
+                reboot.assert_not_called()
+                dead.assert_not_called()
 
     def test_after_reboot_recovery_eof_leaves_state_unchanged(self):
         record = SimpleNamespace(

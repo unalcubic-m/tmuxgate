@@ -16,19 +16,29 @@ from tmuxgate.approval import (
 from tmuxgate.broker import BrokerError, BrokerServer, _ClientSession
 from tmuxgate.client import BrokerConnectionError, submit_request
 from tmuxgate.fake import FakeExecution, ScriptedApprover, ScriptedFakeExecutor
-from tmuxgate.models import ExecutionMode, RequestSpec
+from tmuxgate.models import DisconnectPolicy, ExecutionMode, RequestSpec
 from tmuxgate.operator_interface import ActivityKind, OperationalActivity
 from tmuxgate.protocol import receive_frame, send_frame
-from tmuxgate.result import ExecutionResult, TransportStatus
+from tmuxgate.result import ExecutionResult, ResultCode, TransportStatus
 from tmuxgate.runtime import PeerCredentialError, create_broker_socket
 
 
-def request(label: str, *, machine: str = "machine-a") -> RequestSpec:
+def request(
+    label: str,
+    *,
+    machine: str = "machine-a",
+    expect_full_reboot: bool = False,
+) -> RequestSpec:
     return RequestSpec(
         machine_alias=machine,
         mode=ExecutionMode.ARGV,
         cwd="/tmp",
         argv=("definitely-not-a-real-executor", label),
+        disconnect_policy=(
+            DisconnectPolicy.EXPECT_FULL_REBOOT
+            if expect_full_reboot
+            else DisconnectPolicy.NORMAL
+        ),
     )
 
 
@@ -101,6 +111,23 @@ class RemoteSetupFailingExecutor:
             request_id,
             TransportStatus.REMOTE_SETUP_FAILURE,
             detail="authorized_keys may have changed; command was not started",
+        )
+
+
+class StructuredResultExecutor:
+    def __init__(self, status, code, detail):
+        self.status = status
+        self.code = code
+        self.detail = detail
+        self.calls = []
+
+    def __call__(self, request_id, spec):
+        self.calls.append((request_id, spec))
+        return ExecutionResult(
+            request_id,
+            self.status,
+            detail=self.detail,
+            result_code=self.code,
         )
 
 
@@ -395,6 +422,66 @@ class BrokerIntegrationTests(unittest.TestCase):
         self.assertEqual(server._scheduler.lease_owner, request_id)
         self.assertIn(request_id, server._jobs)
         self.assertIn(request_id, server._active_request_ids)
+
+    def test_verified_reboot_result_releases_scheduler_lease_truthfully(self):
+        approver = ScriptedApprover([ApprovalDecision.APPROVED])
+        executor = StructuredResultExecutor(
+            TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT,
+            ResultCode.ABANDONED_AFTER_VERIFIED_REBOOT,
+            "changed Linux boot ID independently verified",
+        )
+        server = self.start_server(approver, executor)
+
+        result = submit_request(
+            request("reboot", expect_full_reboot=True),
+            socket_path=self.socket_path,
+        )
+
+        self.assertEqual(
+            result.transport_status,
+            TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT,
+        )
+        self.assertEqual(result.result_code, ResultCode.ABANDONED_AFTER_VERIFIED_REBOOT)
+        self.assertEqual((result.stdout, result.stderr), (b"", b""))
+        self.assertIsNone(result.remote_exit_status)
+        self.assertTrue(server.wait_for_audit("abandoned-after-verified-reboot"))
+        self.assertIsNone(server._scheduler.lease_owner)
+
+    def test_expected_reboot_failure_transfers_capacity_to_coordinator(self):
+        approver = ScriptedApprover([ApprovalDecision.APPROVED])
+        executor = StructuredResultExecutor(
+            TransportStatus.INCOMPLETE,
+            ResultCode.REBOOT_RECOVERY_TIMEOUT,
+            "changed boot ID was not verified before the deadline",
+        )
+        server = self.start_server(approver, executor)
+
+        result = submit_request(
+            request("reboot-timeout", expect_full_reboot=True),
+            socket_path=self.socket_path,
+        )
+
+        self.assertEqual(result.result_code, ResultCode.REBOOT_RECOVERY_TIMEOUT)
+        self.assertTrue(server.wait_for_audit("expected-reboot-recovery-failed"))
+        self.assertIsNone(server._scheduler.lease_owner)
+
+    def test_recovery_in_progress_is_rejected_before_remote_lifecycle(self):
+        approver = ScriptedApprover([ApprovalDecision.APPROVED])
+        executor = StructuredResultExecutor(
+            TransportStatus.RECOVERY_IN_PROGRESS,
+            ResultCode.RECOVERY_IN_PROGRESS,
+            "machine recovery is owned by another request",
+        )
+        server = self.start_server(approver, executor)
+
+        result = submit_request(
+            request("blocked-by-machine-recovery"),
+            socket_path=self.socket_path,
+        )
+
+        self.assertEqual(result.result_code, ResultCode.RECOVERY_IN_PROGRESS)
+        self.assertTrue(server.wait_for_audit("recovery-in-progress"))
+        self.assertIsNone(server._scheduler.lease_owner)
 
     def test_remote_setup_failure_releases_slot_without_claiming_command_start(self):
         approver = ScriptedApprover([ApprovalDecision.APPROVED])
