@@ -8,18 +8,20 @@ import time
 
 from tmuxgate.approval import ApprovalDecision
 from tmuxgate.connection_plan import ConnectionPlan, PlannedEndpoint
-from tmuxgate.models import RequestSpec
+from tmuxgate.models import DisconnectPolicy, RequestSpec
 from tmuxgate.operator_interface import (
     ActivityKind,
     ConnectionPhase,
     MachineDisablePrompt,
     OperationalActivity,
     OperatorInterface,
+    OperatorInterfaceError,
     RemoteMutationState,
     RouteFallbackPrompt,
     SecretInputRecipient,
     SshRetryPrompt,
     require_operator_decision,
+    resolve_operator_prompt,
 )
 from tmuxgate.planning import BoundRequestPlanner
 from tmuxgate.remote_job import (
@@ -29,7 +31,13 @@ from tmuxgate.remote_job import (
     RemoteJobError,
     RemoteJobState,
 )
-from tmuxgate.result import ExecutionResult, TransportStatus
+from tmuxgate.real_ssh import AutomaticSecretInputError
+from tmuxgate.reboot_recovery import BootIdProbeError
+from tmuxgate.recovery_coordinator import (
+    ExpectedRebootRecoveryCoordinator,
+    RecoveryCoordinatorError,
+)
+from tmuxgate.result import ExecutionResult, ResultCode, TransportStatus
 from tmuxgate.scheduler import RequestState
 from tmuxgate.ssh import ResolvedSshEndpoint
 from tmuxgate.spool import ResultSpool
@@ -64,6 +72,17 @@ class RemoteSetupFailure(TransportError):
     def __init__(self, detail: str, record: DurableJobRecord) -> None:
         super().__init__(detail)
         self.record = record
+
+
+class AutomationPolicyDeniedError(TransportError):
+    """A validated pre-remote decision was denied by Automation policy."""
+
+
+def _automation_mode(operator_interface: OperatorInterface) -> bool:
+    try:
+        return getattr(operator_interface, "approval_mode") == "disabled"
+    except BaseException:
+        return False
 
 
 def _bounded_detail(detail: str, fallback: str) -> str:
@@ -247,6 +266,7 @@ class RealExecutor:
         detached_handler: DetachedHandler = reattach_detached_job,
         poll_interval_seconds: float = 0.25,
         detached_wait_seconds: float = 5.0,
+        reboot_recovery: ExpectedRebootRecoveryCoordinator | None = None,
     ) -> None:
         for name, callback in (
             ("backend_factory", backend_factory),
@@ -277,6 +297,7 @@ class RealExecutor:
         self.detached_handler = detached_handler
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.detached_wait_seconds = float(detached_wait_seconds)
+        self.reboot_recovery = reboot_recovery
         self._delivery_records: dict[str, DurableJobRecord] = {}
         self._recovery_leases: dict[str, TransportLease] = {}
         self._recovery_jobs: dict[str, tuple[RemoteJobCoordinator, RemoteJob]] = {}
@@ -351,9 +372,12 @@ class RealExecutor:
                     )
                 decision = require_operator_decision(
                     prompt,
-                    self.operator_interface.request_fallback(prompt),
+                    resolve_operator_prompt(self.operator_interface, prompt),
                 )
                 if decision is not ApprovalDecision.APPROVED:
+                    detail = f"{failure}; next approved fallback was denied"
+                    if _automation_mode(self.operator_interface):
+                        raise AutomationPolicyDeniedError(detail)
                     raise TransportError(
                         f"{failure}; human denied the next approved fallback"
                     )
@@ -439,7 +463,7 @@ class RealExecutor:
                             )
                         decision = require_operator_decision(
                             prompt,
-                            self.operator_interface.request_ssh_retry(prompt),
+                            resolve_operator_prompt(self.operator_interface, prompt),
                         )
                         if decision is ApprovalDecision.APPROVED:
                             self.planner.revalidate_connection_plan(
@@ -460,8 +484,13 @@ class RealExecutor:
                             )
                             continue
                         all_endpoints_exhausted = False
-                        failure = TransportError(
-                            f"{exc}; operator cancelled the same-endpoint retry"
+                        detail = f"{exc}; same-endpoint retry was denied"
+                        failure = (
+                            AutomationPolicyDeniedError(detail)
+                            if _automation_mode(self.operator_interface)
+                            else TransportError(
+                                f"{exc}; operator cancelled the same-endpoint retry"
+                            )
                         )
                     else:
                         failure = TransportError(
@@ -504,6 +533,7 @@ class RealExecutor:
         detail: str,
         coordinator: RemoteJobCoordinator | None = None,
         job: RemoteJob | None = None,
+        result_code: ResultCode = ResultCode.UNEXPECTED_DISCONNECT,
     ) -> ExecutionResult:
         try:
             record = self.state.mark_recovery_required(record, detail=detail[:1000])
@@ -517,6 +547,7 @@ class RealExecutor:
             request_id,
             TransportStatus.INCOMPLETE,
             detail=detail + "; command lease retained for recovery",
+            result_code=result_code,
         )
 
     def _monitor(self, request_id: str, coordinator: RemoteJobCoordinator, job: RemoteJob) -> None:
@@ -537,7 +568,114 @@ class RealExecutor:
                 continue
             time.sleep(self.poll_interval_seconds)
 
+    def _finalize_completed_remote(
+        self,
+        request_id: str,
+        request: RequestSpec,
+        endpoint: PlannedEndpoint,
+        record: DurableJobRecord,
+        lease: TransportLease,
+        coordinator: RemoteJobCoordinator,
+        job: RemoteJob,
+        backend: object,
+    ) -> ExecutionResult:
+        observation = backend.observe(job.identity)
+        if not observation.completion_proven or observation.attached_clients != 0:
+            raise RemoteJobError("completion/detach could not be proven")
+        record = self.state.mark_completion_proven(
+            record,
+            exit_status=observation.exit_status,
+        )
+        record = self.state.mark_viewer_detached(record)
+        if job.viewer is not None and not job.viewer.attached:
+            try:
+                job.viewer.wait(timeout=0)
+            except (AttributeError, TimeoutError):
+                pass
+        record = self.state.mark_terminal_restored(record)
+        collected = coordinator.collect(job)
+        if isinstance(collected, CollectedRemoteFiles):
+            try:
+                spooled = self.spool.store_files(
+                    request_id,
+                    collected.stdout_path,
+                    collected.stderr_path,
+                    stdout_size=collected.stdout_size,
+                    stdout_sha256=collected.stdout_sha256,
+                    stderr_size=collected.stderr_size,
+                    stderr_sha256=collected.stderr_sha256,
+                    exit_status=collected.exit_status,
+                )
+            finally:
+                collected.close()
+        else:
+            spooled = self.spool.store(
+                request_id,
+                collected.stdout,
+                collected.stderr,
+                collected.exit_status,
+            )
+        record = self.state.mark_local_spool_verified(
+            record,
+            manifest_sha256=spooled.manifest_payload_sha256,
+        )
+        record = self.state.release_lease(record)
+        try:
+            coordinator.cleanup(job)
+        except BaseException:
+            pass
+        lease.release()
+        record = self.state.begin_result_delivery(record)
+        with self._records_lock:
+            self._delivery_records[request_id] = record
+        self._publish_connection(
+            request_id,
+            request,
+            ConnectionPhase.COMPLETED,
+            "Remote execution completed and its result was verified locally.",
+            endpoint_id=endpoint.resolved.endpoint_id,
+            remote_mutation_state=RemoteMutationState.STARTED,
+        )
+        return ExecutionResult(
+            request_id,
+            TransportStatus.COMPLETE,
+            stdout=spooled.stdout,
+            stderr=spooled.stderr,
+            remote_exit_status=spooled.exit_status,
+        )
+
     def __call__(self, request_id: str, request: RequestSpec) -> ExecutionResult:
+        expected_reboot = (
+            request.disconnect_policy is DisconnectPolicy.EXPECT_FULL_REBOOT
+        )
+        if self.reboot_recovery is not None:
+            try:
+                self.reboot_recovery.require_machine_available(
+                    request.machine_alias, request_id
+                )
+                if expected_reboot:
+                    self.reboot_recovery.claim_expected_reboot(
+                        request.machine_alias, request_id
+                    )
+            except RecoveryCoordinatorError as exc:
+                return ExecutionResult(
+                    request_id,
+                    TransportStatus.RECOVERY_IN_PROGRESS,
+                    detail=str(exc),
+                    result_code=ResultCode.RECOVERY_IN_PROGRESS,
+                )
+        elif expected_reboot:
+            return ExecutionResult(
+                request_id,
+                TransportStatus.PRE_REMOTE_FAILURE,
+                detail="expected reboot recovery is not configured",
+                result_code=ResultCode.AUTOMATION_POLICY_DENIED,
+            )
+
+        def release_expected_claim() -> None:
+            if expected_reboot and self.reboot_recovery is not None:
+                self.reboot_recovery.release_claim(request.machine_alias, request_id)
+
         try:
             # Consuming the approved plan is still entirely local.  In
             # particular, a runtime machine disable can invalidate a queued
@@ -545,6 +683,7 @@ class RealExecutor:
             # boundary exists.
             context = self.planner.take(request_id, request)
         except BaseException as exc:
+            release_expected_claim()
             self._publish_connection(
                 request_id,
                 request,
@@ -569,6 +708,7 @@ class RealExecutor:
         try:
             boundary.approve()
         except BaseException as exc:
+            release_expected_claim()
             self._publish_connection(
                 request_id,
                 request,
@@ -589,6 +729,7 @@ class RealExecutor:
                 boundary,
             )
         except RemoteSetupFailure as exc:
+            release_expected_claim()
             return ExecutionResult(
                 request_id,
                 TransportStatus.REMOTE_SETUP_FAILURE,
@@ -596,6 +737,7 @@ class RealExecutor:
             )
         except SshEndpointsExhaustedError as exc:
             disable_detail = "; machine remains enabled"
+            automation_policy_denied = False
             try:
                 enabled = self.machine_enabled(request.machine_alias)
                 if type(enabled) is not bool:
@@ -614,11 +756,17 @@ class RealExecutor:
                         )
                     decision = require_operator_decision(
                         prompt,
-                        self.operator_interface.request_machine_disable(prompt),
+                        resolve_operator_prompt(self.operator_interface, prompt),
                     )
                     if decision is ApprovalDecision.APPROVED:
                         self.machine_disabler(request.machine_alias)
                         disable_detail = "; machine disabled by operator"
+                    elif _automation_mode(self.operator_interface):
+                        automation_policy_denied = True
+                        disable_detail = (
+                            "; Automation denied persistent machine disable and "
+                            "the machine remains enabled"
+                        )
                     elif not self.machine_enabled(request.machine_alias):
                         # Another failed request may have disabled the machine
                         # while this request waited for the terminal arbiter.
@@ -630,6 +778,7 @@ class RealExecutor:
                 )
             detail = f"SSH transport was not established: {exc}{disable_detail}"
             boundary.fail_pre_remote(detail)
+            release_expected_claim()
             self._publish_connection(
                 request_id,
                 request,
@@ -640,10 +789,16 @@ class RealExecutor:
                 request_id,
                 TransportStatus.PRE_REMOTE_FAILURE,
                 detail=detail,
+                result_code=(
+                    ResultCode.AUTOMATION_POLICY_DENIED
+                    if automation_policy_denied
+                    else None
+                ),
             )
         except BaseException as exc:
             detail = f"SSH transport was not established: {exc}"
             boundary.fail_pre_remote(detail)
+            release_expected_claim()
             self._publish_connection(
                 request_id,
                 request,
@@ -654,7 +809,56 @@ class RealExecutor:
                 request_id,
                 TransportStatus.PRE_REMOTE_FAILURE,
                 detail=detail,
+                result_code=(
+                    ResultCode.AUTOMATION_POLICY_DENIED
+                    if _automation_mode(self.operator_interface)
+                    and isinstance(
+                        exc,
+                        (AutomationPolicyDeniedError, OperatorInterfaceError),
+                    )
+                    else None
+                ),
             )
+
+        if expected_reboot:
+            assert self.reboot_recovery is not None
+            try:
+                approved = self.reboot_recovery.capture_pre_reboot(approved, lease)
+                boundary.record = approved
+            except BootIdProbeError as exc:
+                if approved.state is RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE:
+                    boundary.fail_remote_setup(
+                        f"pre-reboot boot ID probe failed before command start: {exc}"
+                    )
+                else:
+                    boundary.fail_pre_remote(
+                        f"pre-reboot boot ID probe failed before command start: {exc}"
+                    )
+                lease.release()
+                release_expected_claim()
+                return ExecutionResult(
+                    request_id,
+                    TransportStatus.PRE_REMOTE_FAILURE,
+                    detail=str(exc),
+                    result_code=ResultCode.PRE_REBOOT_BOOT_ID_UNAVAILABLE,
+                )
+            except BaseException as exc:
+                if approved.state is RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE:
+                    boundary.fail_remote_setup(
+                        f"pre-reboot evidence binding failed before command start: {exc}"
+                    )
+                else:
+                    boundary.fail_pre_remote(
+                        f"pre-reboot evidence binding failed before command start: {exc}"
+                    )
+                lease.release()
+                release_expected_claim()
+                return ExecutionResult(
+                    request_id,
+                    TransportStatus.PRE_REMOTE_FAILURE,
+                    detail=str(exc),
+                    result_code=ResultCode.PRE_REBOOT_BOOT_ID_UNAVAILABLE,
+                )
 
         try:
             armed, permit = self.state.arm_remote_start(approved)
@@ -684,6 +888,7 @@ class RealExecutor:
                     )
             finally:
                 lease.release()
+                release_expected_claim()
             if approved.remote_mutation_started:
                 self._publish_connection(
                     request_id,
@@ -717,6 +922,7 @@ class RealExecutor:
 
         coordinator: RemoteJobCoordinator | None = None
         job: RemoteJob | None = None
+        backend: object | None = None
         try:
             recipient = SecretInputRecipient(
                 request_id,
@@ -738,71 +944,18 @@ class RealExecutor:
             )
             self._monitor(request_id, coordinator, job)
 
-            observation = backend.observe(job.identity)
-            if not observation.completion_proven or observation.attached_clients != 0:
-                raise RemoteJobError("completion/detach could not be proven")
-            armed = self.state.mark_completion_proven(
-                armed,
-                exit_status=observation.exit_status,
-            )
-            armed = self.state.mark_viewer_detached(armed)
-            if job.viewer is not None and not job.viewer.attached:
-                try:
-                    job.viewer.wait(timeout=0)
-                except (AttributeError, TimeoutError):
-                    pass
-            armed = self.state.mark_terminal_restored(armed)
-            collected = coordinator.collect(job)
-            if isinstance(collected, CollectedRemoteFiles):
-                try:
-                    spooled = self.spool.store_files(
-                        request_id,
-                        collected.stdout_path,
-                        collected.stderr_path,
-                        stdout_size=collected.stdout_size,
-                        stdout_sha256=collected.stdout_sha256,
-                        stderr_size=collected.stderr_size,
-                        stderr_sha256=collected.stderr_sha256,
-                        exit_status=collected.exit_status,
-                    )
-                finally:
-                    collected.close()
-            else:
-                spooled = self.spool.store(
-                    request_id,
-                    collected.stdout,
-                    collected.stderr,
-                    collected.exit_status,
-                )
-            armed = self.state.mark_local_spool_verified(
-                armed,
-                manifest_sha256=spooled.manifest_payload_sha256,
-            )
-            armed = self.state.release_lease(armed)
-            try:
-                coordinator.cleanup(job)
-            except BaseException:
-                # Cleanup is safe to retry later and is not a command-lease gate.
-                pass
-            lease.release()
-            armed = self.state.begin_result_delivery(armed)
-            with self._records_lock:
-                self._delivery_records[request_id] = armed
-            self._publish_connection(
+            result = self._finalize_completed_remote(
                 request_id,
                 request,
-                ConnectionPhase.COMPLETED,
-                "Remote execution completed and its result was verified locally.",
-                endpoint_id=endpoint.resolved.endpoint_id,
-                remote_mutation_state=RemoteMutationState.STARTED,
+                endpoint,
+                armed,
+                lease,
+                coordinator,
+                job,
+                backend,
             )
-            return ExecutionResult(
-                request_id,
-                TransportStatus.COMPLETE,
-                stdout=spooled.stdout,
-                stderr=spooled.stderr,
-                remote_exit_status=spooled.exit_status,
-            )
+            release_expected_claim()
+            return result
         except BaseException as exc:
             self._publish_connection(
                 request_id,
@@ -812,6 +965,57 @@ class RealExecutor:
                 endpoint_id=endpoint.resolved.endpoint_id,
                 remote_mutation_state=RemoteMutationState.STARTED,
             )
+            if isinstance(exc, AutomaticSecretInputError):
+                result_code = ResultCode(exc.code)
+                if expected_reboot:
+                    assert self.reboot_recovery is not None
+                    with self._records_lock:
+                        self._recovery_leases[request_id] = lease
+                        if coordinator is not None and job is not None:
+                            self._recovery_jobs[request_id] = (coordinator, job)
+                    return self.reboot_recovery.fail_closed_after_remote_start(
+                        armed,
+                        code=result_code,
+                        detail=f"automatic secret input failed: {exc}",
+                    )
+                return self._retain_recovery(
+                    request_id,
+                    armed,
+                    lease,
+                    f"automatic secret input failed: {exc}",
+                    coordinator,
+                    job,
+                    result_code=result_code,
+                )
+            if expected_reboot:
+                assert self.reboot_recovery is not None
+
+                def resume_same_boot(
+                    same_boot_record: DurableJobRecord,
+                    _current: ResolvedSshEndpoint,
+                ) -> ExecutionResult | None:
+                    if coordinator is None or job is None or backend is None:
+                        return None
+                    resumed_state = coordinator.refresh(job)
+                    if resumed_state is not RemoteJobState.COMPLETE_DETACHED:
+                        return None
+                    return self._finalize_completed_remote(
+                        request_id,
+                        request,
+                        endpoint,
+                        same_boot_record,
+                        lease,
+                        coordinator,
+                        job,
+                        backend,
+                    )
+
+                return self.reboot_recovery.recover(
+                    armed,
+                    endpoint.resolved,
+                    lease=lease,
+                    same_boot_resumer=resume_same_boot,
+                )
             return self._retain_recovery(
                 request_id,
                 armed,

@@ -51,7 +51,12 @@ of a stated tmuxgate invariant.
 
 The default Textual dashboard is presentation, not authority. Structured
 operator prompts retain their immutable request and route bindings outside the
-rendered widget tree. MCP and Unix-socket frames, remote stdout/stderr, OpenSSH
+rendered widget tree. A centralized Automation policy approves only the exact
+bound execution, one exact same-endpoint pre-mutation retry, and the next exact
+adjacent pre-mutation route fallback, recording activity before returning. It
+denies persistent machine-disable mutation and human secret-input handoff.
+Automation never queues or displays an operator dialog, and the dashboard
+cannot report Ready while a forbidden pending prompt exists. MCP and Unix-socket frames, remote stdout/stderr, OpenSSH
 diagnostics, tmux pane text, ANSI controls, terminal links, and Textual markup
 are untrusted data: they are escaped and cannot create widgets, key events, or
 decisions. Only deliberate input from the one validated foreground controlling
@@ -82,11 +87,12 @@ Manual secret input is a separate ownership boundary. After an exact request-,
 command-, route-, endpoint-, and viewer-bound authorization, Textual leaves
 application mode and stops reading the terminal before the trusted external
 viewer receives `/dev/tty`. In automatic mode, the exact default sudo prompt or
-that machine's learned exact prompt may instead receive the owner-only stored
-password up to three times. An unknown first-use prompt requires a dedicated
-masked credential enrollment; entering a password explicitly trusts and saves
-that exact prompt for the logical machine. Manual Forward Input bytes are not
-retained; enrolled bytes are kept only in the mode-`0600` credential file and a
+that machine's previously enrolled exact prompt may instead receive the
+owner-only stored password up to three times. Missing credentials, prompt
+mismatch, submission failure, and retry exhaustion fail immediately without
+`getpass`, enrollment, a TUI dialog, or Forward Input. Enrollment is a separate
+explicit operator action. Manual Forward Input bytes are not retained;
+enrolled bytes are kept only in the mode-`0600` credential file and a
 short-lived private tmux buffer.
 
 ## Interactive remote execution
@@ -100,19 +106,16 @@ cannot open `/dev/tty` at all; prompt detection and terminal handoff are not
 offered for it.
 
 With Automation on, approving an interactive Codex request also authorizes up
-to three stored-password submissions when distinct prompt episodes emit an
-exact default or per-machine learned prompt. A stored password may automatically
-learn a new exact prompt only when its visible text identifies itself as sudo;
-other unknown prompts require masked first-use enrollment. Learned prompts may
-not name the resolved user, so the approved interactive command and first-use
-trust decision remain the security boundary. This matches sudo's ordinary retry
-behavior when a stored password has changed. Automatic mode never opens the
-Forward Input authorization; cancelled or unusable credentials leave the command
-detached to fail or time out, with explicit `tmuxgate attach REQUEST_ID` still
-available. Prompt text cannot prove that the remote program really is sudo, so
-an accepted interactive command can deliberately imitate that prompt and
-consume the stored password; Codex approval is therefore the security decision
-for both command execution and credential use. Automation off restores the
+to three stored-password submissions when distinct prompt episodes emit that
+machine's exact previously enrolled sudo prompt. Automation cannot learn or
+replace a prompt and cannot enroll credentials. An absent password, mismatched
+prompt, rejected submission, or exhausted retry budget fails the request
+immediately with a stable reason code. Automatic mode never opens Forward
+Input. Prompt text cannot prove that the remote program really is sudo, so an
+accepted interactive command can deliberately imitate the enrolled prompt and
+consume the stored password; Codex approval and the separate enrollment action
+are therefore the security decisions for command execution and credential use.
+Automation off restores the
 second single-request handoff decision. Passwords never enter captured
 stdout/stderr, the verified result spool, durable job records, activity text,
 child arguments, or environment. tmuxgate still does not support `sudo -S`,
@@ -126,6 +129,32 @@ prompt detection authorizing input on its own, a handoff reaching a request that
 did not ask for interactive execution, typed bytes appearing in any recorded
 stream or durable record, or an interactive job escaping its process-group
 termination boundary are security-boundary reports.
+
+## Expected full-reboot recovery boundary
+
+Automatic abandonment is opt-in per request through the authenticated,
+digest-bound `EXPECT_FULL_REBOOT` disconnect policy. Before the requested
+command can start, tmuxgate reads the canonical Linux boot ID through the exact
+approved route and durably binds it to the request, route, endpoint, host-key
+alias, resolved identity, job path, start boundary, and record generation. A
+missing or malformed value leaves the start gate closed.
+
+After disconnect, verification uses an independent one-shot SSH connection
+with multiplexing disabled, the approved identity forced, and strict host-key
+checking. A timeout, unreachable host, same boot ID, changed endpoint or
+identity, host-key failure, credential failure, or stale request binding cannot
+prove reboot. Only a different canonical boot ID commits verified evidence.
+The coordinator commits that evidence before reconciling the exact local
+transport pin/socket, and releases capacity only after the existing safe-socket
+checks complete. Startup resumes either durable phase without a prompt.
+
+Verified reboot proves that processes from the prior Linux boot no longer run;
+it does not prove rollback, command success, or absence of partial effects.
+Accordingly, `ABANDONED_AFTER_VERIFIED_REBOOT` has no remote exit status,
+stdout, stderr, or completion claim. Reports that show automatic abandonment
+without exact changed-boot evidence, use of the prior SSH master for the probe,
+cross-machine blocking, cleanup before evidence commit, or release after
+ambiguous cleanup are security-boundary reports.
 
 ## Installer security boundary
 

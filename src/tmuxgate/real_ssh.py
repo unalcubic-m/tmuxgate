@@ -46,6 +46,16 @@ _SECRET_PROMPT_RE = re.compile(
 MAX_AUTOMATIC_SECRET_ATTEMPTS = 3
 
 
+class AutomaticSecretInputError(TransportError):
+    """Automation could not satisfy an exact stored-sudo prompt."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        if code not in {"credential_unavailable", "credential_prompt_mismatch"}:
+            raise ValueError("automatic secret-input failure code is invalid")
+        self.code = code
+        super().__init__(detail)
+
+
 def _sudo_prompt_matches(
     signature: bytes,
     user: str,
@@ -328,6 +338,10 @@ class SshChannelRunner:
         self.popen = popen
         self.terminal_opener = terminal_opener
         self.prompt_presenter = prompt_presenter
+
+    def raise_automatic_secret_failure(self, request_id: str) -> None:
+        if self.prompt_presenter is not None:
+            self.prompt_presenter.raise_automatic_failure(request_id)
 
     def batch(
         self,
@@ -856,12 +870,30 @@ class SecretPromptPresenter:
         self._watched_lock = threading.Lock()
         self._active: tuple[DetachedTmuxViewerProcess, str] | None = None
         self._active_lock = threading.Lock()
+        self._automatic_failures: dict[str, AutomaticSecretInputError] = {}
+        self._automatic_failures_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._present_loop,
             name="tmuxgate-secret-prompt-presenter",
             daemon=True,
         )
         self._thread.start()
+
+    def _record_automatic_failure(
+        self,
+        request_id: str,
+        code: str,
+        detail: str,
+    ) -> None:
+        failure = AutomaticSecretInputError(code, detail)
+        with self._automatic_failures_lock:
+            self._automatic_failures.setdefault(request_id, failure)
+
+    def raise_automatic_failure(self, request_id: str) -> None:
+        with self._automatic_failures_lock:
+            failure = self._automatic_failures.get(request_id)
+        if failure is not None:
+            raise failure
 
     def watch(
         self,
@@ -899,7 +931,6 @@ class SecretPromptPresenter:
         prompt_episode = False
         automatic_attempts = 0
         automatic_failure_reported = False
-        enrollment_attempted = False
         try:
             while not self._stop.is_set():
                 try:
@@ -919,6 +950,11 @@ class SecretPromptPresenter:
                             automatic_mode = self.automatic_secret_input()
                         except Exception:
                             automatic_mode = True
+                            self._record_automatic_failure(
+                                recipient.request_id,
+                                "credential_unavailable",
+                                "automatic secret-input policy state is unavailable",
+                            )
                             if not automatic_failure_reported:
                                 automatic_failure_reported = True
                                 self.reporter(
@@ -929,6 +965,11 @@ class SecretPromptPresenter:
                                 )
                         if automatic_mode:
                             if automatic_attempts >= MAX_AUTOMATIC_SECRET_ATTEMPTS:
+                                self._record_automatic_failure(
+                                    recipient.request_id,
+                                    "credential_unavailable",
+                                    "stored sudo credential was rejected for the maximum three prompt episodes",
+                                )
                                 if not automatic_failure_reported:
                                     automatic_failure_reported = True
                                     self.reporter(
@@ -945,6 +986,11 @@ class SecretPromptPresenter:
                                 )
                             except Exception:
                                 automatic_attempts += 1
+                                self._record_automatic_failure(
+                                    recipient.request_id,
+                                    "credential_unavailable",
+                                    "stored sudo credential submission failed",
+                                )
                                 if not automatic_failure_reported:
                                     automatic_failure_reported = True
                                     self.reporter(
@@ -955,36 +1001,38 @@ class SecretPromptPresenter:
                                     )
                             if automatic_submitted:
                                 automatic_attempts += 1
-                            elif automatic_attempts == 0 and not enrollment_attempted:
-                                enrollment_attempted = True
-                                try:
-                                    enrolled_secret = self.credential_enroller(
-                                        recipient.request.machine_alias,
-                                        signature,
-                                    )
-                                    if enrolled_secret is not None:
-                                        if not isinstance(enrolled_secret, bytes):
-                                            raise TypeError(
-                                                "credential enroller returned non-bytes"
-                                            )
-                                        viewer.submit_secret_line(enrolled_secret)
-                                        automatic_attempts += 1
-                                        automatic_submitted = True
-                                        self.reporter(
-                                            "new sudo prompt and password enrolled for "
-                                            f"request {recipient.request_id} on "
-                                            f"{recipient.request.machine_alias}"
-                                        )
-                                except Exception:
-                                    if not automatic_failure_reported:
-                                        automatic_failure_reported = True
-                                        self.reporter(
-                                            "sudo credential enrollment failed for "
-                                            f"request {recipient.request_id} on "
-                                            f"{recipient.request.machine_alias}; Forward "
-                                            "Input is suppressed"
-                                        )
                             if not automatic_submitted and not automatic_failure_reported:
+                                endpoint = next(
+                                    (
+                                        item.resolved
+                                        for item in recipient.connection_plan.endpoints
+                                        if item.resolved.endpoint_id == recipient.endpoint_id
+                                    ),
+                                    None,
+                                )
+                                learned_prompt = self.prompt_provider(
+                                    recipient.request.machine_alias
+                                )
+                                prompt_matches = endpoint is not None and _sudo_prompt_matches(
+                                    signature,
+                                    endpoint.resolved_user,
+                                    learned_prompt,
+                                )
+                                code = (
+                                    "credential_unavailable"
+                                    if prompt_matches
+                                    else "credential_prompt_mismatch"
+                                )
+                                detail = (
+                                    "no stored sudo credential is available for the exact prompt"
+                                    if prompt_matches
+                                    else "remote secret prompt does not match the exact supported sudo prompt"
+                                )
+                                self._record_automatic_failure(
+                                    recipient.request_id,
+                                    code,
+                                    detail,
+                                )
                                 automatic_failure_reported = True
                                 self.reporter(
                                     "automatic mode could not use a stored sudo password "
@@ -992,6 +1040,8 @@ class SecretPromptPresenter:
                                     f"{recipient.request.machine_alias}; Forward Input is "
                                     "suppressed"
                                 )
+                            if not automatic_submitted:
+                                return
                             continue
                         else:
                             self.reporter(

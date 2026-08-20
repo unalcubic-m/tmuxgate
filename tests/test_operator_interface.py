@@ -10,6 +10,7 @@ from tmuxgate.operator_interface import (
     ActivityKind,
     ConnectionPhase,
     ExecutionApprovalPrompt,
+    MachineDisablePrompt,
     OperationalActivity,
     OperatorDecision,
     OperatorInterfaceError,
@@ -23,6 +24,7 @@ from tmuxgate.operator_interface import (
     SecretInputRecipient,
     SshRetryPrompt,
     require_operator_decision,
+    resolve_operator_prompt,
 )
 from test_connection_plan import REQUEST_ID, build_plan
 
@@ -36,6 +38,17 @@ class FakeTerminalArbiter:
 
     def poll_dashboard_line(self, **_keywords):
         return None
+
+
+class HumanPromptMethodsForbiddenAutomationInterface(PlainTerminalInterface):
+    def _human_method_called(self, _prompt):
+        raise AssertionError("Automation called a request-specific human prompt method")
+
+    request_execution_approval = _human_method_called
+    request_ssh_retry = _human_method_called
+    request_fallback = _human_method_called
+    request_machine_disable = _human_method_called
+    request_secret_input_authorization = _human_method_called
 
 
 def request(*, script: bytes | None = None) -> RequestSpec:
@@ -618,6 +631,96 @@ class PlainTerminalInterfaceTests(unittest.TestCase):
             interface.request_execution_approval(after_close).decision,
             ApprovalDecision.DENIED,
         )
+
+    def test_automation_resolves_every_prompt_kind_without_queue_or_terminal(self):
+        interface = HumanPromptMethodsForbiddenAutomationInterface(
+            FakeTerminalArbiter(),
+            approval_mode="disabled",
+        )
+        self.addCleanup(interface.close)
+        exact_request = request()
+        plan = build_plan()
+        execution = ExecutionApprovalPrompt.create(
+            REQUEST_ID,
+            exact_request,
+            plan,
+        )
+        retry = SshRetryPrompt.create(
+            SECOND_REQUEST_ID,
+            exact_request,
+            plan,
+            endpoint_id="home-lan",
+            failure_detail="initial authentication failed",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+        )
+        fallback = RouteFallbackPrompt.create(
+            "3" * 32,
+            exact_request,
+            plan,
+            failed_endpoint_id="home-lan",
+            fallback_endpoint_id="wireguard",
+            failure_detail="home route failed",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+        )
+        disable = MachineDisablePrompt.create(
+            "4" * 32,
+            exact_request,
+            plan,
+            failure_detail="all routes failed",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+        )
+        secret = SecretInputAuthorizationPrompt.create(
+            "5" * 32,
+            exact_request,
+            plan,
+            endpoint_id="home-lan",
+            viewer_session_id="tmuxgate-555555555555",
+        )
+
+        decisions = (
+            resolve_operator_prompt(interface, execution).decision,
+            resolve_operator_prompt(interface, retry).decision,
+            resolve_operator_prompt(interface, fallback).decision,
+            resolve_operator_prompt(interface, disable).decision,
+            resolve_operator_prompt(interface, secret).decision,
+        )
+
+        self.assertEqual(
+            decisions,
+            (
+                ApprovalDecision.APPROVED,
+                ApprovalDecision.APPROVED,
+                ApprovalDecision.APPROVED,
+                ApprovalDecision.DENIED,
+                ApprovalDecision.DENIED,
+            ),
+        )
+        self.assertIsNone(interface._prompts.next_prompt(timeout=0))
+        audit = tuple(
+            event
+            for event in interface.activity_history
+            if event.kind is ActivityKind.BROKER_AUDIT
+        )
+        self.assertEqual(len(audit), 5)
+        self.assertEqual(
+            tuple(dict(event.details)["binding_sha256"] for event in audit),
+            tuple(
+                prompt.binding_sha256
+                for prompt in (execution, retry, fallback, disable, secret)
+            ),
+        )
+
+        called = []
+        with self.assertRaisesRegex(OperatorInterfaceError, "human prompt"):
+            interface._request(execution)
+        with self.assertRaisesRegex(OperatorInterfaceError, "forbids"):
+            interface.run_terminal_session("forbidden", lambda: called.append(True))
+        with self.assertRaisesRegex(OperatorInterfaceError, "forbids"):
+            interface.run_external_terminal_session(
+                secret,
+                lambda: called.append(True),
+            )
+        self.assertEqual(called, [])
 
     def test_activity_history_is_bounded(self):
         interface = PlainTerminalInterface(

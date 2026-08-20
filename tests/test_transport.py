@@ -6,6 +6,7 @@ import stat
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from tmuxgate.approval import ApprovalDecision
 from tmuxgate.models import ExecutionMode, RequestSpec
@@ -632,6 +633,106 @@ class MasterPoolTests(unittest.TestCase):
 
         self.assertEqual(len(self.backend.starts), 2)
         self.assertEqual(restarted_pool.pinned_request_ids, ())
+
+    def test_verified_reboot_cleanup_retires_exact_master_then_starts_fresh(self):
+        reboot = self.acquire(0)
+        endpoint = reboot.transport.endpoint
+        identity_digest = reboot.transport.identity_sha256
+        old_path = reboot.transport.control_path
+        reboot.release()
+
+        outcome = self.pool.reconcile_verified_reboot(
+            machine_name=endpoint.machine_name,
+            request_id=REQUEST_ID,
+            endpoint=endpoint,
+            expected_identity_sha256=identity_digest,
+        )
+
+        self.assertEqual(outcome, "retained_master_reconciled")
+        self.assertFalse(old_path.exists())
+        replacement = self.acquire(0, request_id=SECOND_ID)
+        self.assertEqual(len(self.backend.starts), 2)
+        self.assertEqual(replacement.transport.endpoint, endpoint)
+        replacement.release()
+
+    def test_verified_reboot_cleanup_never_releases_a_foreign_pin(self):
+        foreign = self.acquire(0, request_id=SECOND_ID)
+        endpoint = foreign.transport.endpoint
+
+        with self.assertRaisesRegex(TransportBusyError, "still has command pins"):
+            self.pool.reconcile_verified_reboot(
+                machine_name=endpoint.machine_name,
+                request_id=REQUEST_ID,
+                endpoint=endpoint,
+                expected_identity_sha256=foreign.transport.identity_sha256,
+            )
+
+        self.assertEqual(self.pool.pinned_request_ids, (SECOND_ID,))
+        foreign.release()
+
+    def test_verified_reboot_cleanup_leaves_wrong_mode_socket_untouched(self):
+        endpoint = self.endpoints[0]
+        path = self.pool.expected_control_path(
+            endpoint.machine_name,
+            resolved_identity_sha256(endpoint),
+        )
+        master = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(master.close)
+        master.bind(str(path))
+        os.chmod(path, 0o666)
+
+        with self.assertRaises(TransportError):
+            self.pool.reconcile_verified_reboot(
+                machine_name=endpoint.machine_name,
+                request_id=REQUEST_ID,
+                endpoint=endpoint,
+                expected_identity_sha256=resolved_identity_sha256(endpoint),
+            )
+
+        self.assertTrue(path.exists())
+        self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), 0o666)
+
+    def test_verified_reboot_cleanup_refuses_replaced_socket_inode(self):
+        endpoint = self.endpoints[0]
+        identity_digest = resolved_identity_sha256(endpoint)
+        path = self.pool.expected_control_path(
+            endpoint.machine_name,
+            identity_digest,
+        )
+        master = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(master.close)
+        master.bind(str(path))
+        os.chmod(path, 0o600)
+        original_lstat = os.lstat
+        original_inode = original_lstat(path).st_ino
+        target_lstat_calls = 0
+
+        def replaced_on_final_check(candidate, *args, **kwargs):
+            nonlocal target_lstat_calls
+            metadata = original_lstat(candidate, *args, **kwargs)
+            if Path(candidate) != path:
+                return metadata
+            target_lstat_calls += 1
+            if target_lstat_calls < 3:
+                return metadata
+            values = list(metadata)
+            values[1] += 1
+            return os.stat_result(values)
+
+        with mock.patch(
+            "tmuxgate.transport.os.lstat",
+            side_effect=replaced_on_final_check,
+        ):
+            with self.assertRaisesRegex(TransportError, "changed control socket"):
+                self.pool.reconcile_verified_reboot(
+                    machine_name=endpoint.machine_name,
+                    request_id=REQUEST_ID,
+                    endpoint=endpoint,
+                    expected_identity_sha256=identity_digest,
+                )
+
+        self.assertTrue(path.exists())
+        self.assertEqual(os.lstat(path).st_ino, original_inode)
 
     def test_identity_change_after_approval_prevents_reuse_or_authentication(self):
         endpoint = self.endpoints[0]

@@ -66,10 +66,15 @@ The unified lifecycle starts resources in fail-closed order:
    selected dashboard loop. The Textual operator interface is the default;
    explicit `--plain` selects the supported line-oriented fail-safe.
 
-Startup refuses to accept new approvals when durable recovery reports a
-possibly running or incompletely collected request. An MCP bind or startup
-failure stops the already-started broker and unwinds owned resources; there is
-no silent broker-only mode. The lifecycle locks are the authoritative
+Startup reconstructs every durable remote-active request before accepting new
+work. Ordinary uncertain records retain the historical global fail-closed
+barrier. Records explicitly bound to `EXPECT_FULL_REBOOT` instead enter the
+broker-owned recovery coordinator: their logical machine remains blocked, each
+record counts against the configured capacity, and unrelated machines may use
+the remaining slots. Recovery begins without an approval or credential dialog;
+the dashboard cannot report Ready while a forbidden prompt is pending. An MCP
+bind or startup failure stops the already-started broker and unwinds owned
+resources; there is no silent broker-only mode. The lifecycle locks are the authoritative
 exclusion mechanism for issue #73. Their metadata binds PID, Linux boot ID,
 process start ticks, executable device/inode, UID, and one random instance ID.
 A contending default-TUI process reports a standalone, non-owning conflict
@@ -388,13 +393,13 @@ control requests (`list_machines`, `list_jobs`, and `read_verified_result`) use
 the same one-frame, EOF-terminated, same-UID-validated socket boundary and one
 strictly decoded response.
 
-The request header is protocol version 3. It adds one required boolean member,
-`interactive`, to the exact key set the broker accepts, and that member is
-inside `client_request_sha256`. A version-2 frame therefore fails closed rather
-than being treated as a non-interactive request by default, and an approval or
-handoff digest cannot be reused across the two spellings. Client and broker
-ship in the same package, so this affects only a deliberately mixed
-installation.
+The request header is protocol version 4. It adds one required
+`disconnect_policy` member (`normal` or `expect_full_reboot`) to the exact key
+set, and that member is inside `client_request_sha256`. The broker accepts an
+exact version-3 header conservatively as `normal`, preserving rolling local
+upgrades without giving an older request automatic abandonment authority.
+Other versions and mixed key sets fail closed. An approval or handoff digest
+cannot be reused across the two spellings.
 
 The broker composes that local socket boundary, one-shot bound planner, real
 broker-owned OpenSSH master/channels, durable state, dedicated remote tmux jobs,
@@ -419,8 +424,10 @@ Ephemeral socket, control, viewer, and `broker.lock` socket-lifecycle files live
 durable job store uses checksummed,
 generation-checked JSON records, mode `0600`, same-directory atomic replacement,
 file `fsync`, and directory `fsync`. Startup recovery atomically terminalizes
-records proven to be pre-remote and blocks all new approvals for possibly
-running or incompletely collected records. A remote-start permit is returned
+records proven to be pre-remote. Ordinary possibly running or incompletely
+collected records retain the global barrier; explicitly armed expected-reboot
+records block only their machine while the recovery coordinator owns their
+capacity. A remote-start permit is returned
 only after `REMOTE_MAY_BE_RUNNING` and the predictable guarded job identity are
 durable. Completion, viewer detach, terminal restoration, local-spool
 verification, lease release, delivery, and done are also generation-checked
@@ -681,11 +688,20 @@ Detaching while a command runs does not release that request's lease. An
 uncertain job holds its own lease in recovery-required state; other configured
 slots continue independently.
 
-`approval_mode = "disabled"` is the default automatic policy: Codex approval is
-sufficient and no tmuxgate execution confirmation is shown. When the dashboard
-has a password for the target machine, the same policy also enables automatic
-sudo input for up to three distinct prompt episodes. Repeated rejection lets
-sudo return its ordinary failure without opening Forward Input.
+`approval_mode = "disabled"` is the default Automation policy. One centralized
+decision boundary approves the exact bound execution request, the single exact
+same-endpoint pre-mutation SSH retry, and the next exact adjacent pre-mutation
+route fallback. It emits a broker activity audit before each decision returns.
+Persistent machine disable and human secret-input handoff are denied without
+mutating policy. Automation never renders or queues an operator dialog.
+
+When an owner-only stored password and its enrolled exact sudo prompt are
+available for the target machine, Automation may submit that password for up
+to three distinct prompt episodes. Missing credentials, prompt mismatch,
+submission failure, or retry exhaustion fails the request immediately with a
+stable result code; none opens Forward Input, `getpass`, a TUI dialog, or a
+credential-enrollment flow.
+
 `approval_mode = "always"` disables stored-password submission and
 enables the execution and secret-input approval UI. Automatic mode suppresses
 the Forward Input UI even when a password is missing, rejected, or presented to
@@ -707,8 +723,8 @@ Each SSH viewer runs in a separate owner-only local tmux server below the
 runtime directory. A broker-owned monitor checks only the visible cursor row of
 each viewer for a password or passphrase prompt; this deliberately ignores the
 nested remote tmux status row below it. In automatic mode, it accepts the exact
-default `[sudo] password for <resolved-user>:` form or the exact prompt learned
-for that logical machine, plus bounded literal sudo `pwfeedback` stars. It loads
+default `[sudo] password for <resolved-user>:` form or the exact prompt already
+enrolled for that logical machine, plus bounded literal sudo `pwfeedback` stars. It loads
 the per-machine password through tmux stdin, pastes and deletes that private
 named buffer, and reports only that submission occurred. The secret never
 appears in a child argument, environment, activity,
@@ -717,15 +733,9 @@ allowed per distinct prompt episode, capped at three per viewer. That bounded
 retry lets sudo finish its ordinary incorrect-password path without looping
 into account lockout.
 
-When automation is on, an unknown prompt enters a one-time credential enrollment
-on the controlling terminal. If an existing password and the prompt text both
-identify sudo, tmuxgate learns the exact machine prompt without asking for the
-password again. Otherwise the operator sees the escaped exact prompt and enters
-a masked password; tmuxgate atomically stores schema-version-2 machine entries
-containing the password and base64-preserved prompt, migrating version-1
-password-only entries on their next write. Cancelling enrollment, submission
-failure, or an exhausted retry budget is reported without queuing Forward Input;
-the command stays detached to exit or time out. If automation is off, the
+Automation never learns a prompt or enrolls a password during command
+execution. Enrollment is an explicit, separate operator workflow. If
+Automation is off, the
 presenter asks the operator to authorize the exact request, logical machine,
 approved command identity, connection plan, endpoint, and isolated viewer
 session. Authorization requires typing the full
@@ -1082,9 +1092,9 @@ Prompt detection is offered only for an interactive request. `SshChannelRunner`
 watches a viewer only when the bound recipient's request asked for it, and
 `SecretPromptPresenter.watch` independently refuses a non-interactive recipient,
 so prompt-like text produced by a command that has no controlling terminal can
-never propose a handoff. The exact default or learned machine prompt may consume
-the stored password when automation is on; an unknown prompt can invoke the
-first-use enrollment above. With automation off, every prompt requires the
+never propose a handoff. The exact default or previously enrolled machine
+prompt may consume the stored password when Automation is on; an unknown prompt
+fails immediately and cannot enroll a credential. With Automation off, every prompt requires the
 separate `SecretInputAuthorizationPrompt` decision described under the
 operator-interface boundary, which names the full request, machine, endpoint,
 approved command identity, and viewer session. Manual typed bytes are not
@@ -1120,12 +1130,40 @@ RECEIVED
 the lease. A whole-host reboot can also strand `COMPLETION_PROVEN` after the
 wrapper status was observed but before canonical output reached the local
 spool; destroying the pinned SSH control socket makes collection impossible.
-For either state, the broker must be stopped and
-`tmuxgate recover after-reboot REQUEST_ID` may record
-`ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT` after an exact controlling-terminal
-confirmation that the entire logical machine rebooted after the recorded start
-time. Stopping the broker retires its process-owned command lease and transport
-pin. On restart, a new transport pool can authenticate a fresh SSH master.
+
+For the default `NORMAL` disconnect policy, the legacy manual workflow is
+unchanged: stop the broker, then use `tmuxgate recover after-reboot REQUEST_ID`
+to record `ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT` after the exact
+controlling-terminal attestation. `recover after-dead-pane` remains equally
+manual and never substitutes for reboot evidence.
+
+An explicit `EXPECT_FULL_REBOOT` request instead captures
+`/proc/sys/kernel/random/boot_id` through the approved transport before the
+requested command can start. The canonical UUID is durably bound to the
+request ID, policy, logical machine, connection-plan digest, endpoint,
+host-key alias, resolved-identity digest, remote job path, remote start time,
+and state generation. If capture is unavailable or malformed, the start gate
+stays closed.
+
+After an expected disconnect the recovery coordinator persists
+`EXPECTED_REBOOT_VERIFICATION_PENDING` and probes through a new one-shot SSH
+connection with `ControlMaster=no`, `ControlPath=none`, `ControlPersist=no`,
+the exact approved identity, and strict host-key checking. It never reuses or
+consults the old master. An unchanged boot ID is durable evidence that the old
+job may still exist, so the original executor resumes observation and
+collection when available. Transient unreachability is retried only within the
+configured `reboot_recovery_timeout_seconds`; endpoint, identity, host-key,
+credential, or request-binding mismatches fail immediately and remain visible.
+
+Only an exact, canonical changed boot ID permits automatic abandonment. The
+coordinator first commits `EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING`, including
+the post-boot ID, timestamps, attempts, decision/reason, and evidence digest.
+It then reconciles only the exact locally bound pin/socket under the existing
+safe-socket checks and commits `ABANDONED_AFTER_VERIFIED_REBOOT`. A crash in
+either window resumes idempotently on startup. Cleanup ambiguity never releases
+capacity or fabricates completion evidence, exit status, stdout, or stderr.
+Stopping the broker retires only process-owned leases; durable expected-reboot
+records are reconstructed machine-scoped on the next start.
 
 This terminal audit state preserves the original start, identity, and job path.
 For an uncertain request it retains null completion evidence. For a stranded

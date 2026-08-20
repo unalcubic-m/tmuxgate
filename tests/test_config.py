@@ -144,6 +144,7 @@ class ConfigTests(unittest.TestCase):
         config = parse_config(valid_config())
         self.assertEqual(config.broker.max_active_remote_commands, 3)
         self.assertEqual(config.broker.max_open_ssh_masters, 3)
+        self.assertEqual(config.broker.reboot_recovery_timeout_seconds, 300)
         self.assertEqual(config.machines["app-server"].endpoints[0].address.exploded, "192.0.2.20")
         self.assertEqual(
             tuple(map(str, config.wireguard.local_addresses)),
@@ -191,6 +192,17 @@ class ConfigTests(unittest.TestCase):
         data["broker"]["max_open_ssh_masters"] = 4
         with self.assertRaises(ConfigError):
             parse_config(data)
+
+    def test_reboot_recovery_timeout_is_bounded_and_rejects_bool(self):
+        for value in (0, 3601, True):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                BrokerConfig(reboot_recovery_timeout_seconds=value)
+        data = valid_config()
+        data["broker"]["reboot_recovery_timeout_seconds"] = 45
+        self.assertEqual(
+            parse_config(data).broker.reboot_recovery_timeout_seconds,
+            45,
+        )
 
     def test_rejects_unknown_fields_and_host_key_alias_sharing(self):
         data = valid_config()

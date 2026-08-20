@@ -626,6 +626,25 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
             (),
         )
 
+        retry_plan = build_plan()
+        retry = SshRetryPrompt.create(
+            "a" * 32,
+            execution.request,
+            retry_plan,
+            endpoint_id=retry_plan.selected.resolved.endpoint_id,
+            failure_detail="initial SSH authentication failed",
+            remote_mutation_state=RemoteMutationState.NOT_STARTED,
+        )
+        with mock.patch.object(
+            interface,
+            "_request",
+            side_effect=AssertionError("Textual modal path was reached"),
+        ) as human_request:
+            retry_result = interface.request_ssh_retry(retry)
+        self.assertIs(retry_result.decision, ApprovalDecision.APPROVED)
+        human_request.assert_not_called()
+        self.assertEqual(interface.pending_prompt_count, 0)
+
     def test_exact_secret_modal_reserves_suspends_and_restores_terminal(self):
         events = []
 

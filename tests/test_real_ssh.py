@@ -370,7 +370,8 @@ class RealSshProcessTests(unittest.TestCase):
             poll_seconds=0.005,
         )
         try:
-            presenter.watch(viewer, secret_input_recipient(viewer))
+            recipient = secret_input_recipient(viewer)
+            presenter.watch(viewer, recipient)
             deadline = time.monotonic() + 1
             while len(authorization_prompts) < 1 and time.monotonic() < deadline:
                 time.sleep(0.01)
@@ -449,7 +450,7 @@ class RealSshProcessTests(unittest.TestCase):
         finally:
             self.assertTrue(presenter.close())
 
-    def test_unknown_prompt_enrolls_and_submits_once_without_forward_input(self):
+    def test_unknown_prompt_fails_without_enrollment_or_forward_input(self):
         viewer = ScriptedDetachedViewer("dadcdadcdadc")
         viewer.prompt = b"Custom privileged password:\n"
         submitted = []
@@ -472,18 +473,61 @@ class RealSshProcessTests(unittest.TestCase):
             poll_seconds=0.005,
         )
         try:
-            presenter.watch(viewer, secret_input_recipient(viewer))
+            recipient = secret_input_recipient(viewer)
+            presenter.watch(viewer, recipient)
             deadline = time.monotonic() + 1
-            while not submitted and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertEqual(submitted, [b"newly-enrolled-password"])
-            self.assertEqual(
-                enrollment_calls,
-                [("app-server", b"Custom privileged password:")],
-            )
+            failure = None
+            while failure is None and time.monotonic() < deadline:
+                try:
+                    presenter.raise_automatic_failure(recipient.request_id)
+                except TransportError as exc:
+                    failure = exc
+                else:
+                    time.sleep(0.01)
+            self.assertIsNotNone(failure)
+            self.assertIn("does not match", str(failure))
+            self.assertEqual(submitted, [])
+            self.assertEqual(enrollment_calls, [])
             self.assertEqual(authorization_prompts, [])
-            time.sleep(0.05)
-            self.assertEqual(len(enrollment_calls), 1)
+        finally:
+            self.assertTrue(presenter.close())
+
+    def test_missing_stored_sudo_password_fails_without_enrollment_or_tty(self):
+        viewer = ScriptedDetachedViewer("dadcdadcdadd")
+        submitted = []
+        enrollment_calls = []
+        authorization_prompts = []
+        terminal_handoffs = []
+        viewer.submit_secret_line = submitted.append
+
+        presenter = SecretPromptPresenter(
+            authorizer=lambda prompt: authorization_prompts.append(prompt),
+            secret_provider=lambda machine: None,
+            credential_enroller=lambda machine, prompt: enrollment_calls.append(
+                (machine, prompt)
+            ),
+            automatic_secret_input=lambda: True,
+            terminal_handoff=lambda prompt, session: terminal_handoffs.append(prompt),
+            poll_seconds=0.005,
+        )
+        try:
+            recipient = secret_input_recipient(viewer)
+            presenter.watch(viewer, recipient)
+            deadline = time.monotonic() + 1
+            failure = None
+            while failure is None and time.monotonic() < deadline:
+                try:
+                    presenter.raise_automatic_failure(recipient.request_id)
+                except TransportError as exc:
+                    failure = exc
+                else:
+                    time.sleep(0.01)
+            self.assertIsNotNone(failure)
+            self.assertIn("no stored sudo credential", str(failure))
+            self.assertEqual(submitted, [])
+            self.assertEqual(enrollment_calls, [])
+            self.assertEqual(authorization_prompts, [])
+            self.assertEqual(terminal_handoffs, [])
         finally:
             self.assertTrue(presenter.close())
 

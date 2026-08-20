@@ -22,7 +22,13 @@ from tmuxgate.broker_api import (
     is_control_request_header,
 )
 from tmuxgate.fake import FakeExecution
-from tmuxgate.models import RequestSpec, ValidationError, new_request_id, validate_alias
+from tmuxgate.models import (
+    DisconnectPolicy,
+    RequestSpec,
+    ValidationError,
+    new_request_id,
+    validate_alias,
+)
 from tmuxgate.operator_interface import ActivityKind, OperationalActivity
 from tmuxgate.protocol import ProtocolError, receive_single_request, send_frame
 from tmuxgate.result import ExecutionResult, TransportStatus, send_result, send_status
@@ -312,6 +318,7 @@ class BrokerServer:
         activity_publisher: Callable[[OperationalActivity], object] = (
             lambda event: None
         ),
+        external_active_count: Callable[[], int] = lambda: 0,
     ) -> None:
         if listener.family != socket.AF_UNIX:
             raise ValueError("broker listener must be an AF_UNIX socket")
@@ -324,6 +331,7 @@ class BrokerServer:
                 approval_discarder,
                 delivery_observer,
                 activity_publisher,
+                external_active_count,
             )
         ):
             raise TypeError("broker callbacks must be callable")
@@ -386,6 +394,7 @@ class BrokerServer:
         self._scheduler = SequentialScheduler(
             max_pending_requests,
             max_active_remote_commands=max_active_remote_commands,
+            external_active_count=external_active_count,
         )
         self._events: queue.Queue[
             _IncomingRequest
@@ -1067,12 +1076,59 @@ class BrokerServer:
                 self._record("pre-remote-failure", request_id)
                 self._deliver_scheduled(event.work.session, execution)
                 return
+            if execution.transport_status is TransportStatus.RECOVERY_IN_PROGRESS:
+                self._scheduler.mark_pre_remote_failure(
+                    request_id,
+                    detail=execution.detail or "machine recovery is in progress",
+                )
+                self._record("recovery-in-progress", request_id)
+                self._deliver_scheduled(event.work.session, execution)
+                return
             if execution.transport_status is TransportStatus.REMOTE_SETUP_FAILURE:
                 self._scheduler.mark_remote_setup_failure(
                     request_id,
                     detail=execution.detail or "remote setup failed after mutation",
                 )
                 self._record("remote-setup-failure", request_id)
+                self._deliver_scheduled(event.work.session, execution)
+                return
+            if (
+                execution.transport_status
+                is TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT
+            ):
+                self._scheduler.mark_remote_may_be_running(request_id)
+                self._scheduler.mark_abandoned_after_verified_reboot(
+                    request_id,
+                    detail=execution.detail or "full-host reboot was cryptographically verified",
+                )
+                self._record("abandoned-after-verified-reboot", request_id)
+                self._deliver_scheduled(event.work.session, execution)
+                return
+            if (
+                execution.transport_status is TransportStatus.INCOMPLETE
+                and event.work.request.disconnect_policy
+                is DisconnectPolicy.EXPECT_FULL_REBOOT
+                and execution.result_code is not None
+                and execution.result_code.value
+                in {
+                    "reboot_recovery_timeout",
+                    "same_boot_observed",
+                    "endpoint_identity_mismatch",
+                    "host_key_mismatch",
+                    "unsafe_control_path",
+                    "ambiguous_master_state",
+                    "credential_unavailable",
+                    "credential_prompt_mismatch",
+                    "reboot_probe_unavailable",
+                    "request_binding_mismatch",
+                }
+            ):
+                self._scheduler.mark_remote_may_be_running(request_id)
+                self._scheduler.mark_recovery_transferred(
+                    request_id,
+                    detail=execution.detail or "expected reboot recovery failed closed",
+                )
+                self._record("expected-reboot-recovery-failed", request_id)
                 self._deliver_scheduled(event.work.session, execution)
                 return
             if execution.transport_status is not TransportStatus.COMPLETE:

@@ -341,6 +341,34 @@ def build_batch_channel_prefix(
     return SshInvocation("batch-channel-prefix", argv, False)
 
 
+def build_independent_boot_id_probe_invocation(
+    resolved: ResolvedSshEndpoint,
+    *,
+    ssh_path: os.PathLike[str] | str = DEFAULT_SSH_PATH,
+) -> SshInvocation:
+    """Build the fixed post-disconnect probe without any ControlMaster."""
+
+    if not isinstance(resolved, ResolvedSshEndpoint):
+        raise TypeError("resolved must be a ResolvedSshEndpoint")
+    identity_options = tuple(
+        "StrictHostKeyChecking=yes"
+        if option == "StrictHostKeyChecking=ask"
+        else option
+        for option in _identity_options(resolved, enrollment=False)
+    )
+    argv = (
+        _ssh_executable(ssh_path),
+        *identity_options,
+        "-o", "ClearAllForwardings=yes",
+        "-o", "ControlMaster=no",
+        "-o", "ControlPath=none",
+        "-o", "ControlPersist=no",
+        "-T", "--", resolved.ssh_profile,
+        "/bin/cat /proc/sys/kernel/random/boot_id",
+    )
+    return SshInvocation("independent-boot-id-probe", argv, False)
+
+
 def build_viewer_channel_prefix(
     resolved: ResolvedSshEndpoint,
     control_path: os.PathLike[str] | str,
@@ -503,6 +531,16 @@ class MasterTransportPool:
                 )
             )
 
+    def pinned_request_ids_for_machine(self, machine_name: str) -> tuple[str, ...]:
+        machine_name = validate_alias(machine_name, field_name="machine name")
+        with self._lock:
+            transport = self._transports.get(machine_name)
+            return (
+                ()
+                if transport is None
+                else tuple(sorted(transport.pinned_request_ids))
+            )
+
     @property
     def pinned_request_id(self) -> str | None:
         pinned = self.pinned_request_ids
@@ -645,6 +683,8 @@ class MasterTransportPool:
     def reconcile_startup(
         self,
         endpoints: Iterable[ResolvedSshEndpoint],
+        *,
+        protected_paths: Iterable[Path] = (),
     ) -> tuple[Path, ...]:
         """Retire only stale controls bound to current configured identities.
 
@@ -667,8 +707,20 @@ class MasterTransportPool:
                 )
             expected[path] = endpoint
 
+        protected = frozenset(protected_paths)
+        if any(
+            not isinstance(path, Path)
+            or not path.is_absolute()
+            or path.parent != self.control_dir
+            or _CONTROL_SOCKET_NAME_RE.fullmatch(path.name) is None
+            for path in protected
+        ):
+            raise TransportError("protected control path is outside the runtime root")
         entries = tuple(self.control_dir.iterdir())
         for entry in entries:
+            if entry in protected:
+                self._control_socket_present(entry)
+                continue
             if entry not in expected:
                 try:
                     self._control_socket_present(entry)
@@ -685,6 +737,8 @@ class MasterTransportPool:
 
         reconciled: list[Path] = []
         for path, endpoint in expected.items():
+            if path in protected:
+                continue
             if not path.exists() and not path.is_symlink():
                 continue
             try:
@@ -695,6 +749,66 @@ class MasterTransportPool:
                 ) from exc
             reconciled.append(path)
         return tuple(reconciled)
+
+    def expected_control_path(
+        self,
+        machine_name: str,
+        identity_sha256: str,
+    ) -> Path:
+        """Return the validated deterministic path for durable recovery binding."""
+
+        machine_name = validate_alias(machine_name, field_name="machine name")
+        if not isinstance(identity_sha256, str) or _DIGEST_RE.fullmatch(identity_sha256) is None:
+            raise TransportError("recovery identity digest is invalid")
+        return self._control_path(machine_name, identity_sha256)
+
+    def reconcile_verified_reboot(
+        self,
+        *,
+        machine_name: str,
+        request_id: str,
+        endpoint: ResolvedSshEndpoint,
+        expected_identity_sha256: str,
+    ) -> str:
+        """Idempotently retire an old master after reboot evidence is durable."""
+
+        machine_name = validate_alias(machine_name, field_name="machine name")
+        request_id = validate_request_id(request_id)
+        if endpoint.machine_name != machine_name:
+            raise TransportIdentityError("recovery endpoint belongs to another machine")
+        current, identity_digest = self._validated_current_identity(
+            TransportAuthorization(
+                request_id=request_id,
+                machine_name=machine_name,
+                endpoint_id=endpoint.endpoint_id,
+                connection_plan_sha256="0" * 64,
+                approval_binding_sha256="0" * 64,
+                resolved_identity_sha256=expected_identity_sha256,
+            ),
+            endpoint,
+        )
+        if identity_digest != expected_identity_sha256:
+            raise TransportIdentityError("recovery endpoint identity changed")
+        path = self._control_path(machine_name, identity_digest)
+        with self._lock:
+            retained = self._transports.get(machine_name)
+            if retained is not None:
+                if (
+                    retained.endpoint != current
+                    or retained.identity_sha256 != identity_digest
+                    or retained.control_path != path
+                ):
+                    raise TransportIdentityError(
+                        "retained recovery transport differs from durable evidence"
+                    )
+                if retained.pinned_request_ids:
+                    raise TransportBusyError(
+                        "verified reboot transport still has command pins"
+                    )
+                self._stop(retained)
+                return "retained_master_reconciled"
+            self._reconcile_unowned_control_path(current, path)
+            return "unowned_control_reconciled"
 
     def _stop(self, transport: MasterTransport) -> None:
         if transport.pinned_request_ids:

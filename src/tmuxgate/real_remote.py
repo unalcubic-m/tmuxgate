@@ -412,6 +412,7 @@ class RealRemoteJobBackend(RemoteJobBackend):
         )
 
     def observe(self, identity: RemoteJobIdentity) -> RemoteObservation:
+        self.channels.raise_automatic_secret_failure(identity.request_id)
         return self._parse_observation(self._batch(identity, "observe"))
 
     def release_gate(self, identity: RemoteJobIdentity) -> None:

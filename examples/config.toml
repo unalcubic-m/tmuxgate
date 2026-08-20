@@ -8,6 +8,7 @@ max_open_ssh_masters = 3
 max_pending_requests = 16
 queue_policy = "fifo"
 ssh_master_idle_timeout_seconds = 600
+reboot_recovery_timeout_seconds = 300
 approval_mode = "disabled"
 
 [mcp]

@@ -1,12 +1,14 @@
+import hashlib
 import io
 import socket
 import time
 import unittest
 
-from tmuxgate.models import PROTOCOL_VERSION
+from tmuxgate.models import PREVIOUS_PROTOCOL_VERSION, PROTOCOL_VERSION
 from tmuxgate.protocol import ProtocolError, send_frame
 from tmuxgate.result import (
     ExecutionResult,
+    ResultCode,
     TransportStatus,
     receive_result,
     relay_transparent,
@@ -19,6 +21,56 @@ REQUEST_ID = "0123456789abcdef0123456789abcdef"
 
 
 class ResultProtocolTests(unittest.TestCase):
+    def test_previous_protocol_result_decodes_without_a_result_code(self):
+        stdout = b"old protocol stdout\n"
+        stderr = b"old protocol stderr\n"
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        send_frame(
+            left,
+            {
+                "detail": None,
+                "protocol": PREVIOUS_PROTOCOL_VERSION,
+                "remote_exit_status": 7,
+                "request_id": REQUEST_ID,
+                "stderr_length": len(stderr),
+                "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+                "stdout_length": len(stdout),
+                "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+                "transport_status": "complete",
+                "type": "result-start",
+            },
+        )
+        for name, payload in (("stdout", stdout), ("stderr", stderr)):
+            send_frame(
+                left,
+                {
+                    "final": True,
+                    "offset": 0,
+                    "protocol": PREVIOUS_PROTOCOL_VERSION,
+                    "request_id": REQUEST_ID,
+                    "stream": name,
+                    "type": "result-stream",
+                },
+                payload,
+            )
+        send_frame(
+            left,
+            {
+                "protocol": PREVIOUS_PROTOCOL_VERSION,
+                "request_id": REQUEST_ID,
+                "type": "result-end",
+            },
+        )
+
+        result = receive_result(right, expected_request_id=REQUEST_ID)
+
+        self.assertEqual(result.transport_status, TransportStatus.COMPLETE)
+        self.assertEqual(result.remote_exit_status, 7)
+        self.assertEqual((result.stdout, result.stderr), (stdout, stderr))
+        self.assertIsNone(result.result_code)
+
     def test_exit_seven_and_streams_remain_separate(self):
         expected = ExecutionResult(
             REQUEST_ID,
@@ -102,6 +154,28 @@ class ResultProtocolTests(unittest.TestCase):
         self.assertEqual(result.transparent_exit_code(), 70)
         self.assertIsNone(result.remote_exit_status)
         self.assertIn(b'"transport_status":"remote_setup_failure"', result.structured_json())
+
+    def test_verified_reboot_is_truthful_and_has_a_stable_result_code(self):
+        result = ExecutionResult(
+            REQUEST_ID,
+            TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT,
+            detail="host boot identity changed after the expected disconnect",
+            result_code=ResultCode.ABANDONED_AFTER_VERIFIED_REBOOT,
+        )
+        self.assertIsNone(result.remote_exit_status)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        self.assertIn(
+            b'"result_code":"abandoned_after_verified_reboot"',
+            result.structured_json(),
+        )
+        with self.assertRaisesRegex(ValueError, "cannot claim command output"):
+            ExecutionResult(
+                REQUEST_ID,
+                TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT,
+                stdout=b"invented",
+                result_code=ResultCode.ABANDONED_AFTER_VERIFIED_REBOOT,
+            )
 
     def test_result_write_timeout_rejects_nonfinite_values(self):
         result = ExecutionResult(
