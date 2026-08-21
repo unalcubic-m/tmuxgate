@@ -25,8 +25,9 @@ from tmuxgate.runtime import PRIVATE_DIRECTORY_MODE, ensure_private_directory
 from tmuxgate.scheduler import ApprovalDecision, RequestState
 
 
-STATE_FORMAT_VERSION = 3
-PREVIOUS_STATE_FORMAT_VERSION = 2
+STATE_FORMAT_VERSION = 4
+PREVIOUS_STATE_FORMAT_VERSION = 3
+LEGACY_STATE_FORMAT_VERSIONS = frozenset({2, 3})
 STATE_FILE_MODE = 0o600
 STATE_JOBS_DIRECTORY_NAME = "jobs"
 MAX_STATE_FILE_BYTES = 1024 * 1024
@@ -55,6 +56,7 @@ _OPERATOR_ABANDONED_STATES = frozenset(
     {
         RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
         RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE,
+        RequestState.ABANDONED_AFTER_OPERATOR_ACKNOWLEDGED_UNCERTAINTY,
     }
 )
 _AUTOMATIC_ABANDONED_STATES = frozenset(
@@ -161,6 +163,49 @@ class RebootRecoveryPhase(StrEnum):
     VERIFIED_CHANGED_BOOT = "verified_changed_boot"
     CLEANUP_COMPLETE = "cleanup_complete"
     FAILED = "failed"
+
+
+class RemotePhase(StrEnum):
+    """Last fsynced fact in the ordinary remote-command lifecycle.
+
+    ``REMOTE_WRAPPER_REQUESTED`` is deliberately additional to the public
+    milestone list. It closes the crash window between asking the host to
+    create the gated wrapper and recording that the wrapper was observed.
+    """
+
+    NOT_ATTEMPTED = "not_attempted"
+    CONNECTION_ATTEMPTED = "connection_attempted"
+    STAGING_REQUESTED = "staging_requested"
+    STAGING_VERIFIED = "staging_verified"
+    REMOTE_WRAPPER_REQUESTED = "remote_wrapper_requested"
+    REMOTE_WRAPPER_CREATED = "remote_wrapper_created"
+    USER_COMMAND_STARTED = "user_command_started"
+    RESULT_SPOOL_FINALIZED = "result_spool_finalized"
+    RESULT_SPOOL_LOCALLY_VERIFIED = "result_spool_locally_verified"
+    CLEANUP_COMPLETED = "cleanup_completed"
+    LEGACY_UNCERTAIN = "legacy_uncertain"
+
+
+_REMOTE_PHASE_RANK = {
+    RemotePhase.NOT_ATTEMPTED: 0,
+    RemotePhase.CONNECTION_ATTEMPTED: 1,
+    RemotePhase.STAGING_REQUESTED: 2,
+    RemotePhase.STAGING_VERIFIED: 3,
+    RemotePhase.REMOTE_WRAPPER_REQUESTED: 4,
+    RemotePhase.REMOTE_WRAPPER_CREATED: 5,
+    RemotePhase.USER_COMMAND_STARTED: 6,
+    RemotePhase.RESULT_SPOOL_FINALIZED: 7,
+    RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED: 8,
+    RemotePhase.CLEANUP_COMPLETED: 9,
+}
+
+
+def remote_phase_at_least(phase: RemotePhase, expected: RemotePhase) -> bool:
+    """Compare current-format phases while keeping legacy uncertainty opaque."""
+
+    if phase is RemotePhase.LEGACY_UNCERTAIN:
+        return False
+    return _REMOTE_PHASE_RANK[phase] >= _REMOTE_PHASE_RANK[expected]
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,6 +455,7 @@ class DurableJobRecord:
     resolved_identity_sha256: str | None = None
     disconnect_policy: DisconnectPolicy = DisconnectPolicy.NORMAL
     reboot_recovery: RebootRecoveryEvidence | None = None
+    remote_phase: RemotePhase = RemotePhase.NOT_ATTEMPTED
     record_version: int = STATE_FORMAT_VERSION
 
     def __post_init__(self) -> None:
@@ -422,9 +468,8 @@ class DurableJobRecord:
         object.__setattr__(self, "machine_alias", machine_alias)
         if type(self.generation) is not int or self.generation < 1:
             raise StateCorruptionError("generation must be a positive integer")
-        if self.record_version not in {
-            PREVIOUS_STATE_FORMAT_VERSION,
-            STATE_FORMAT_VERSION,
+        if self.record_version not in LEGACY_STATE_FORMAT_VERSIONS | {
+            STATE_FORMAT_VERSION
         }:
             raise StateCorruptionError("unsupported state record version")
         _validate_digest(self.client_request_sha256, "client_request_sha256")
@@ -441,12 +486,27 @@ class DurableJobRecord:
         except (TypeError, ValueError) as exc:
             raise StateCorruptionError("disconnect policy is invalid") from exc
         object.__setattr__(self, "disconnect_policy", disconnect_policy)
-        if self.record_version == PREVIOUS_STATE_FORMAT_VERSION and (
+        if self.record_version == 2 and (
             disconnect_policy is not DisconnectPolicy.NORMAL
             or self.resolved_identity_sha256 is not None
             or self.reboot_recovery is not None
         ):
             raise StateCorruptionError("legacy state cannot claim reboot recovery evidence")
+        try:
+            remote_phase = RemotePhase(self.remote_phase)
+        except (TypeError, ValueError) as exc:
+            raise StateCorruptionError("remote phase is invalid") from exc
+        object.__setattr__(self, "remote_phase", remote_phase)
+        if self.record_version in LEGACY_STATE_FORMAT_VERSIONS:
+            expected_legacy_phase = (
+                RemotePhase.LEGACY_UNCERTAIN
+                if self.remote_mutation_started
+                else RemotePhase.NOT_ATTEMPTED
+            )
+            if remote_phase is not expected_legacy_phase:
+                raise StateCorruptionError("legacy state claims a current remote phase")
+        elif remote_phase is RemotePhase.LEGACY_UNCERTAIN:
+            raise StateCorruptionError("current state cannot claim a legacy remote phase")
         if self.endpoint_id is not None and (
             not isinstance(self.endpoint_id, str)
             or _ENDPOINT_ID_RE.fullmatch(self.endpoint_id) is None
@@ -519,8 +579,52 @@ class DurableJobRecord:
             optional=True,
         )
 
-        if state in _REMOTE_MUTATION_STATES and not self.remote_mutation_started:
+        if (
+            self.record_version in LEGACY_STATE_FORMAT_VERSIONS
+            and state in _REMOTE_MUTATION_STATES
+            and not self.remote_mutation_started
+        ):
             raise StateCorruptionError("remote lifecycle state lacks mutation boundary")
+        if (
+            self.record_version == STATE_FORMAT_VERSION
+            and remote_phase_at_least(remote_phase, RemotePhase.USER_COMMAND_STARTED)
+            and not self.remote_mutation_started
+        ):
+            raise StateCorruptionError("command-start phase lacks mutation boundary")
+        if (
+            self.record_version == STATE_FORMAT_VERSION
+            and self.remote_mutation_started
+            and state not in {
+                RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
+                RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+                RequestState.FAILED_REMOTE_SETUP,
+            }
+            and not remote_phase_at_least(
+                remote_phase, RemotePhase.USER_COMMAND_STARTED
+            )
+        ):
+            raise StateCorruptionError("mutation boundary precedes command-start phase")
+        if (
+            self.record_version == STATE_FORMAT_VERSION
+            and state is RequestState.REMOTE_MAY_BE_RUNNING
+            and not remote_phase_at_least(
+                remote_phase, RemotePhase.USER_COMMAND_STARTED
+            )
+        ):
+            raise StateCorruptionError("remote state lacks mutation boundary")
+        if (
+            self.record_version == STATE_FORMAT_VERSION
+            and state is RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING
+            and remote_phase not in {
+                RemotePhase.REMOTE_WRAPPER_REQUESTED,
+                RemotePhase.REMOTE_WRAPPER_CREATED,
+                RemotePhase.USER_COMMAND_STARTED,
+                RemotePhase.RESULT_SPOOL_FINALIZED,
+                RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED,
+                RemotePhase.CLEANUP_COMPLETED,
+            }
+        ):
+            raise StateCorruptionError("recovery state lacks a remote uncertainty phase")
         if state in {
             RequestState.APPROVED_PRE_REMOTE,
             RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
@@ -533,6 +637,7 @@ class DurableJobRecord:
             RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
             RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
             RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE,
+            RequestState.ABANDONED_AFTER_OPERATOR_ACKNOWLEDGED_UNCERTAINTY,
             RequestState.ABANDONED_AFTER_PROVEN_UNSTARTED,
             RequestState.COMPLETION_PROVEN,
             RequestState.LOCAL_SPOOL_VERIFIED,
@@ -556,6 +661,7 @@ class DurableJobRecord:
             RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
             RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
             RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE,
+            RequestState.ABANDONED_AFTER_OPERATOR_ACKNOWLEDGED_UNCERTAINTY,
             RequestState.ABANDONED_AFTER_PROVEN_UNSTARTED,
             RequestState.COMPLETION_PROVEN,
             RequestState.LOCAL_SPOOL_VERIFIED,
@@ -574,6 +680,22 @@ class DurableJobRecord:
         if state in {RequestState.COMPLETION_PROVEN, RequestState.LOCAL_SPOOL_VERIFIED}:
             if self.exit_status is None or self.completion_time is None:
                 raise StateCorruptionError("proven completion lacks time or exit status")
+        if self.record_version == STATE_FORMAT_VERSION:
+            if (
+                state is RequestState.COMPLETION_PROVEN
+                and remote_phase is not RemotePhase.RESULT_SPOOL_FINALIZED
+            ):
+                raise StateCorruptionError("completion state lacks finalized spool phase")
+            if (
+                state is RequestState.LOCAL_SPOOL_VERIFIED
+                and remote_phase not in {
+                    RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED,
+                    RemotePhase.CLEANUP_COMPLETED,
+                }
+            ):
+                raise StateCorruptionError(
+                    "local spool state lacks local verification phase"
+                )
         if state in _ABANDONED_STATES:
             if self.failure_detail is None:
                 raise StateCorruptionError(
@@ -620,6 +742,14 @@ class DurableJobRecord:
             and self.terminal_restored
         ):
             raise StateCorruptionError("released remote job lacks every completion gate")
+        if (
+            self.record_version == STATE_FORMAT_VERSION
+            and remote_phase_at_least(
+                remote_phase, RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED
+            )
+            and not self.local_spool_verified
+        ):
+            raise StateCorruptionError("local verification phase lacks verified spool")
 
         reboot = self.reboot_recovery
         if reboot is not None and not isinstance(reboot, RebootRecoveryEvidence):
@@ -633,7 +763,7 @@ class DurableJobRecord:
             }:
                 raise StateCorruptionError("normal disconnect policy claims reboot recovery")
         else:
-            if self.record_version != STATE_FORMAT_VERSION:
+            if self.record_version == 2:
                 raise StateCorruptionError("expected reboot requires current durable state")
             if state in _REMOTE_STARTED_STATES and reboot is None:
                 raise StateCorruptionError("expected reboot remote state lacks pre-boot evidence")
@@ -713,6 +843,19 @@ class DurableJobRecord:
                         else self.reboot_recovery.payload_document()
                     ),
                     "resolved_identity_sha256": self.resolved_identity_sha256,
+                    "remote_phase": self.remote_phase.value,
+                }
+            )
+        elif self.record_version == 3:
+            document.update(
+                {
+                    "disconnect_policy": self.disconnect_policy.value,
+                    "reboot_recovery": (
+                        None
+                        if self.reboot_recovery is None
+                        else self.reboot_recovery.payload_document()
+                    ),
+                    "resolved_identity_sha256": self.resolved_identity_sha256,
                 }
             )
         return document
@@ -736,9 +879,18 @@ class DurableJobRecord:
                     "disconnect_policy",
                     "reboot_recovery",
                     "resolved_identity_sha256",
+                    "remote_phase",
                 }
             )
-        elif version != PREVIOUS_STATE_FORMAT_VERSION:
+        elif version == 3:
+            expected.update(
+                {
+                    "disconnect_policy",
+                    "reboot_recovery",
+                    "resolved_identity_sha256",
+                }
+            )
+        elif version != 2:
             raise StateCorruptionError("unsupported state record version")
         if set(payload) != expected:
             raise StateCorruptionError("state payload fields are not exactly recognized")
@@ -770,19 +922,26 @@ class DurableJobRecord:
             failure_detail=payload["failure_detail"],
             resolved_identity_sha256=(
                 payload["resolved_identity_sha256"]
-                if version == STATE_FORMAT_VERSION
+                if version in {3, STATE_FORMAT_VERSION}
                 else None
             ),
             disconnect_policy=(
                 payload["disconnect_policy"]
-                if version == STATE_FORMAT_VERSION
+                if version in {3, STATE_FORMAT_VERSION}
                 else DisconnectPolicy.NORMAL
             ),
             reboot_recovery=(
                 None
-                if version != STATE_FORMAT_VERSION
+                if version not in {3, STATE_FORMAT_VERSION}
                 or payload["reboot_recovery"] is None
                 else RebootRecoveryEvidence.from_payload(payload["reboot_recovery"])
+            ),
+            remote_phase=(
+                payload["remote_phase"]
+                if version == STATE_FORMAT_VERSION
+                else RemotePhase.LEGACY_UNCERTAIN
+                if payload["remote_mutation_started"]
+                else RemotePhase.NOT_ATTEMPTED
             ),
             record_version=version,
         )
@@ -803,6 +962,7 @@ class StartupRecoveryReport:
     safe_to_accept_new_approvals: bool
     blocking_machine_aliases: tuple[str, ...] = ()
     expected_reboot_request_ids: tuple[str, ...] = ()
+    automatic_recovery_request_ids: tuple[str, ...] = ()
 
 
 class DurableStateStore:
@@ -1075,6 +1235,186 @@ class DurableStateStore:
         self.write(retargeted)
         return retargeted
 
+    def mark_remote_connection_attempted(
+        self,
+        record: DurableJobRecord,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Fsync that the approved endpoint may have received an SSH attempt."""
+
+        if record.record_version != STATE_FORMAT_VERSION:
+            raise StateConflictError("atomic remote phases require current durable state")
+        if record.state not in {
+            RequestState.APPROVED_PRE_REMOTE,
+            RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+        }:
+            raise StateConflictError("connection attempt requires approved setup")
+        if record.remote_phase is RemotePhase.CONNECTION_ATTEMPTED:
+            return record
+        if record.remote_phase is not RemotePhase.NOT_ATTEMPTED:
+            raise StateConflictError("connection attempt is out of order")
+        attempted = replace(
+            record,
+            generation=record.generation + 1,
+            updated_at=now(),
+            remote_phase=RemotePhase.CONNECTION_ATTEMPTED,
+        )
+        self.write(attempted)
+        return attempted
+
+    def upgrade_legacy_remote_observation(
+        self,
+        record: DurableJobRecord,
+        *,
+        observed_phase: RemotePhase,
+        detail: str,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Upgrade only positive authenticated legacy remote evidence.
+
+        A legacy broad mutation bit cannot prove a narrower phase on its own.
+        An exact gated session does prove wrapper creation, while a released
+        gate, running command, or authenticated complete spool proves command
+        start. Missing remote artifacts are intentionally not accepted here.
+        """
+
+        if (
+            record.record_version not in LEGACY_STATE_FORMAT_VERSIONS
+            or record.remote_phase is not RemotePhase.LEGACY_UNCERTAIN
+            or record.state is not RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING
+            or observed_phase not in {
+                RemotePhase.REMOTE_WRAPPER_CREATED,
+                RemotePhase.USER_COMMAND_STARTED,
+            }
+        ):
+            raise StateConflictError(
+                "legacy phase upgrade requires positive exact-job recovery evidence"
+            )
+        _validate_text(detail, "legacy phase upgrade detail")
+        upgraded = replace(
+            record,
+            generation=record.generation + 1,
+            record_version=STATE_FORMAT_VERSION,
+            updated_at=now(),
+            remote_mutation_started=(
+                observed_phase is RemotePhase.USER_COMMAND_STARTED
+            ),
+            remote_phase=observed_phase,
+            failure_detail=detail,
+        )
+        self.write(upgraded)
+        return upgraded
+
+    def request_remote_staging(
+        self,
+        record: DurableJobRecord,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> tuple[DurableJobRecord, RemoteStartPermit]:
+        """Fsync immediately before the first remote staging request."""
+
+        if record.state not in {
+            RequestState.APPROVED_PRE_REMOTE,
+            RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+        } or record.remote_phase is not RemotePhase.CONNECTION_ATTEMPTED:
+            raise StateConflictError("staging requires an attempted approved connection")
+        staged = replace(
+            record,
+            generation=record.generation + 1,
+            updated_at=now(),
+            remote_phase=RemotePhase.STAGING_REQUESTED,
+        )
+        self.write(staged)
+        digest = _sha256_document(staged.payload_document())
+        return staged, RemoteStartPermit(staged.request_id, staged.generation, digest)
+
+    def mark_remote_staging_verified(
+        self,
+        record: DurableJobRecord,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        if record.remote_phase is not RemotePhase.STAGING_REQUESTED:
+            raise StateConflictError("staging verification lacks a staging request")
+        verified = replace(
+            record,
+            generation=record.generation + 1,
+            updated_at=now(),
+            remote_phase=RemotePhase.STAGING_VERIFIED,
+        )
+        self.write(verified)
+        return verified
+
+    def request_remote_wrapper(
+        self,
+        record: DurableJobRecord,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        if record.remote_phase is not RemotePhase.STAGING_VERIFIED:
+            raise StateConflictError("wrapper creation requires verified staging")
+        requested = replace(
+            record,
+            generation=record.generation + 1,
+            updated_at=now(),
+            remote_phase=RemotePhase.REMOTE_WRAPPER_REQUESTED,
+        )
+        self.write(requested)
+        return requested
+
+    def mark_remote_wrapper_created(
+        self,
+        record: DurableJobRecord,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        if record.remote_phase is not RemotePhase.REMOTE_WRAPPER_REQUESTED:
+            raise StateConflictError("wrapper verification lacks a creation request")
+        created = replace(
+            record,
+            generation=record.generation + 1,
+            updated_at=now(),
+            remote_phase=RemotePhase.REMOTE_WRAPPER_CREATED,
+        )
+        self.write(created)
+        return created
+
+    def mark_user_command_started(
+        self,
+        record: DurableJobRecord,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Record only an observed release of the remote command-start gate."""
+
+        if record.remote_phase is not RemotePhase.REMOTE_WRAPPER_CREATED:
+            raise StateConflictError("command start requires a verified remote wrapper")
+        timestamp = now()
+        reboot = record.reboot_recovery
+        if record.disconnect_policy is DisconnectPolicy.EXPECT_FULL_REBOOT:
+            if reboot is None:
+                raise StateConflictError(
+                    "expected reboot start requires durable pre-boot evidence"
+                )
+            reboot = replace(
+                reboot,
+                remote_start_time=record.start_time or timestamp,
+                remote_start_generation=record.generation + 1,
+            )
+        started = replace(
+            record,
+            generation=record.generation + 1,
+            state=RequestState.REMOTE_MAY_BE_RUNNING,
+            remote_mutation_started=True,
+            start_time=record.start_time or timestamp,
+            updated_at=timestamp,
+            reboot_recovery=reboot,
+            remote_phase=RemotePhase.USER_COMMAND_STARTED,
+        )
+        self.write(started)
+        return started
+
     def arm_remote_start(
         self,
         record: DurableJobRecord,
@@ -1114,6 +1454,7 @@ class DurableStateStore:
             start_time=record.start_time or timestamp,
             updated_at=timestamp,
             reboot_recovery=reboot,
+            remote_phase=RemotePhase.USER_COMMAND_STARTED,
         )
         self.write(armed)
         payload_digest = _sha256_document(armed.payload_document())
@@ -1483,6 +1824,15 @@ class DurableStateStore:
     ) -> DurableJobRecord:
         if record.state is not RequestState.APPROVED_PRE_REMOTE:
             raise StateConflictError("pre-remote failure requires approved-pre-remote state")
+        if record.record_version == STATE_FORMAT_VERSION and record.remote_phase in {
+            RemotePhase.REMOTE_WRAPPER_REQUESTED,
+            RemotePhase.REMOTE_WRAPPER_CREATED,
+            RemotePhase.USER_COMMAND_STARTED,
+            RemotePhase.RESULT_SPOOL_FINALIZED,
+            RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED,
+            RemotePhase.CLEANUP_COMPLETED,
+        }:
+            raise StateConflictError("pre-remote failure cannot discard wrapper uncertainty")
         if not isinstance(detail, str) or not detail or "\x00" in detail:
             raise ValueError("failure detail must be non-empty text without NUL")
         timestamp = now()
@@ -1496,6 +1846,41 @@ class DurableStateStore:
         self.write(failed)
         return failed
 
+    def fail_before_command_after_verified_observation(
+        self,
+        record: DurableJobRecord,
+        *,
+        detail: str,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Terminalize only after an authenticated exact-job unstarted proof."""
+
+        if (
+            record.record_version != STATE_FORMAT_VERSION
+            or record.state not in {
+                RequestState.APPROVED_PRE_REMOTE,
+                RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+            }
+            or record.remote_phase not in {
+                RemotePhase.REMOTE_WRAPPER_REQUESTED,
+                RemotePhase.REMOTE_WRAPPER_CREATED,
+            }
+            or record.remote_mutation_started
+        ):
+            raise StateConflictError(
+                "verified pre-command failure requires current wrapper uncertainty"
+            )
+        _validate_text(detail, "verified pre-command failure detail")
+        failed = replace(
+            record,
+            generation=record.generation + 1,
+            state=RequestState.FAILED_PRE_REMOTE,
+            updated_at=now(),
+            failure_detail=detail,
+        )
+        self.write(failed)
+        return failed
+
     def mark_recovery_required(
         self,
         record: DurableJobRecord,
@@ -1504,10 +1889,19 @@ class DurableStateStore:
         now: Callable[[], str] = utc_now,
     ) -> DurableJobRecord:
         if record.state not in {
+            RequestState.APPROVED_PRE_REMOTE,
             RequestState.REMOTE_MAY_BE_RUNNING,
             RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
         }:
             raise StateConflictError("recovery requires a possibly-running state")
+        if (
+            record.state is RequestState.APPROVED_PRE_REMOTE
+            and record.remote_phase not in {
+                RemotePhase.REMOTE_WRAPPER_REQUESTED,
+                RemotePhase.REMOTE_WRAPPER_CREATED,
+            }
+        ):
+            raise StateConflictError("pre-start recovery requires wrapper uncertainty")
         if not isinstance(detail, str) or not detail or "\x00" in detail:
             raise ValueError("recovery detail must be non-empty text without NUL")
         timestamp = now()
@@ -1657,6 +2051,54 @@ class DurableStateStore:
         self.write(abandoned)
         return abandoned
 
+    def mark_abandoned_after_operator_acknowledged_uncertainty(
+        self,
+        record: DurableJobRecord,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """One-action local abandonment for irreducible remote uncertainty.
+
+        This never contacts or deletes the remote identity and never records an
+        exit status, output, result spool, or assertion that the command ended.
+        """
+
+        if (
+            record.disconnect_policy is not DisconnectPolicy.NORMAL
+            or record.state is not RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING
+            or any(
+                (
+                    record.completion_time is not None,
+                    record.exit_status is not None,
+                    record.local_spool_verified,
+                    record.local_spool_manifest_sha256 is not None,
+                    record.viewer_detached,
+                    record.terminal_restored,
+                )
+            )
+        ):
+            raise StateConflictError(
+                "uncertainty acknowledgement requires an unproven normal remote job"
+            )
+        timestamp = now()
+        evidence = record.failure_detail or (
+            "remote execution has no authoritative completion or termination evidence"
+        )
+        abandoned = replace(
+            record,
+            generation=record.generation + 1,
+            state=RequestState.ABANDONED_AFTER_OPERATOR_ACKNOWLEDGED_UNCERTAINTY,
+            updated_at=timestamp,
+            failure_detail=(
+                f"{evidence}; controlling-terminal operator used the single TUI "
+                "uncertainty action to unblock local scheduling; no remote cleanup "
+                "was attempted and no completion, exit status, output, result spool, "
+                "or remote absence is claimed"
+            ),
+        )
+        self.write(abandoned)
+        return abandoned
+
     def mark_abandoned_after_proven_unstarted(
         self,
         record: DurableJobRecord,
@@ -1745,6 +2187,11 @@ class DurableStateStore:
             completion_time=timestamp,
             exit_status=exit_status,
             failure_detail=None,
+            remote_phase=(
+                RemotePhase.RESULT_SPOOL_FINALIZED
+                if record.record_version == STATE_FORMAT_VERSION
+                else record.remote_phase
+            ),
         )
         self.write(completed)
         return completed
@@ -1814,9 +2261,37 @@ class DurableStateStore:
             updated_at=timestamp,
             local_spool_verified=True,
             local_spool_manifest_sha256=manifest_sha256,
+            remote_phase=(
+                RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED
+                if record.record_version == STATE_FORMAT_VERSION
+                else record.remote_phase
+            ),
         )
         self.write(verified)
         return verified
+
+    def mark_remote_cleanup_completed(
+        self,
+        record: DurableJobRecord,
+        *,
+        now: Callable[[], str] = utc_now,
+    ) -> DurableJobRecord:
+        """Record exact, idempotent cleanup only after local spool verification."""
+
+        if record.record_version != STATE_FORMAT_VERSION:
+            raise StateConflictError("legacy cleanup evidence cannot be upgraded in place")
+        if record.remote_phase is RemotePhase.CLEANUP_COMPLETED:
+            return record
+        if record.remote_phase is not RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED:
+            raise StateConflictError("cleanup requires a locally verified result spool")
+        cleaned = replace(
+            record,
+            generation=record.generation + 1,
+            updated_at=now(),
+            remote_phase=RemotePhase.CLEANUP_COMPLETED,
+        )
+        self.write(cleaned)
+        return cleaned
 
     def release_lease(
         self,
@@ -1939,6 +2414,27 @@ def recover_startup(
     records = list(store.load_all())
     interrupted: list[str] = []
     for index, record in enumerate(records):
+        if (
+            record.record_version == STATE_FORMAT_VERSION
+            and record.state in {
+                RequestState.APPROVED_PRE_REMOTE,
+                RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
+            }
+            and record.remote_phase in {
+                RemotePhase.REMOTE_WRAPPER_REQUESTED,
+                RemotePhase.REMOTE_WRAPPER_CREATED,
+            }
+        ):
+            records[index] = store.mark_recovery_required(
+                record,
+                detail=(
+                    "broker restarted after durable phase "
+                    f"{record.remote_phase.value}; exact remote evidence must be "
+                    "reconciled automatically"
+                ),
+                now=now,
+            )
+            continue
         if record.state in {
             RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
             RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
@@ -1996,4 +2492,17 @@ def recover_startup(
             sorted({record.machine_alias for record in blocking_records})
         ),
         expected_reboot_request_ids=expected_reboot,
+        automatic_recovery_request_ids=tuple(
+            record.request_id
+            for record in records
+            if (
+                record.state in _REMOTE_ACTIVE_STATES
+                and record.disconnect_policy is DisconnectPolicy.NORMAL
+            )
+            or (
+                record.record_version == STATE_FORMAT_VERSION
+                and record.remote_phase
+                is RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED
+            )
+        ),
     )

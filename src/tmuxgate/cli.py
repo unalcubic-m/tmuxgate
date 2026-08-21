@@ -773,6 +773,7 @@ def _job_document(record: object) -> dict[str, object]:
         "local_spool_verified": record.local_spool_verified,
         "machine": record.machine_alias,
         "remote_mutation_started": record.remote_mutation_started,
+        "remote_phase": record.remote_phase.value,
         "remote_job_path": record.remote_job_path,
         "remote_tmux_session": record.remote_tmux_session,
         "request_id": record.request_id,
@@ -1131,6 +1132,7 @@ def _attach_local_viewer(args: argparse.Namespace) -> int:
     if not record.remote_mutation_started or record.state in {
         RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
         RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE,
+        RequestState.ABANDONED_AFTER_OPERATOR_ACKNOWLEDGED_UNCERTAINTY,
         RequestState.DONE,
     }:
         raise StateConflictError("request has no attachable active viewer")

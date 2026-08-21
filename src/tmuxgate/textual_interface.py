@@ -201,6 +201,8 @@ class DashboardJob:
     state: str
     updated_at: str
     active: bool
+    manual_action_required: bool = False
+    recovery_evidence: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +217,7 @@ class DashboardRuntimeSnapshot:
 
 
 DashboardProvider = Callable[[], DashboardRuntimeSnapshot]
+RecoveryAcknowledger = Callable[[str], str]
 
 
 class TerminalOwnershipState(StrEnum):
@@ -1165,6 +1168,62 @@ class SudoCredentialScreen(ModalScreen[SudoCredentialAction | None]):
 
 
 
+class UncertainRemoteJobScreen(ModalScreen[bool]):
+    """One explicit local-only decision for irreducible remote uncertainty."""
+
+    CSS = """
+    UncertainRemoteJobScreen { align: center middle; background: $background 80%; }
+    #uncertain-dialog {
+        width: 100%; max-width: 105; height: 100%;
+        border: heavy $error; background: $surface; padding: 1 2;
+    }
+    #uncertain-evidence { height: 1fr; overflow-y: auto; padding: 1; }
+    #uncertain-actions { height: 3; align-horizontal: right; }
+    #uncertain-actions Button { margin-left: 1; min-width: 22; }
+    """
+    BINDINGS = [Binding("escape", "cancel", "Keep blocked", priority=True)]
+
+    def __init__(self, job: DashboardJob) -> None:
+        super().__init__()
+        self.job = job
+
+    def compose(self) -> ComposeResult:
+        document = "\n".join(
+            (
+                "Irreducible remote-execution uncertainty",
+                "",
+                "Request: " + inert_text(self.job.request_id),
+                "Machine: " + inert_text(self.job.machine_alias),
+                "Durable state: " + inert_text(self.job.state),
+                "Evidence: " + inert_text(self.job.recovery_evidence),
+                "",
+                "Automatic recovery cannot prove a remote result or an "
+                "authoritative termination. Acknowledge and unblock changes "
+                "only the local durable record. It does not contact or clean "
+                "the remote host and does not claim an exit status, output, "
+                "completion, or remote absence.",
+            )
+        )
+        with Vertical(id="uncertain-dialog"):
+            yield Static(document, markup=False, id="uncertain-evidence")
+            with Horizontal(id="uncertain-actions"):
+                yield Button("Keep blocked", id="uncertain-cancel", variant="primary")
+                yield Button(
+                    "Acknowledge & unblock",
+                    id="uncertain-confirm",
+                    variant="warning",
+                )
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "uncertain-confirm":
+            self.dismiss(True)
+        elif event.button.id == "uncertain-cancel":
+            self.dismiss(False)
+
+
 class TmuxgateDashboardApp(App[None]):
     """Bounded dashboard with one request-bound approval modal at a time."""
 
@@ -1233,6 +1292,13 @@ class TmuxgateDashboardApp(App[None]):
                     classes="panel",
                     id="jobs-content",
                 )
+                with Horizontal(classes="dashboard-actions"):
+                    yield Button(
+                        "No recovery action required",
+                        id="recovery-action",
+                        variant="warning",
+                        disabled=True,
+                    )
             with TabPane("Machines", id="machines"):
                 yield Static(
                     "No configured machines.",
@@ -1321,6 +1387,25 @@ class TmuxgateDashboardApp(App[None]):
             enabled = self.interface.approval_mode != "disabled"
             self.interface.set_automation_enabled(enabled)
             self.refresh_snapshot()
+            return
+        if event.button.id == "recovery-action":
+            job = next(
+                (
+                    item
+                    for item in self.interface.dashboard_snapshot(self.config).jobs
+                    if item.manual_action_required
+                ),
+                None,
+            )
+            if job is None or not self.interface.recovery_action_available:
+                return
+
+            def complete(confirmed: bool | None) -> None:
+                if confirmed:
+                    self.interface.acknowledge_recovery_uncertainty(job.request_id)
+                    self.refresh_snapshot()
+
+            self.push_screen(UncertainRemoteJobScreen(job), complete)
             return
         if event.button.id != "credential-manage":
             return
@@ -1530,11 +1615,20 @@ class TmuxgateDashboardApp(App[None]):
         lines.extend(
             f"{inert_text(job.request_id):32}  "
             f"{inert_text(job.machine_alias):17}  {inert_text(job.state)}"
+            + ("  ACTION REQUIRED" if job.manual_action_required else "")
             for job in bounded
         )
         if not bounded:
             lines.append("No durable jobs.")
         self.query_one("#jobs-content", Static).update(self._text(lines))
+        action = self.query_one("#recovery-action", Button)
+        manual = next((job for job in bounded if job.manual_action_required), None)
+        action.disabled = manual is None or not self.interface.recovery_action_available
+        action.label = (
+            "No recovery action required"
+            if manual is None
+            else "Resolve uncertainty: " + manual.request_id[:8]
+        )
 
     def _render_machines(self, machines: tuple[DashboardMachine, ...]) -> None:
         bounded = machines[:MAX_DASHBOARD_MACHINES]
@@ -1632,6 +1726,7 @@ class TextualOperatorInterface(PlainTerminalInterface):
         self._pending_prompt_count = 0
         self._submitted_sequence = 0
         self._dashboard_provider: DashboardProvider | None = None
+        self._recovery_acknowledger: RecoveryAcknowledger | None = None
         self.credential_store = credential_store
         self._automation_setter: Callable[[bool], str] | None = None
         self._app_factory = app_factory
@@ -1839,6 +1934,22 @@ class TextualOperatorInterface(PlainTerminalInterface):
         if self._dashboard_provider is not None:
             raise OperatorInterfaceError("dashboard provider is already bound")
         self._dashboard_provider = provider
+
+    @property
+    def recovery_action_available(self) -> bool:
+        return self._recovery_acknowledger is not None
+
+    def bind_recovery_acknowledger(self, acknowledger: RecoveryAcknowledger) -> None:
+        if not callable(acknowledger):
+            raise TypeError("recovery acknowledger must be callable")
+        if self._recovery_acknowledger is not None:
+            raise OperatorInterfaceError("recovery acknowledger is already bound")
+        self._recovery_acknowledger = acknowledger
+
+    def acknowledge_recovery_uncertainty(self, request_id: str) -> str:
+        if self._recovery_acknowledger is None:
+            raise OperatorInterfaceError("recovery acknowledgement is unavailable")
+        return self._recovery_acknowledger(request_id)
 
     def dashboard_snapshot(self, config: object) -> DashboardRuntimeSnapshot:
         if self._dashboard_provider is not None:

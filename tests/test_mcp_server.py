@@ -40,7 +40,7 @@ from tmuxgate.protocol import MAX_HEADER_BYTES
 from tmuxgate.runtime import create_broker_socket
 from tmuxgate.scheduler import RequestState
 from tmuxgate.spool import ResultSpool
-from tmuxgate.state import DurableJobRecord, DurableStateStore
+from tmuxgate.state import DurableJobRecord, DurableStateStore, RemotePhase
 
 
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
@@ -72,6 +72,7 @@ def completed_record(manifest_sha256: str) -> DurableJobRecord:
         remote_mutation_started=True,
         local_spool_verified=True,
         local_spool_manifest_sha256=manifest_sha256,
+        remote_phase=RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED,
     )
 
 

@@ -211,6 +211,48 @@ class InteractiveHandoffScopeTests(unittest.TestCase):
                     listener.close()
                     self.assertTrue(presenter.close())
 
+    def test_recovery_adopts_only_the_exact_live_private_viewer_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "viewer.sock"
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(os.fspath(socket_path))
+            os.chmod(socket_path, 0o600)
+            calls = []
+
+            def run(argv, **kwargs):
+                calls.append(argv)
+                self.assertEqual(argv[-3:], ("has-session", "-t", "tmuxgate-bbbbbbbbbbbb"))
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+            try:
+                viewer = SshChannelRunner(runner=run).detached_viewer(
+                    ("ssh", "host"),
+                    socket_path=socket_path,
+                    session_name="tmuxgate-bbbbbbbbbbbb",
+                    adopt_existing=True,
+                )
+                self.assertTrue(viewer.attached)
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(socket_path.exists())
+            finally:
+                listener.close()
+
+    def test_recovery_never_adopts_a_non_socket_viewer_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "viewer.sock"
+            socket_path.write_bytes(b"preserve")
+            socket_path.chmod(0o600)
+
+            with self.assertRaisesRegex(TransportError, "unsafe"):
+                SshChannelRunner().detached_viewer(
+                    ("ssh", "host"),
+                    socket_path=socket_path,
+                    session_name="tmuxgate-bbbbbbbbbbbb",
+                    adopt_existing=True,
+                )
+
+            self.assertEqual(socket_path.read_bytes(), b"preserve")
+
 
 class RealSshProcessTests(unittest.TestCase):
     def test_automatic_sudo_matching_accepts_only_exact_supported_prompts(self):

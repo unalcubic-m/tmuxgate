@@ -8,6 +8,7 @@ import socket
 import stat
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -361,6 +362,22 @@ class BrokerSocketTests(unittest.TestCase):
 
 
 class BrokerLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _owner_proof(owner, challenge, **changes):
+        values = {
+            "challenge": challenge,
+            "instance_id": owner.instance_id,
+            "pid": owner.pid,
+            "uid": owner.uid,
+            "boot_id": owner.boot_id,
+            "process_start_ticks": owner.process_start_ticks,
+            "executable_device": owner.executable_device,
+            "executable_inode": owner.executable_inode,
+            "started_at_ns": owner.started_at_ns,
+        }
+        values.update(changes)
+        return SimpleNamespace(**values)
+
     def _new_path(self, base: Path) -> Path:
         runtime_dir = base / "runtime"
         ensure_private_directory(runtime_dir)
@@ -419,6 +436,91 @@ class BrokerLifecycleTests(unittest.TestCase):
                 self.assertEqual(successor.reconciled_owner, reused)
             finally:
                 successor.close()
+
+    def test_live_broker_challenge_reconciles_hidden_proc_for_exact_lease(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            paths = prepare_runtime_layout(
+                socket_path=base / "runtime" / "broker.sock",
+                state_dir=base / "state",
+            )
+            with acquire_runtime_ownership(paths) as ownership:
+                owner = ownership.state_lock.owner
+                ambiguous = (
+                    RuntimeOwnershipStatus(
+                        "ambiguous", paths.state_dir / "state.lock", owner, "hidden"
+                    ),
+                    RuntimeOwnershipStatus(
+                        "ambiguous", paths.lock_path, owner, "hidden"
+                    ),
+                )
+
+                def prove(_path, challenge, **_timeouts):
+                    return self._owner_proof(owner, challenge)
+
+                with (
+                    mock.patch.object(
+                        runtime,
+                        "inspect_lifecycle_lock",
+                        side_effect=ambiguous,
+                    ),
+                    mock.patch("tmuxgate.client.get_runtime_owner", side_effect=prove),
+                ):
+                    statuses = runtime.inspect_runtime_ownership(paths)
+
+            self.assertEqual([item.state for item in statuses], ["active", "active"])
+            self.assertTrue(
+                all("exact lock lease nonce" in item.detail for item in statuses)
+            )
+
+    def test_broker_challenge_refuses_replay_pid_reuse_and_nonce_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            paths = prepare_runtime_layout(
+                socket_path=base / "runtime" / "broker.sock",
+                state_dir=base / "state",
+            )
+            with acquire_runtime_ownership(paths) as ownership:
+                owner = ownership.state_lock.owner
+            ambiguous = (
+                RuntimeOwnershipStatus(
+                    "ambiguous", paths.state_dir / "state.lock", owner, "hidden"
+                ),
+                RuntimeOwnershipStatus("ambiguous", paths.lock_path, owner, "hidden"),
+            )
+            proofs = (
+                lambda challenge: self._owner_proof(owner, "0" * 32),
+                lambda challenge: self._owner_proof(
+                    owner,
+                    challenge,
+                    process_start_ticks=owner.process_start_ticks + 1,
+                ),
+                lambda challenge: self._owner_proof(
+                    owner,
+                    challenge,
+                    instance_id="f" * 32,
+                ),
+            )
+            for proof in proofs:
+                with self.subTest(proof=proof):
+                    with (
+                        mock.patch.object(
+                            runtime,
+                            "inspect_lifecycle_lock",
+                            side_effect=ambiguous,
+                        ),
+                        mock.patch(
+                            "tmuxgate.client.get_runtime_owner",
+                            side_effect=lambda _path, challenge, **_timeouts: proof(
+                                challenge
+                            ),
+                        ),
+                    ):
+                        statuses = runtime.inspect_runtime_ownership(paths)
+                    self.assertEqual(
+                        [item.state for item in statuses],
+                        ["ambiguous", "ambiguous"],
+                    )
 
     def test_held_lock_with_mismatched_process_identity_is_ambiguous_and_untouched(self):
         with tempfile.TemporaryDirectory() as temporary:

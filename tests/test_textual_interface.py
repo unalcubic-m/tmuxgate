@@ -65,6 +65,7 @@ from tmuxgate.textual_interface import (
     TextualOperatorInterface,
     TerminalOwnershipState,
     TmuxgateDashboardApp,
+    UncertainRemoteJobScreen,
     _resume_after,
     flush_textual_input,
     validate_textual_terminal,
@@ -1187,6 +1188,68 @@ class TextualOperatorInterfaceTests(unittest.TestCase):
                 self.assertTrue(app.query_one("#views", TabbedContent).display)
 
         asyncio.run(exercise())
+
+    def test_uncertain_remote_job_has_one_explained_local_only_action(self):
+        interface = TextualOperatorInterface(
+            FakeTerminalArbiter(), validate_terminal=False
+        )
+        self.addCleanup(interface.close)
+        acknowledged = []
+        interface.bind_recovery_acknowledger(
+            lambda request_id: acknowledged.append(request_id) or "abandoned"
+        )
+        interface.bind_dashboard_provider(
+            lambda: DashboardRuntimeSnapshot(
+                ready=True,
+                listener="http://127.0.0.1:8765/mcp",
+                approval_mode="disabled",
+                machines=(),
+                jobs=(
+                    DashboardJob(
+                        request_id=REQUEST_ID,
+                        machine_alias="app-server",
+                        state="recovery-required-possibly-running",
+                        updated_at="2026-08-21T00:00:00Z",
+                        active=True,
+                        manual_action_required=True,
+                        recovery_evidence=(
+                            "phase=user_command_started; session_exists=0; "
+                            "completion_proven=0"
+                        ),
+                    ),
+                ),
+                terminal_owner="broker terminal",
+            )
+        )
+        app = TmuxgateDashboardApp(interface, threading.Event(), config())
+
+        async def exercise() -> None:
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.press("j")
+                await pilot.pause()
+                action = app.query_one("#recovery-action", Button)
+                self.assertFalse(action.disabled)
+                self.assertIn(REQUEST_ID[:8], str(action.label))
+                self.assertTrue(await pilot.click("#recovery-action"))
+                await pilot.pause()
+                self.assertIsInstance(app.screen, UncertainRemoteJobScreen)
+                document = (
+                    app.screen.query_one("#uncertain-evidence", Static)
+                    .render()
+                    .plain
+                )
+                self.assertIn(REQUEST_ID, document)
+                self.assertIn("phase=user_command_started", document)
+                self.assertIn("does not contact or clean the remote host", document)
+                self.assertIn("does not claim an exit status", document)
+                self.assertTrue(
+                    app.screen.query_one("#uncertain-cancel", Button).has_focus
+                )
+                self.assertTrue(await pilot.click("#uncertain-confirm"))
+                await pilot.pause()
+
+        asyncio.run(exercise())
+        self.assertEqual(acknowledged, [REQUEST_ID])
 
     def test_dashboard_toggles_automation_and_manages_sudo_password(self):
         with tempfile.TemporaryDirectory() as temporary:

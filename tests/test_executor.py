@@ -19,7 +19,7 @@ from tmuxgate.result import ResultCode, TransportStatus
 from tmuxgate.runtime import create_broker_socket
 from tmuxgate.scheduler import RequestState
 from tmuxgate.spool import ResultSpool
-from tmuxgate.state import DurableStateStore, recover_startup
+from tmuxgate.state import DurableStateStore, RemotePhase, recover_startup
 from tmuxgate.approval import ApprovalDecision
 from tmuxgate.operator_interface import (
     ActivityKind,
@@ -1038,7 +1038,7 @@ class RealExecutorTests(unittest.TestCase):
         )
         self.assertIsNone(self.pool.pinned_request_id)
 
-    def test_changed_boot_after_disconnect_terminalizes_without_output_claim(self):
+    def test_staging_disconnect_precedes_reboot_and_fails_pre_remote(self):
         spec = replace(
             request(("systemctl", "reboot")),
             disconnect_policy=DisconnectPolicy.EXPECT_FULL_REBOOT,
@@ -1063,17 +1063,17 @@ class RealExecutorTests(unittest.TestCase):
 
         self.assertEqual(
             result.transport_status,
-            TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT,
+            TransportStatus.PRE_REMOTE_FAILURE,
         )
-        self.assertEqual(result.result_code, ResultCode.ABANDONED_AFTER_VERIFIED_REBOOT)
         self.assertEqual((result.stdout, result.stderr), (b"", b""))
         self.assertIsNone(result.remote_exit_status)
         self.assertEqual(
             self.state.load(REQUEST_ID).state,
-            RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
+            RequestState.FAILED_PRE_REMOTE,
         )
+        self.assertEqual(probe.post_calls, [])
 
-    def test_complete_automation_mcp_reboot_incident_recovers_fresh_master(self):
+    def test_complete_automation_mcp_staging_reset_is_pre_remote(self):
         interface = PromptForbiddenAutomationInterface()
         probe = SequencedExecutorBootProbe(
             pre_boot_id="11111111-2222-3333-4444-555555555555",
@@ -1178,11 +1178,7 @@ class RealExecutorTests(unittest.TestCase):
         self.assertFalse(reboot.is_error)
         self.assertEqual(
             reboot.structured_content["transport_status"],
-            "abandoned_after_verified_reboot",
-        )
-        self.assertEqual(
-            reboot.structured_content["result_code"],
-            "abandoned_after_verified_reboot",
+            "pre_remote_failure",
         )
         self.assertEqual(reboot.structured_content["stdout_length"], 0)
         self.assertEqual(reboot.structured_content["stderr_length"], 0)
@@ -1191,16 +1187,16 @@ class RealExecutorTests(unittest.TestCase):
         self.assertEqual(
             post_reboot.structured_content["transport_status"], "complete"
         )
-        self.assertEqual(len(probe.post_calls), 2)
-        self.assertEqual(len(self.master_backend.starts), 2)
-        self.assertEqual(len(self.master_backend.stops), 1)
+        self.assertEqual(len(probe.post_calls), 0)
+        self.assertEqual(len(self.master_backend.starts), 1)
+        self.assertEqual(len(self.master_backend.stops), 0)
         self.assertTrue(old_path.exists())
-        self.assertNotEqual(old_path.stat().st_ino, old_inode)
+        self.assertEqual(old_path.stat().st_ino, old_inode)
         self.assertEqual(self.pool.pinned_request_ids, ())
         self.assertEqual(interface.prompt_calls, [])
         self.assertIsNone(self.pool.pinned_request_id)
 
-    def test_verified_reboot_allows_next_request_through_a_fresh_master(self):
+    def test_pre_remote_reboot_staging_failure_allows_next_request(self):
         reboot_spec = replace(
             request(("systemctl", "reboot")),
             disconnect_policy=DisconnectPolicy.EXPECT_FULL_REBOOT,
@@ -1241,11 +1237,11 @@ class RealExecutorTests(unittest.TestCase):
 
         self.assertEqual(
             reboot_result.transport_status,
-            TransportStatus.ABANDONED_AFTER_VERIFIED_REBOOT,
+            TransportStatus.PRE_REMOTE_FAILURE,
         )
         self.assertEqual(verification_result.transport_status, TransportStatus.COMPLETE)
         self.assertEqual(starts_after_reboot, 1)
-        self.assertEqual(len(self.master_backend.starts), 2)
+        self.assertEqual(len(self.master_backend.starts), 1)
         self.assertEqual(self.pool.pinned_request_ids, ())
         self.assertIsNone(interface._prompts.next_prompt(timeout=0))
 
@@ -1268,25 +1264,29 @@ class RealExecutorTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.state.load(REQUEST_ID)
 
-    def test_post_arm_failure_is_incomplete_and_retains_transport_lease(self):
+    def test_staging_failure_is_automatic_pre_remote_and_releases_lease(self):
         spec = request(("true",))
         self.approve(spec)
         backend = FakeRemoteBackend()
 
         def fail_stage(identity, submitted):
-            raise RuntimeError("synthetic stage failure")
+            raise RuntimeError("remote staging failed with status 255")
 
         backend.stage = fail_stage
         executor = self.executor(backend)
         result = executor(REQUEST_ID, spec)
-        self.assertEqual(result.transport_status, TransportStatus.INCOMPLETE)
-        self.assertEqual(self.pool.pinned_request_id, REQUEST_ID)
+        self.assertEqual(result.transport_status, TransportStatus.PRE_REMOTE_FAILURE)
+        self.assertIsNone(self.pool.pinned_request_id)
         self.assertEqual(
             self.state.load(REQUEST_ID).state,
-            RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING,
+            RequestState.FAILED_PRE_REMOTE,
         )
-        # The retained lease is deliberately not released by the test subject.
-        executor._recovery_leases[REQUEST_ID].release()
+        self.assertFalse(self.state.load(REQUEST_ID).remote_mutation_started)
+        self.assertEqual(
+            self.state.load(REQUEST_ID).remote_phase,
+            RemotePhase.STAGING_REQUESTED,
+        )
+        self.assertIn("status 255", self.state.load(REQUEST_ID).failure_detail)
 
 
 if __name__ == "__main__":

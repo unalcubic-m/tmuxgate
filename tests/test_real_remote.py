@@ -2,6 +2,7 @@ import hashlib
 from io import BytesIO
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -101,6 +102,116 @@ class StageArchiveTests(unittest.TestCase):
             job = home / ".cache/tmuxgate/jobs" / REQUEST_ID
             self.assertEqual(job.stat().st_mode & 0o777, 0o700)
             self.assertTrue(all((item.stat().st_mode & 0o777) == 0o600 for item in job.iterdir()))
+
+
+class ControlScriptRecoveryTests(unittest.TestCase):
+    class LocalChannels:
+        def __init__(self, home):
+            self.home = home
+            self.commands = []
+
+        def batch(self, argv, *, timeout_seconds):
+            self.commands.append(argv[-1])
+            return subprocess.run(
+                ["/bin/bash", "-c", argv[-1]],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"HOME": os.fspath(self.home), "PATH": "/usr/bin:/bin"},
+                timeout=timeout_seconds,
+                check=False,
+            )
+
+    class LocalBackend(RealRemoteJobBackend):
+        def _batch_prefix(self):
+            return ("local-test",)
+
+    def _unstarted_job(self, root: Path):
+        home = root / "home"
+        job = home / ".cache/tmuxgate/jobs" / REQUEST_ID
+        job.mkdir(parents=True, mode=0o700)
+        job.parents[0].chmod(0o700)
+        source = (
+            Path(__file__).parents[1]
+            / "src/tmuxgate/assets/remote_control.sh"
+        )
+        control = job / "remote_control.sh"
+        shutil.copy2(source, control)
+        control.chmod(0o600)
+        state = job / "state"
+        state.write_bytes(b"gated\n")
+        state.chmod(0o600)
+        fake_tmux = root / "fake-tmux"
+        fake_tmux.write_text(
+            "#!/bin/sh\n[ \"$1\" = has-session ] && exit 1\nexit 0\n",
+            encoding="ascii",
+        )
+        fake_tmux.chmod(0o700)
+        return home, job, control, fake_tmux
+
+    def _discard(self, home, control, fake_tmux):
+        return subprocess.run(
+            ["/bin/bash", str(control), "discard-unstarted", REQUEST_ID],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                "HOME": os.fspath(home),
+                "PATH": "/usr/bin:/bin",
+                "TMUXGATE_TMUX_BIN": os.fspath(fake_tmux),
+            },
+            timeout=5,
+            check=False,
+        )
+
+    def test_guarded_discard_removes_only_proven_unstarted_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, job, control, fake_tmux = self._unstarted_job(Path(directory))
+
+            completed = self._discard(home, control, fake_tmux)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(job.exists())
+
+    def test_guarded_discard_refuses_command_start_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, job, control, fake_tmux = self._unstarted_job(Path(directory))
+            marker = job / "gate-released"
+            marker.write_bytes(b"")
+            marker.chmod(0o600)
+
+            completed = self._discard(home, control, fake_tmux)
+
+            self.assertEqual(completed.returncode, 125)
+            self.assertTrue(job.exists())
+            self.assertTrue(marker.exists())
+
+    def test_guarded_discard_refuses_unknown_remote_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, job, control, fake_tmux = self._unstarted_job(Path(directory))
+            unknown = job / "operator-data"
+            unknown.write_bytes(b"preserve")
+            unknown.chmod(0o600)
+
+            completed = self._discard(home, control, fake_tmux)
+
+            self.assertEqual(completed.returncode, 125)
+            self.assertEqual(unknown.read_bytes(), b"preserve")
+
+    def test_cleanup_is_idempotent_after_exact_job_directory_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            jobs = home / ".cache/tmuxgate/jobs"
+            jobs.mkdir(parents=True, mode=0o700)
+            jobs.chmod(0o700)
+            channels = self.LocalChannels(home)
+            backend = self.LocalBackend(object(), channels=channels)
+            identity = RemoteJobIdentity.for_request(REQUEST_ID)
+
+            backend.cleanup(identity)
+            backend.cleanup(identity)
+
+            self.assertEqual(len(channels.commands), 2)
+            self.assertTrue(all(REQUEST_ID in item for item in channels.commands))
 
 
 class RemoteParsingTests(unittest.TestCase):

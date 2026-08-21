@@ -199,7 +199,17 @@ class RemoteJobBackend(Protocol):
     def observe(self, identity: RemoteJobIdentity) -> RemoteObservation: ...
     def release_gate(self, identity: RemoteJobIdentity) -> None: ...
     def collect(self, identity: RemoteJobIdentity) -> RemoteCollection: ...
+    def discard_unstarted(self, identity: RemoteJobIdentity) -> None: ...
     def cleanup(self, identity: RemoteJobIdentity) -> None: ...
+
+
+class RemotePhaseLifecycle(Protocol):
+    """Durable callbacks bracketing remote side effects and observations."""
+
+    def staging_verified(self) -> None: ...
+    def before_remote_wrapper(self) -> None: ...
+    def remote_wrapper_created(self) -> None: ...
+    def user_command_started(self) -> None: ...
 
 
 @dataclass(slots=True)
@@ -215,9 +225,57 @@ class RemoteJob:
 class RemoteJobCoordinator:
     """Enforce viewer-before-gate and fail-closed collection/cleanup ordering."""
 
-    def __init__(self, backend: RemoteJobBackend):
+    def __init__(
+        self,
+        backend: RemoteJobBackend,
+        *,
+        lifecycle: RemotePhaseLifecycle | None = None,
+    ):
         self.backend = backend
+        self.lifecycle = lifecycle
         self.active: RemoteJob | None = None
+
+    def adopt(
+        self,
+        request_id: str,
+        request_sha256: str,
+        durable_generation: int,
+        observation: RemoteObservation,
+    ) -> RemoteJob:
+        """Adopt one exact durable identity after an authenticated observation."""
+
+        if self.active is not None and self.active.state is not RemoteJobState.CLEANED:
+            raise RemoteJobBusyError("another remote job remains active or retained")
+        if not re.fullmatch(r"[0-9a-f]{64}", request_sha256):
+            raise RemoteJobError("durable request digest is invalid")
+        if type(durable_generation) is not int or durable_generation < 1:
+            raise RemoteJobError("durable generation is invalid")
+        job = RemoteJob(
+            identity=RemoteJobIdentity.for_request(request_id),
+            request_sha256=request_sha256,
+            durable_generation=durable_generation,
+        )
+        attached = observation.attached_clients > 0
+        if observation.completion_proven:
+            job.state = (
+                RemoteJobState.COMPLETE_WAITING_FOR_DETACH
+                if attached
+                else RemoteJobState.COMPLETE_DETACHED
+            )
+        elif observation.session_exists and not observation.gate_released:
+            if observation.command_running:
+                raise RemoteJobError("gated session cannot report a running command")
+            job.state = RemoteJobState.GATED_WAITING_FOR_VIEWER
+        elif observation.session_exists and observation.command_running:
+            job.state = (
+                RemoteJobState.RUNNING_ATTACHED
+                if attached
+                else RemoteJobState.RUNNING_DETACHED
+            )
+        else:
+            job.state = RemoteJobState.RECOVERY_REQUIRED
+        self.active = job
+        return job
 
     def prepare(
         self,
@@ -242,6 +300,9 @@ class RemoteJobCoordinator:
         try:
             self.backend.stage(identity, request)
             job.state = RemoteJobState.STAGED
+            if self.lifecycle is not None:
+                self.lifecycle.staging_verified()
+                self.lifecycle.before_remote_wrapper()
             self.backend.create_gated_session(identity)
             observation = self.backend.observe(identity)
             if (
@@ -252,6 +313,8 @@ class RemoteJobCoordinator:
             ):
                 raise RemoteJobError("new remote session is not safely gated")
             job.state = RemoteJobState.GATED_WAITING_FOR_VIEWER
+            if self.lifecycle is not None:
+                self.lifecycle.remote_wrapper_created()
         except BaseException:
             job.state = RemoteJobState.RECOVERY_REQUIRED
             self.active = job
@@ -274,6 +337,8 @@ class RemoteJobCoordinator:
         if not observation.gate_released:
             job.state = RemoteJobState.RECOVERY_REQUIRED
             raise RemoteJobError("remote start gate release was not proven")
+        if self.lifecycle is not None:
+            self.lifecycle.user_command_started()
         job.viewer = viewer
         job.state = RemoteJobState.RUNNING_ATTACHED
         return viewer

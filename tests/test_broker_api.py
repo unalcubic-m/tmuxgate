@@ -19,6 +19,8 @@ from tmuxgate.broker_api import (
     MachineSummary,
     ReadVerifiedResultRequest,
     ResultStream,
+    RuntimeOwnerProof,
+    RuntimeOwnerRequest,
     decode_control_request,
     decode_control_response,
 )
@@ -28,7 +30,7 @@ from tmuxgate.protocol import Frame, ProtocolError
 from tmuxgate.runtime import create_broker_socket
 from tmuxgate.scheduler import RequestState
 from tmuxgate.spool import ResultSpool, STDOUT_NAME
-from tmuxgate.state import DurableJobRecord, DurableStateStore
+from tmuxgate.state import DurableJobRecord, DurableStateStore, RemotePhase
 
 
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
@@ -61,6 +63,7 @@ def completed_record(manifest_sha256: str) -> DurableJobRecord:
         remote_mutation_started=True,
         local_spool_verified=True,
         local_spool_manifest_sha256=manifest_sha256,
+        remote_phase=RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED,
     )
 
 
@@ -127,6 +130,36 @@ class ControlCodecTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             decode_control_response(ListJobsRequest(), Frame(header, payload))
 
+    def test_runtime_owner_proof_is_challenge_bound_and_exact(self):
+        challenge = "1" * 32
+        request = decode_control_request(
+            Frame(
+                {
+                    "challenge": challenge,
+                    "protocol": PROTOCOL_VERSION,
+                    "type": "runtime_owner",
+                },
+                b"",
+            )
+        )
+        self.assertEqual(request, RuntimeOwnerRequest(challenge))
+        proof = RuntimeOwnerProof(
+            challenge,
+            "2" * 32,
+            123,
+            os.geteuid(),
+            "boot-id",
+            456,
+            7,
+            8,
+            9,
+        )
+        header, payload = proof.to_wire()
+        self.assertEqual(decode_control_response(request, Frame(header, payload)), proof)
+        replay = dict(header, challenge="3" * 32)
+        with self.assertRaisesRegex(ProtocolError, "not echoed exactly"):
+            decode_control_response(request, Frame(replay, payload))
+
 
 class BrokerControlServiceTests(unittest.TestCase):
     def setUp(self):
@@ -166,6 +199,28 @@ class BrokerControlServiceTests(unittest.TestCase):
             MachineSummary.from_wire(
                 {"alias": "machine-b", "description": "Build host"}
             )
+
+    def test_runtime_owner_response_echoes_challenge_and_exact_lease(self):
+        owner = SimpleNamespace(
+            instance_id="4" * 32,
+            pid=123,
+            uid=os.geteuid(),
+            boot_id="boot-id",
+            process_start_ticks=456,
+            executable_device=7,
+            executable_inode=8,
+            started_at_ns=9,
+        )
+        service = BrokerControlService(
+            {"machine-a": SimpleNamespace(description="Application server")},
+            self.store,
+            self.spool,
+            runtime_owner=owner,
+        )
+        response = service.handle(RuntimeOwnerRequest("5" * 32))
+        self.assertEqual(response.challenge, "5" * 32)
+        self.assertEqual(response.instance_id, owner.instance_id)
+        self.assertEqual(response.process_start_ticks, owner.process_start_ticks)
 
     def test_machine_list_reports_disabled_without_exposing_machine_details(self):
         service = BrokerControlService(

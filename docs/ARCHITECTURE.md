@@ -67,16 +67,23 @@ The unified lifecycle starts resources in fail-closed order:
    explicit `--plain` selects the supported line-oriented fail-safe.
 
 Startup reconstructs every durable remote-active request before accepting new
-work. Ordinary uncertain records retain the historical global fail-closed
-barrier. Records explicitly bound to `EXPECT_FULL_REBOOT` instead enter the
-broker-owned recovery coordinator: their logical machine remains blocked, each
-record counts against the configured capacity, and unrelated machines may use
-the remaining slots. Recovery begins without an approval or credential dialog;
+work. Ordinary records enter the broker-owned automatic recovery coordinator;
+their logical machine remains blocked while exact authenticated evidence is
+reconciled, each record counts against configured capacity, and unrelated
+machines may use the remaining slots. Records explicitly bound to
+`EXPECT_FULL_REBOOT` use the changed-boot coordinator instead. Recovery begins
+without an approval or credential dialog;
 the dashboard cannot report Ready while a forbidden prompt is pending. An MCP
 bind or startup failure stops the already-started broker and unwinds owned
-resources; there is no silent broker-only mode. The lifecycle locks are the authoritative
-exclusion mechanism for issue #73. Their metadata binds PID, Linux boot ID,
-process start ticks, executable device/inode, UID, and one random instance ID.
+resources; there is no silent broker-only mode. The lifecycle locks are the
+authoritative exclusion mechanism for issue #73. Their metadata binds PID,
+Linux boot ID, process start ticks, executable device/inode, UID, creation
+time, and one random instance/lease nonce. When `/proc` cannot see an
+otherwise matching live owner, read-only status sends a fresh challenge over
+the same-UID broker socket and accepts the locks as active only when the
+response echoes that challenge and every metadata field including the nonce.
+This lets a healthy replacement broker prove its own locks across PID
+namespaces without weakening PID-reuse protection.
 A contending default-TUI process reports a standalone, non-owning conflict
 dialog only when the held record exactly matches the live process incarnation.
 The safe focused action exits and uses the existing broker; another action
@@ -191,8 +198,8 @@ those two points would otherwise read as a successful update. Every
 block naming the candidate release, whether it was discarded or retained, which
 release is active or that none is, whether publication was attempted, and what
 persistent state the run left behind, including whether it created the MCP
-token. Releases are identified by release ID, because every build reports the
-same `0.1.0.dev0` version and only the release ID distinguishes them; a
+token. Releases are identified by release ID, because development builds can
+report the same package version and only the release ID distinguishes them; a
 successful run prints the release it published for the same reason. Uncatchable
 termination and interruption checkpoints are not yet covered by this contract.
 
@@ -424,16 +431,16 @@ Ephemeral socket, control, viewer, and `broker.lock` socket-lifecycle files live
 durable job store uses checksummed,
 generation-checked JSON records, mode `0600`, same-directory atomic replacement,
 file `fsync`, and directory `fsync`. Startup recovery atomically terminalizes
-records proven to be pre-remote. Ordinary possibly running or incompletely
-collected records retain the global barrier; explicitly armed expected-reboot
-records block only their machine while the recovery coordinator owns their
-capacity. A remote-start permit is returned
-only after `REMOTE_MAY_BE_RUNNING` and the predictable guarded job identity are
-durable. Completion, viewer detach, terminal restoration, local-spool
-verification, lease release, delivery, and done are also generation-checked
-and fsynced; the verified spool flag is inseparable from its exact manifest
-digest. The real executor uses this store directly; there is no second state
-path.
+records proven to be pre-command and hands every ordinary uncertain record to
+automatic evidence reconciliation. An unresolved record blocks only its
+machine while the coordinator owns its capacity. Explicitly armed
+expected-reboot records use their separate changed-boot proof. Before each
+remote effect, and after each authenticated observation, the durable record
+advances one generation through the exact phase sequence described below.
+Completion, viewer detach, terminal restoration, local-spool verification,
+cleanup, lease release, delivery, and done are generation-checked and fsynced;
+the verified spool flag is inseparable from its exact manifest digest. The
+real executor uses this store directly; there is no second state path.
 
 The durable record begins at approval, not at transport. As soon as the
 one-shot approved context is consumed the executor fsyncs
@@ -1131,11 +1138,63 @@ the lease. A whole-host reboot can also strand `COMPLETION_PROVEN` after the
 wrapper status was observed but before canonical output reached the local
 spool; destroying the pinned SSH control socket makes collection impossible.
 
-For the default `NORMAL` disconnect policy, the legacy manual workflow is
-unchanged: stop the broker, then use `tmuxgate recover after-reboot REQUEST_ID`
-to record `ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT` after the exact
-controlling-terminal attestation. `recover after-dead-pane` remains equally
-manual and never substitutes for reboot evidence.
+Current durable records also carry an orthogonal, atomically fsynced remote
+phase:
+
+```text
+NOT_ATTEMPTED
+ -> CONNECTION_ATTEMPTED
+ -> STAGING_REQUESTED
+ -> STAGING_VERIFIED
+ -> REMOTE_WRAPPER_REQUESTED
+ -> REMOTE_WRAPPER_CREATED
+ -> USER_COMMAND_STARTED
+ -> RESULT_SPOOL_FINALIZED
+ -> RESULT_SPOOL_LOCALLY_VERIFIED
+ -> CLEANUP_COMPLETED
+```
+
+`REMOTE_WRAPPER_REQUESTED` closes the crash window immediately before wrapper
+creation; it is reconciled from the exact guarded remote job and is not itself
+proof that a wrapper exists. `remote_mutation_started` remains readable for
+compatibility, but for ordinary version-4 records it becomes true only at
+`USER_COMMAND_STARTED`, not before staging. Version-2 and version-3 records are
+loaded byte-for-byte as `LEGACY_UNCERTAIN` when their old broad mutation flag
+is true; tmuxgate never guesses a narrower phase from that flag. A legacy
+record with an exact resolved identity may be atomically upgraded to
+`REMOTE_WRAPPER_CREATED` or `USER_COMMAND_STARTED` only after an authenticated
+exact-job observation positively proves a gated wrapper, released gate,
+running command, or complete spool. An all-missing observation is not proof
+that an older command never started.
+
+For the default `NORMAL` policy, a broker-owned loop repeatedly applies this
+evidence table:
+
+- Connection or staging interruption before a wrapper request becomes
+  `FAILED_PRE_REMOTE` automatically. SSH status 255 is not evidence that a
+  command ran.
+- A requested or created wrapper with an authenticated closed gate, no exact
+  session, no running command, and no completion can be removed only by the
+  guarded `discard-unstarted` control and then becomes `FAILED_PRE_REMOTE`.
+- A gated exact session is reattached and its gate released; a running detached
+  session gets a replacement local viewer. An already-live exact local viewer
+  is adopted after owner, mode, socket type, and request-derived session checks.
+- A complete authenticated remote spool is collected and verified locally.
+  Local viewer metadata is no longer a completion gate once the foreground
+  process is proven finished. Cleanup is idempotent and retried independently
+  after the local result is available.
+- A command-start marker without an authenticated complete result or
+  authoritative termination evidence remains fail-closed. The Jobs view then
+  offers one explained, safe-default workflow: `Acknowledge & unblock`. It
+  changes only the local audit/scheduling state, performs no SSH or cleanup,
+  and claims no exit status, output, completion, or remote absence.
+
+Closing or restarting the dashboard therefore does not abandon a request: the
+remote wrapper, result spool, private viewer, and durable record—not the old
+dashboard pane—are the recovery authorities. Repeated passes are idempotent;
+they may neither rerun a command nor delete an uncertain job. The old
+`recover after-reboot` and `recover after-dead-pane` commands remain only for
+backward compatibility and are not part of routine automatic-mode operation.
 
 An explicit `EXPECT_FULL_REBOOT` request instead captures
 `/proc/sys/kernel/random/boot_id` through the approved transport before the
@@ -1296,7 +1355,9 @@ can append canonical output after result publication. The policy and ordering
 are identical for argv and script modes.
 
 The real backend implements this lifecycle; fake and real-local-tmux tests
-exercise the same scripts. A durable start permit is required before staging. The coordinator
+exercise the same scripts. A durable staging permit is required before staging;
+the requested command is not marked started until the authenticated start-gate
+marker is observed. The coordinator
 proves the dedicated session is gated, proves at least one viewer is attached,
 and only then releases the unique wait channel. A running viewer accepts input
 and Ctrl-C and can detach/reattach without affecting another job. Completion
@@ -1342,18 +1403,21 @@ July 19, 2026.
 
 Broker/SSH failure does not rerun the command. State is reported as incomplete
 unless completion and exit status can be proven. Cleanup validates the exact
-parent and job ID and refuses active or uncertain jobs. A full machine reboot
-can instead be recorded as operator-confirmed abandonment, without an invented
-exit status or canonical result; stale remote job residue remains untouched
-until a later independently approved cleanup can prove it inactive.
-Because older tmuxgate builds do not recognize this terminal state, the
-installed source must not be downgraded after recording one.
+parent and job ID and refuses active or uncertain jobs; repeating cleanup after
+the exact directory is already absent succeeds so a crash between remote
+deletion and the local cleanup marker can converge. Only a wrapper that still
+proves its start gate was never released accepts `discard-unstarted`, and that
+operation refuses unknown files. A full machine reboot can instead be recorded
+as operator-confirmed abandonment, without an invented exit status or canonical
+result. Because older tmuxgate builds do not recognize state format 4 or the
+new terminal state, rollback must preserve a pre-upgrade state snapshot and a
+downgrade must not read records written by the newer release.
 
 Every irreversible transition must be atomically written and fsynced under the
-durable state boundary. The implemented state API requires the local record to
-say `REMOTE_MAY_BE_RUNNING` before it returns a remote-start permit, so the
-boundary precedes remote directory staging as well as command start. Startup
-loads and reconciles durable state and refuses new approvals while any job is
-corrupt, missing required evidence, possibly running, or not through every
-completion/spool/viewer/terminal gate. The real coordinator consumes that
+durable state boundary. The state API returns a staging permit only after
+`STAGING_REQUESTED`, fsyncs a wrapper-request marker before creation, and sets
+`REMOTE_MAY_BE_RUNNING` only after the gate-release marker proves the user
+command started. Startup loads and reconciles durable state and refuses work on
+an affected machine while any exact job remains unproven or has not passed its
+completion/spool/viewer/terminal gates. The real coordinator consumes that
 permit and recovery report; bypassing them is not an allowed executor design.
