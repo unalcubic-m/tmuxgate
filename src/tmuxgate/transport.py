@@ -111,6 +111,7 @@ class TransportAuthorization:
     connection_plan_sha256: str
     approval_binding_sha256: str
     resolved_identity_sha256: str
+    allow_key_enrollment: bool = True
 
     def __post_init__(self) -> None:
         validate_request_id(self.request_id)
@@ -123,6 +124,8 @@ class TransportAuthorization:
         ):
             if not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None:
                 raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+        if type(self.allow_key_enrollment) is not bool:
+            raise ValueError("allow_key_enrollment must be boolean")
 
 
 def _authorization_for_endpoint(
@@ -992,12 +995,13 @@ class MasterTransportPool:
         start for this machine can run concurrently.
         """
 
-        if self.key_manager is not None:
-            self.key_manager.prepare_local_key(current)
+        key_manager = self.key_manager if authorization.allow_key_enrollment else None
+        if key_manager is not None:
+            key_manager.prepare_local_key(current)
         self._reconcile_unowned_control_path(current, path)
         start_builder = (
             build_enrollment_master_start_invocation
-            if self.key_manager is not None
+            if key_manager is not None
             else build_master_start_invocation
         )
         start = start_builder(
@@ -1020,7 +1024,7 @@ class MasterTransportPool:
                 raise TransportError(
                     "new authenticated SSH master failed its control check"
                 )
-            if self.key_manager is not None:
+            if key_manager is not None:
                 def before_remote_mutation() -> None:
                     nonlocal key_enrollment_started
                     if key_enrollment_lifecycle is None:
@@ -1030,7 +1034,7 @@ class MasterTransportPool:
                     key_enrollment_lifecycle.before_remote_mutation(current)
                     key_enrollment_started = True
 
-                outcome = self.key_manager.enroll_remote_key(
+                outcome = key_manager.enroll_remote_key(
                     current,
                     path,
                     before_remote_mutation=before_remote_mutation,

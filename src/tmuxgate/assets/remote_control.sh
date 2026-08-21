@@ -160,6 +160,40 @@ case "$operation" in
             collect-stderr) exec /bin/cat -- "$job_dir/stderr.raw" ;;
         esac
         ;;
+    discard-unstarted)
+        if [ "$session_exists" -ne 0 ] || safe_file gate-released; then
+            echo 'tmuxgate discard refused a live or released wrapper' >&2
+            exit 125
+        fi
+        state=$(read_state)
+        case "$state" in
+            missing|gated) ;;
+            *)
+                echo 'tmuxgate discard refused command evidence' >&2
+                exit 125
+                ;;
+        esac
+        for entry in "$job_dir"/* "$job_dir"/.[!.]* "$job_dir"/..?*; do
+            [ -e "$entry" ] || continue
+            name=${entry##*/}
+            case "$name" in
+                mode|cwd.bin|environment.bin|timeout|interactive|result-limits|argv.bin|payload.sh|remote_runner.sh|remote_control.sh|state)
+                    [ -f "$entry" ] && [ ! -L "$entry" ] || exit 125
+                    ;;
+                *)
+                    echo "tmuxgate discard refused unexpected entry: $name" >&2
+                    exit 125
+                    ;;
+            esac
+        done
+        rm -f -- \
+            "$job_dir/mode" "$job_dir/cwd.bin" "$job_dir/environment.bin" \
+            "$job_dir/timeout" "$job_dir/interactive" "$job_dir/result-limits" \
+            "$job_dir/argv.bin" "$job_dir/payload.sh" \
+            "$job_dir/remote_runner.sh" "$job_dir/remote_control.sh" \
+            "$job_dir/state"
+        rmdir -- "$job_dir"
+        ;;
     cleanup)
         if [ "$(read_state)" != complete ] || [ "$attached" -ne 0 ]; then
             echo 'tmuxgate cleanup refused active or incomplete job' >&2

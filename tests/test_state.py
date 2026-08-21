@@ -12,6 +12,7 @@ from tmuxgate.models import DisconnectPolicy, ExecutionMode, RequestSpec
 from tmuxgate.state import (
     DurableJobRecord,
     DurableStateStore,
+    RemotePhase,
     StateConflictError,
     StateCorruptionError,
     new_approved_job_record,
@@ -42,7 +43,24 @@ def record(
     viewer_detached=False,
     terminal_restored=False,
     failure_detail=None,
+    remote_phase=None,
+    record_version=4,
 ):
+    if remote_phase is None:
+        if record_version in {2, 3}:
+            remote_phase = (
+                RemotePhase.LEGACY_UNCERTAIN
+                if remote_mutation_started
+                else RemotePhase.NOT_ATTEMPTED
+            )
+        elif local_spool_verified:
+            remote_phase = RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED
+        elif completion_time is not None:
+            remote_phase = RemotePhase.RESULT_SPOOL_FINALIZED
+        elif remote_mutation_started:
+            remote_phase = RemotePhase.USER_COMMAND_STARTED
+        else:
+            remote_phase = RemotePhase.NOT_ATTEMPTED
     return DurableJobRecord(
         request_id=request_id,
         generation=generation,
@@ -71,6 +89,8 @@ def record(
         viewer_detached=viewer_detached,
         terminal_restored=terminal_restored,
         failure_detail=failure_detail,
+        remote_phase=remote_phase,
+        record_version=record_version,
     )
 
 
@@ -196,6 +216,51 @@ class DurableStateTests(unittest.TestCase):
         self.assertEqual(permit.request_id, REQUEST_ID)
         self.assertEqual(permit.durable_generation, 2)
         self.assertEqual(len(permit.durable_payload_sha256), 64)
+
+    def test_atomic_remote_phases_advance_only_in_exact_evidence_order(self):
+        store = self.make_store()
+        current = store.write(record())
+        observed = [current.remote_phase]
+        current = store.mark_remote_connection_attempted(current)
+        observed.append(current.remote_phase)
+        current, permit = store.request_remote_staging(current)
+        observed.append(current.remote_phase)
+        self.assertEqual(permit.durable_generation, current.generation)
+        current = store.mark_remote_staging_verified(current)
+        observed.append(current.remote_phase)
+        current = store.request_remote_wrapper(current)
+        observed.append(current.remote_phase)
+        current = store.mark_remote_wrapper_created(current)
+        observed.append(current.remote_phase)
+        self.assertFalse(current.remote_mutation_started)
+        current = store.mark_user_command_started(current)
+        observed.append(current.remote_phase)
+        self.assertTrue(current.remote_mutation_started)
+        current = store.mark_completion_proven(current, exit_status=0)
+        observed.append(current.remote_phase)
+        current = store.mark_viewer_detached(current)
+        current = store.mark_terminal_restored(current)
+        current = store.mark_local_spool_verified(
+            current, manifest_sha256="d" * 64
+        )
+        observed.append(current.remote_phase)
+        current = store.mark_remote_cleanup_completed(current)
+        observed.append(current.remote_phase)
+
+        self.assertEqual(observed, list(RemotePhase)[:-1])
+        self.assertEqual(store.load(REQUEST_ID), current)
+
+    def test_atomic_remote_phases_refuse_skips_and_backward_writes(self):
+        store = self.make_store()
+        approved = store.write(record())
+        with self.assertRaises(StateConflictError):
+            store.request_remote_staging(approved)
+        attempted = store.mark_remote_connection_attempted(approved)
+        with self.assertRaises(StateConflictError):
+            store.mark_remote_wrapper_created(attempted)
+        staged, _ = store.request_remote_staging(attempted)
+        with self.assertRaises(StateConflictError):
+            store.mark_user_command_started(staged)
 
     def test_key_enrollment_has_durable_started_and_verified_boundaries(self):
         store = self.make_store()
@@ -380,6 +445,7 @@ class StartupRecoveryTests(unittest.TestCase):
             ),
             record_version=2,
             resolved_identity_sha256=None,
+            remote_phase=RemotePhase.LEGACY_UNCERTAIN,
         )
         store.write(legacy)
 
@@ -405,6 +471,7 @@ class StartupRecoveryTests(unittest.TestCase):
         self.assertEqual(report.blocking_request_ids, (REQUEST_ID,))
         self.assertTrue(report.safe_to_accept_new_approvals)
         self.assertEqual(report.blocking_machine_aliases, ("app-server",))
+        self.assertEqual(report.automatic_recovery_request_ids, (REQUEST_ID,))
 
     def test_interrupted_key_enrollment_is_terminalized_without_claiming_command(self):
         for verified in (False, True):

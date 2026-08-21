@@ -271,8 +271,12 @@ tmuxgate runtime takeover --yes
 `runtime takeover` signals only an owner whose two lifecycle locks contain the
 same verified process-incarnation identity. It sends `SIGTERM` through a Linux
 PID descriptor, never sends `SIGKILL`, and never deletes a held lock or an
-unverified SSH socket. If status reports ambiguous evidence, inspect it instead
-of manually deleting lock or control files.
+unverified SSH socket. The identity binds PID, boot ID, process start ticks,
+executable device/inode, UID, creation time, and a random lease nonce. If
+`/proc` is hidden by a PID namespace, a fresh same-UID broker challenge must
+echo the nonce and every lock field before status calls the owner active. If
+status still reports ambiguous evidence, inspect it instead of manually
+deleting lock or control files.
 
 The stable dashboard keeps readiness and bounded operational state in place:
 
@@ -516,6 +520,39 @@ prompt.
 > visible pane text. Authorize a handoff only for a command you have reviewed
 > and trust with whatever you are about to type.
 
+### Automatic crash recovery
+
+Automatic mode requires no `recover`, `cleanup`, or `runtime reconcile`
+commands for a state that tmuxgate can prove safe. Durable records separately
+fsync connection attempted, staging requested/verified, wrapper
+requested/created, user-command started, remote result finalized, local result
+verified, and cleanup completed. In particular, an SSH status 255 during
+staging is automatically `failed-pre-remote` when no verified wrapper or
+command-start marker exists; the earlier broad mutation flag is no longer set
+before staging.
+
+After a broker, dashboard, pane, or workstation restart, tmuxgate adopts an
+exact live viewer or recreates a missing viewer for an exact running session.
+It collects a complete authenticated result, reconciles finished local viewer
+metadata, and retries guarded idempotent cleanup. It removes staging only when
+an authenticated exact-job observation plus the guarded control script prove
+the start gate was never released. Repeated reconciliation never reruns a user
+command and never deletes uncertain remote evidence.
+
+The irreducible case is a durable command-start marker with neither a complete
+authenticated result nor authoritative termination evidence. It remains
+blocked and appears in the Jobs view as `ACTION REQUIRED`. The single
+`Acknowledge & unblock` workflow explains the exact evidence and changes only
+the local audit/scheduling state; it performs no SSH or cleanup and claims no
+exit status, output, completion, or remote absence. A legacy version-3 record
+can be upgraded only from positive authenticated evidence of its exact gated,
+running, or completed job. Missing legacy artifacts do not prove absence and
+use this same conservative workflow; version-2 records without an exact
+resolved identity also remain local-only.
+
+See [the recovery runbook](docs/RECOVERY_RUNBOOK.md) for guarded rollout and
+rollback steps.
+
 ### Recovering after an intentional whole-host reboot
 
 Set `expect_full_reboot = true` only when the submitted request is intended to
@@ -548,8 +585,9 @@ marked Automation request.
 successful command result. It has no fabricated exit status, completion time,
 stdout, stderr, local-spool claim, viewer-detach claim, or terminal-restoration
 claim. A verified reboot proves neither the rebooting command's exit status nor
-its earlier side effects. `tmuxgate recover after-reboot REQUEST_ID` remains for
-legacy records and normal interactive recovery when machine evidence is absent.
+its earlier side effects. The older `recover after-reboot` and
+`recover after-dead-pane` commands remain compatibility tools, not the routine
+automatic-mode workflow.
 
 ### Migrating from the earlier CLI workflow
 

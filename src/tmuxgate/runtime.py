@@ -1093,19 +1093,23 @@ def _same_process_incarnation(
     right: RuntimeOwnerRecord,
 ) -> bool:
     return (
+        left.instance_id,
         left.pid,
         left.uid,
         left.boot_id,
         left.process_start_ticks,
         left.executable_device,
         left.executable_inode,
+        left.started_at_ns,
     ) == (
+        right.instance_id,
         right.pid,
         right.uid,
         right.boot_id,
         right.process_start_ticks,
         right.executable_device,
         right.executable_inode,
+        right.started_at_ns,
     )
 
 
@@ -1496,7 +1500,7 @@ def inspect_lifecycle_lock(
 def inspect_runtime_ownership(paths: RuntimePaths) -> tuple[RuntimeOwnershipStatus, ...]:
     """Inspect both durable-state and ephemeral-runtime owners."""
 
-    return (
+    statuses = (
         inspect_lifecycle_lock(
             paths.state_dir,
             lock_file_name=STATE_LOCK_FILE_NAME,
@@ -1506,6 +1510,63 @@ def inspect_runtime_ownership(paths: RuntimePaths) -> tuple[RuntimeOwnershipStat
             lock_file_name=BROKER_LOCK_FILE_NAME,
         ),
     )
+    owners = tuple(status.owner for status in statuses)
+    if (
+        all(status.state in {"active", "ambiguous"} for status in statuses)
+        and all(owner is not None for owner in owners)
+        and _same_process_incarnation(owners[0], owners[1])
+        and any(status.state == "ambiguous" for status in statuses)
+    ):
+        # /proc may intentionally hide the broker across PID namespaces. In
+        # that case, require a fresh challenge response from the same-UID Unix
+        # listener and bind every lock field, including the instance nonce.
+        try:
+            from tmuxgate.client import get_runtime_owner
+
+            challenge = secrets.token_hex(16)
+            proof = get_runtime_owner(
+                paths.socket_path,
+                challenge,
+                connect_timeout_seconds=1.0,
+                request_send_timeout_seconds=1.0,
+                response_timeout_seconds=1.0,
+            )
+            owner = owners[0]
+            assert owner is not None
+            if (
+                proof.challenge == challenge
+                and (
+                    proof.instance_id,
+                    proof.pid,
+                    proof.uid,
+                    proof.boot_id,
+                    proof.process_start_ticks,
+                    proof.executable_device,
+                    proof.executable_inode,
+                    proof.started_at_ns,
+                ) == (
+                    owner.instance_id,
+                    owner.pid,
+                    owner.uid,
+                    owner.boot_id,
+                    owner.process_start_ticks,
+                    owner.executable_device,
+                    owner.executable_inode,
+                    owner.started_at_ns,
+                )
+            ):
+                return tuple(
+                    RuntimeOwnershipStatus(
+                        "active",
+                        status.path,
+                        status.owner,
+                        "live same-UID broker proved the exact lock lease nonce",
+                    )
+                    for status in statuses
+                )
+        except BaseException:
+            pass
+    return statuses
 
 
 def request_runtime_owner_shutdown(

@@ -20,6 +20,8 @@ from tmuxgate.broker_api import (
     MachineSummary,
     ReadVerifiedResultRequest,
     ResultStream,
+    RuntimeOwnerProof,
+    RuntimeOwnerRequest,
     VerifiedResultChunk,
     decode_control_response,
 )
@@ -163,7 +165,12 @@ def exchange_control_request(
 
     if not isinstance(
         request,
-        (ListMachinesRequest, ListJobsRequest, ReadVerifiedResultRequest),
+        (
+            ListMachinesRequest,
+            ListJobsRequest,
+            ReadVerifiedResultRequest,
+            RuntimeOwnerRequest,
+        ),
     ):
         raise TypeError("request must be a broker control request")
     send_timeout = _positive_finite_timeout(
@@ -233,6 +240,27 @@ def _submit_control_request(
             raise BrokerConnectionError(f"broker connection failed: {exc}") from exc
     finally:
         client.close()
+
+
+def get_runtime_owner(
+    socket_path: os.PathLike[str] | str,
+    challenge: str,
+    *,
+    connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    request_send_timeout_seconds: float = DEFAULT_REQUEST_SEND_TIMEOUT_SECONDS,
+    response_timeout_seconds: float = DEFAULT_CONTROL_RESPONSE_TIMEOUT_SECONDS,
+    broker_peer_validator=require_same_uid,
+) -> RuntimeOwnerProof:
+    response = _submit_control_request(
+        RuntimeOwnerRequest(challenge),
+        socket_path=socket_path,
+        connect_timeout_seconds=connect_timeout_seconds,
+        request_send_timeout_seconds=request_send_timeout_seconds,
+        response_timeout_seconds=response_timeout_seconds,
+        broker_peer_validator=broker_peer_validator,
+    )
+    assert isinstance(response, RuntimeOwnerProof)
+    return response
 
 
 def list_machines(

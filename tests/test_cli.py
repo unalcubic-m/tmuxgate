@@ -12,6 +12,7 @@ from tmuxgate.models import DisconnectPolicy, ExecutionMode, RequestSpec, Result
 from tmuxgate.result import ExecutionResult, TransportStatus
 from tmuxgate.runtime import BrokerAlreadyRunningError
 from tmuxgate.scheduler import ApprovalDecision, RequestState
+from tmuxgate.state import RemotePhase
 
 
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
@@ -508,6 +509,7 @@ class FailClosedSurfaceTests(unittest.TestCase):
             local_spool_verified=True,
             machine_alias="app-server",
             remote_mutation_started=True,
+            remote_phase=RemotePhase.USER_COMMAND_STARTED,
             remote_job_path=f"~/.cache/tmuxgate/jobs/{REQUEST_ID}",
             remote_tmux_session=f"tmuxgate-{REQUEST_ID[:12]}",
             request_id=REQUEST_ID,
@@ -521,6 +523,7 @@ class FailClosedSurfaceTests(unittest.TestCase):
         self.assertEqual(document["decision"], "approved")
         self.assertEqual(document["local_spool_manifest_sha256"], "a" * 64)
         self.assertTrue(document["local_spool_verified"])
+        self.assertEqual(document["remote_phase"], "user_command_started")
         self.assertTrue(document["viewer_detached"])
         self.assertTrue(document["terminal_restored"])
         self.assertEqual(document["state"], "lease-released")

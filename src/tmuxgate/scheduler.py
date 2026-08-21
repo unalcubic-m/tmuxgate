@@ -66,6 +66,9 @@ class RequestState(StrEnum):
     ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE = (
         "abandoned-after-operator-confirmed-dead-pane"
     )
+    ABANDONED_AFTER_OPERATOR_ACKNOWLEDGED_UNCERTAINTY = (
+        "abandoned-after-operator-acknowledged-uncertainty"
+    )
     ABANDONED_AFTER_PROVEN_UNSTARTED = "abandoned-after-proven-unstarted"
     COMPLETION_PROVEN = "completion-proven"
     LOCAL_SPOOL_VERIFIED = "local-spool-verified"

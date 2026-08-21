@@ -52,9 +52,9 @@ class InstallReport:
     stopped early left behind.
 
     Releases are identified by release ID rather than by the package version,
-    because every build reports the same ``0.1.0.dev0`` and only the release ID
-    distinguishes them.  It is also directly checkable afterwards with
-    ``readlink ~/.local/share/tmuxgate/current``.
+    because development builds can report the same package version and only
+    the release ID distinguishes them. It is also directly checkable afterwards
+    with ``readlink ~/.local/share/tmuxgate/current``.
     """
 
     candidate_release: str = "NOT ATTEMPTED"

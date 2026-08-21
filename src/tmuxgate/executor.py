@@ -41,7 +41,12 @@ from tmuxgate.result import ExecutionResult, ResultCode, TransportStatus
 from tmuxgate.scheduler import RequestState
 from tmuxgate.ssh import ResolvedSshEndpoint
 from tmuxgate.spool import ResultSpool
-from tmuxgate.state import DurableJobRecord, DurableStateStore, new_approved_job_record
+from tmuxgate.state import (
+    DurableJobRecord,
+    DurableStateStore,
+    RemotePhase,
+    new_approved_job_record,
+)
 from tmuxgate.transport import (
     KeyEnrollmentMutationError,
     MasterTransport,
@@ -138,6 +143,12 @@ class _DurablePreRemoteBoundary:
         )
         return self.record
 
+    def mark_connection_attempted(self) -> DurableJobRecord:
+        self.record = self.state.mark_remote_connection_attempted(
+            self.require_record()
+        )
+        return self.record
+
     def arm_key_enrollment(self) -> DurableJobRecord:
         self.record = self.state.arm_key_enrollment(self.require_record())
         return self.record
@@ -182,6 +193,38 @@ class _DurablePreRemoteBoundary:
             # startup recovery will terminalize it conservatively.
             pass
         return self.require_record()
+
+
+class _DurableRemoteLifecycle:
+    """Advance exact remote phases only after their evidence is observed."""
+
+    def __init__(
+        self,
+        state: DurableStateStore,
+        boundary: _DurablePreRemoteBoundary,
+    ) -> None:
+        self.state = state
+        self.boundary = boundary
+
+    @property
+    def record(self) -> DurableJobRecord:
+        return self.boundary.require_record()
+
+    def request_staging(self):
+        self.boundary.record, permit = self.state.request_remote_staging(self.record)
+        return permit
+
+    def staging_verified(self) -> None:
+        self.boundary.record = self.state.mark_remote_staging_verified(self.record)
+
+    def before_remote_wrapper(self) -> None:
+        self.boundary.record = self.state.request_remote_wrapper(self.record)
+
+    def remote_wrapper_created(self) -> None:
+        self.boundary.record = self.state.mark_remote_wrapper_created(self.record)
+
+    def user_command_started(self) -> None:
+        self.boundary.record = self.state.mark_user_command_started(self.record)
 
 
 class _DurableKeyEnrollmentLifecycle:
@@ -400,6 +443,7 @@ class RealExecutor:
             # Route fallback happens only before remote mutation, so the
             # approved record can truthfully follow the plan to this endpoint.
             boundary.retarget(endpoint)
+            boundary.mark_connection_attempted()
             ssh_attempt = 0
             failure_diagnostics = b""
             while True:
@@ -619,11 +663,13 @@ class RealExecutor:
             record,
             manifest_sha256=spooled.manifest_payload_sha256,
         )
-        record = self.state.release_lease(record)
         try:
             coordinator.cleanup(job)
         except BaseException:
             pass
+        else:
+            record = self.state.mark_remote_cleanup_completed(record)
+        record = self.state.release_lease(record)
         lease.release()
         record = self.state.begin_result_delivery(record)
         with self._records_lock:
@@ -860,14 +906,15 @@ class RealExecutor:
                     result_code=ResultCode.PRE_REBOOT_BOOT_ID_UNAVAILABLE,
                 )
 
+        remote_lifecycle = _DurableRemoteLifecycle(self.state, boundary)
         try:
-            armed, permit = self.state.arm_remote_start(approved)
+            permit = remote_lifecycle.request_staging()
             self._publish_connection(
                 request_id,
                 request,
                 ConnectionPhase.REMOTE_STARTING,
-                "SSH setup is complete; the durable remote-execution boundary "
-                "is armed and the requested command is starting.",
+                "SSH setup is complete; remote staging is starting. The user "
+                "command has not crossed its start gate.",
                 endpoint_id=endpoint.resolved.endpoint_id,
                 remote_mutation_state=(
                     RemoteMutationState.STARTED
@@ -931,9 +978,13 @@ class RealExecutor:
                 endpoint.resolved.endpoint_id,
             )
             backend = self.backend_factory(lease.transport, recipient)
-            coordinator = RemoteJobCoordinator(backend)
+            coordinator = RemoteJobCoordinator(
+                backend,
+                lifecycle=remote_lifecycle,
+            )
             job = coordinator.prepare(request_id, request, permit)
             coordinator.attach_and_start(job)
+            armed = remote_lifecycle.record
             self._publish_connection(
                 request_id,
                 request,
@@ -957,6 +1008,43 @@ class RealExecutor:
             release_expected_claim()
             return result
         except BaseException as exc:
+            current = remote_lifecycle.record
+            if current.remote_phase in {
+                RemotePhase.STAGING_REQUESTED,
+                RemotePhase.STAGING_VERIFIED,
+            }:
+                detail = (
+                    "remote staging failed before a verified wrapper or command-start "
+                    f"marker existed: {exc}"
+                )
+                if current.state is RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE:
+                    boundary.fail_remote_setup(detail)
+                else:
+                    boundary.fail_pre_remote(detail)
+                lease.release()
+                release_expected_claim()
+                self._publish_connection(
+                    request_id,
+                    request,
+                    ConnectionPhase.FAILED,
+                    "Remote staging failed before any verified wrapper or user "
+                    "command start; the request was reconciled automatically.",
+                    endpoint_id=endpoint.resolved.endpoint_id,
+                    remote_mutation_state=(
+                        RemoteMutationState.STARTED
+                        if current.remote_mutation_started
+                        else RemoteMutationState.NOT_STARTED
+                    ),
+                )
+                return ExecutionResult(
+                    request_id,
+                    (
+                        TransportStatus.REMOTE_SETUP_FAILURE
+                        if current.remote_mutation_started
+                        else TransportStatus.PRE_REMOTE_FAILURE
+                    ),
+                    detail=detail,
+                )
             self._publish_connection(
                 request_id,
                 request,
@@ -974,13 +1062,13 @@ class RealExecutor:
                         if coordinator is not None and job is not None:
                             self._recovery_jobs[request_id] = (coordinator, job)
                     return self.reboot_recovery.fail_closed_after_remote_start(
-                        armed,
+                        current,
                         code=result_code,
                         detail=f"automatic secret input failed: {exc}",
                     )
                 return self._retain_recovery(
                     request_id,
-                    armed,
+                    current,
                     lease,
                     f"automatic secret input failed: {exc}",
                     coordinator,
@@ -1011,14 +1099,14 @@ class RealExecutor:
                     )
 
                 return self.reboot_recovery.recover(
-                    armed,
+                    current,
                     endpoint.resolved,
                     lease=lease,
                     same_boot_resumer=resume_same_boot,
                 )
             return self._retain_recovery(
                 request_id,
-                armed,
+                current,
                 lease,
                 f"remote execution is incomplete: {exc}",
                 coordinator,

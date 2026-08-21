@@ -10,6 +10,7 @@ import threading
 from typing import Callable
 
 from tmuxgate.approval import ApprovalDecision, open_approval_terminal
+from tmuxgate.automatic_recovery import AutomaticRecoveryCoordinator
 from tmuxgate.availability import MachineAvailabilityRegistry
 from tmuxgate.broker import BrokerServer
 from tmuxgate.broker_api import BrokerControlService
@@ -58,7 +59,7 @@ from tmuxgate.settings import set_approval_mode, set_machine_enabled
 from tmuxgate.scheduler import RequestState
 from tmuxgate.ssh import ResolvedSshEndpoint, resolve_ssh_endpoint
 from tmuxgate.ssh_key import AutoSshKeyManager
-from tmuxgate.state import DurableStateStore, recover_startup
+from tmuxgate.state import DurableStateStore, RemotePhase, recover_startup
 from tmuxgate.terminal import TerminalArbiter
 from tmuxgate.textual_interface import (
     DashboardJob,
@@ -206,6 +207,7 @@ class UnifiedApplication:
         operator: OperatorInterface
         pool: MasterTransportPool | None = None
         prompt_presenter: SecretPromptPresenter | None = None
+        automatic_coordinator: AutomaticRecoveryCoordinator | None = None
         broker: BrokerServer | None = None
         mcp_http: EmbeddedMcpServer | None = None
         previous: dict[int, object] = {}
@@ -342,12 +344,17 @@ class UnifiedApplication:
                     for record in recovery.records
                     if record.request_id in recovery.expected_reboot_request_ids
                 )
+                automatic_records = tuple(
+                    record
+                    for record in recovery.records
+                    if record.request_id in recovery.automatic_recovery_request_ids
+                )
                 protected_paths = tuple(
                     pool.expected_control_path(
                         record.machine_alias,
                         record.resolved_identity_sha256,
                     )
-                    for record in expected_reboot_records
+                    for record in expected_reboot_records + automatic_records
                     if record.resolved_identity_sha256 is not None
                 )
                 for reconciled_path in pool.reconcile_startup(
@@ -502,6 +509,116 @@ class UnifiedApplication:
                     config.limits.max_aggregate_collection_bytes
                 )
 
+                automatic_coordinator = AutomaticRecoveryCoordinator(
+                    state=store,
+                    spool=spool,
+                    transports=pool,
+                    backend_factory=lambda transport: RealRemoteJobBackend(
+                        transport,
+                        channels=channels,
+                        viewer_dir=paths.viewer_dir,
+                        collection_dir=collection_dir,
+                        limits=config.limits,
+                        collection_budget=collection_budget,
+                        recover_existing_viewer=True,
+                    ),
+                )
+                automatic_stop = threading.Event()
+                automatic_status: dict[str, str] = {}
+
+                def reconcile_ordinary_jobs() -> None:
+                    while not automatic_stop.is_set():
+                        pending_cleanup = tuple(
+                            record.request_id
+                            for record in store.load_all()
+                            if record.remote_phase
+                            is RemotePhase.RESULT_SPOOL_LOCALLY_VERIFIED
+                        )
+                        request_ids = tuple(
+                            dict.fromkeys(
+                                recovery.automatic_recovery_request_ids
+                                + pending_cleanup
+                            )
+                        )
+                        for request_id in request_ids:
+                            if automatic_stop.is_set():
+                                break
+                            try:
+                                record = store.load(request_id)
+                                endpoint = next(
+                                    (
+                                        item
+                                        for item in startup_endpoints
+                                        if item.machine_name == record.machine_alias
+                                        and item.endpoint_id == record.endpoint_id
+                                    ),
+                                    None,
+                                )
+                                if endpoint is None:
+                                    raise RuntimeError(
+                                        "durable recovery endpoint is no longer configured"
+                                    )
+                                outcome = automatic_coordinator.reconcile(
+                                    record, endpoint
+                                )
+                                status_key = outcome.status + "\0" + outcome.detail
+                                if automatic_status.get(request_id) != status_key:
+                                    automatic_status[request_id] = status_key
+                                    operator.publish_activity(
+                                        OperationalActivity.create(
+                                            (
+                                                ActivityKind.ERROR
+                                                if outcome.manual_action_required
+                                                else ActivityKind.STATUS
+                                            ),
+                                            "Automatic recovery: " + outcome.detail,
+                                            request_id=request_id,
+                                            machine_name=record.machine_alias,
+                                            endpoint_id=record.endpoint_id,
+                                        )
+                                    )
+                                if outcome.status in {
+                                    "failed-pre-remote",
+                                    "failed-remote-setup",
+                                    "recovered",
+                                    "result-recovered-cleanup-pending",
+                                    "no-action",
+                                }:
+                                    reboot_coordinator.release_claim(
+                                        record.machine_alias, request_id
+                                    )
+                            except BaseException as exc:
+                                detail = f"automatic recovery will retry safely: {exc}"
+                                if automatic_status.get(request_id) != detail:
+                                    automatic_status[request_id] = detail
+                                    operator.publish_activity(
+                                        OperationalActivity.create(
+                                            ActivityKind.ERROR,
+                                            detail,
+                                            request_id=request_id,
+                                        )
+                                    )
+                        automatic_stop.wait(1.0)
+
+                automatic_thread = threading.Thread(
+                    target=reconcile_ordinary_jobs,
+                    name="tmuxgate-automatic-recovery",
+                    daemon=True,
+                )
+                automatic_thread.start()
+
+                def close_automatic_coordinator() -> None:
+                    automatic_stop.set()
+                    automatic_thread.join(timeout=5)
+                    if automatic_thread.is_alive():
+                        owned_components_clean[0] = False
+                        report_error(
+                            "tmuxgate: automatic recovery worker did not stop"
+                        )
+                    automatic_coordinator.close()
+
+                resources.callback(close_automatic_coordinator)
+
                 def machine_disabler(machine_name: str) -> None:
                     def persist(name: str, expected_machine: Machine) -> None:
                         set_machine_enabled(
@@ -547,6 +664,7 @@ class UnifiedApplication:
                 store,
                 spool,
                 machine_enabled=availability.is_enabled,
+                runtime_owner=ownership.state_lock.owner,
             )
             run_worker_count = config.broker.max_pending_requests + 2
             control_worker_count = DEFAULT_CONTROL_WORKERS
@@ -566,7 +684,14 @@ class UnifiedApplication:
                 external_active_count=(
                     (lambda: 0)
                     if self._fake
-                    else (lambda: reboot_coordinator.active_count)
+                    else (
+                        lambda: reboot_coordinator.active_count
+                        + (
+                            automatic_coordinator.active_count
+                            if automatic_coordinator is not None
+                            else 0
+                        )
+                    )
                 ),
             )
             call_pools = resources.enter_context(
@@ -589,6 +714,7 @@ class UnifiedApplication:
                     RequestState.FAILED_REMOTE_SETUP,
                     RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_REBOOT,
                     RequestState.ABANDONED_AFTER_OPERATOR_CONFIRMED_DEAD_PANE,
+                    RequestState.ABANDONED_AFTER_OPERATOR_ACKNOWLEDGED_UNCERTAINTY,
                     RequestState.ABANDONED_AFTER_PROVEN_UNSTARTED,
                     RequestState.ABANDONED_AFTER_VERIFIED_REBOOT,
                     RequestState.DONE,
@@ -597,16 +723,37 @@ class UnifiedApplication:
                 def dashboard_snapshot() -> DashboardRuntimeSnapshot:
                     retained = set(pool.retained_machine_names) if pool else set()
                     records = store.load_all()
-                    jobs = tuple(
-                        DashboardJob(
+                    def dashboard_job(record) -> DashboardJob:
+                        manual = (
+                            record.state
+                            is RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING
+                            and (
+                                record.remote_phase.value == "legacy_uncertain"
+                                or (
+                                    record.failure_detail is not None
+                                    and "neither a complete authenticated result"
+                                    in record.failure_detail
+                                )
+                            )
+                        )
+                        return DashboardJob(
                             request_id=record.request_id,
                             machine_alias=record.machine_alias,
                             state=record.state.value,
                             updated_at=record.updated_at,
                             active=record.state not in terminal_states,
+                            manual_action_required=manual,
+                            recovery_evidence=(
+                                "phase="
+                                + record.remote_phase.value
+                                + "; "
+                                + (record.failure_detail or "no additional evidence")
+                                if manual
+                                else ""
+                            ),
                         )
-                        for record in records[-100:]
-                    )
+
+                    jobs = tuple(dashboard_job(record) for record in records[-100:])
                     machines = tuple(
                         DashboardMachine(
                             alias=name,
@@ -648,6 +795,37 @@ class UnifiedApplication:
                     )
 
                 operator.bind_dashboard_provider(dashboard_snapshot)
+
+                def acknowledge_uncertainty(request_id: str) -> str:
+                    record = store.load(request_id)
+                    manual = (
+                        record.state
+                        is RequestState.RECOVERY_REQUIRED_POSSIBLY_RUNNING
+                        and (
+                            record.remote_phase.value == "legacy_uncertain"
+                            or (
+                                record.failure_detail is not None
+                                and "neither a complete authenticated result"
+                                in record.failure_detail
+                            )
+                        )
+                    )
+                    if not manual:
+                        raise RuntimeError(
+                            "request no longer requires the uncertainty action"
+                        )
+                    abandoned = (
+                        store.mark_abandoned_after_operator_acknowledged_uncertainty(
+                            record
+                        )
+                    )
+                    if not self._fake:
+                        reboot_coordinator.release_claim(
+                            abandoned.machine_alias, abandoned.request_id
+                        )
+                    return abandoned.state.value
+
+                operator.bind_recovery_acknowledger(acknowledge_uncertainty)
             previous = self._install_signal_handlers()
             try:
                 broker.start()

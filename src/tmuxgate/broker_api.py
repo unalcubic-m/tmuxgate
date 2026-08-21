@@ -30,9 +30,10 @@ MAX_RESULT_CHUNK_BYTES = MAX_VERIFIED_RANGE_BYTES
 MAX_CURSOR_BYTES = 1024
 
 CONTROL_REQUEST_TYPES = frozenset(
-    {"list_machines", "list_jobs", "read_verified_result"}
+    {"list_machines", "list_jobs", "read_verified_result", "runtime_owner"}
 )
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_NONCE_RE = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
 _ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
 
 
@@ -142,6 +143,22 @@ class ListMachinesRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeOwnerRequest:
+    challenge: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.challenge, str) or _NONCE_RE.fullmatch(self.challenge) is None:
+            raise ValueError("runtime owner challenge must be a 128-bit hex nonce")
+
+    def to_wire_header(self) -> dict[str, object]:
+        return {
+            "challenge": self.challenge,
+            "protocol": PROTOCOL_VERSION,
+            "type": "runtime_owner",
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ListJobsRequest:
     states: tuple[RequestState, ...] = ()
     limit: int = DEFAULT_JOB_PAGE_SIZE
@@ -209,7 +226,10 @@ class ReadVerifiedResultRequest:
 
 
 ControlRequest: TypeAlias = (
-    ListMachinesRequest | ListJobsRequest | ReadVerifiedResultRequest
+    ListMachinesRequest
+    | ListJobsRequest
+    | ReadVerifiedResultRequest
+    | RuntimeOwnerRequest
 )
 
 
@@ -229,6 +249,69 @@ class MachineList:
                 "machines": [machine.to_wire() for machine in self.machines],
                 "protocol": PROTOCOL_VERSION,
                 "type": "list_machines_result",
+            },
+            b"",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeOwnerProof:
+    challenge: str
+    instance_id: str
+    pid: int
+    uid: int
+    boot_id: str
+    process_start_ticks: int
+    executable_device: int
+    executable_inode: int
+    started_at_ns: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.challenge, str) or _NONCE_RE.fullmatch(self.challenge) is None:
+            raise ValueError("runtime owner proof challenge is invalid")
+        if not isinstance(self.instance_id, str) or _NONCE_RE.fullmatch(self.instance_id) is None:
+            raise ValueError("runtime owner proof instance ID is invalid")
+        if not isinstance(self.boot_id, str) or not self.boot_id or "\x00" in self.boot_id:
+            raise ValueError("runtime owner proof boot ID is invalid")
+        for name, value in (
+            ("pid", self.pid),
+            ("uid", self.uid),
+            ("process_start_ticks", self.process_start_ticks),
+            ("executable_device", self.executable_device),
+            ("executable_inode", self.executable_inode),
+            ("started_at_ns", self.started_at_ns),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"runtime owner proof {name} is invalid")
+
+    @classmethod
+    def from_owner(cls, challenge: str, owner: object) -> "RuntimeOwnerProof":
+        return cls(
+            challenge=challenge,
+            instance_id=getattr(owner, "instance_id"),
+            pid=getattr(owner, "pid"),
+            uid=getattr(owner, "uid"),
+            boot_id=getattr(owner, "boot_id"),
+            process_start_ticks=getattr(owner, "process_start_ticks"),
+            executable_device=getattr(owner, "executable_device"),
+            executable_inode=getattr(owner, "executable_inode"),
+            started_at_ns=getattr(owner, "started_at_ns"),
+        )
+
+    def to_wire(self) -> tuple[dict[str, object], bytes]:
+        return (
+            {
+                "boot_id": self.boot_id,
+                "challenge": self.challenge,
+                "executable_device": self.executable_device,
+                "executable_inode": self.executable_inode,
+                "instance_id": self.instance_id,
+                "pid": self.pid,
+                "process_start_ticks": self.process_start_ticks,
+                "protocol": PROTOCOL_VERSION,
+                "started_at_ns": self.started_at_ns,
+                "type": "runtime_owner_result",
+                "uid": self.uid,
             },
             b"",
         )
@@ -418,7 +501,9 @@ class VerifiedResultChunk:
         )
 
 
-ControlResponse: TypeAlias = MachineList | JobPage | VerifiedResultChunk
+ControlResponse: TypeAlias = (
+    MachineList | JobPage | VerifiedResultChunk | RuntimeOwnerProof
+)
 
 
 class ControlService(Protocol):
@@ -438,6 +523,16 @@ def decode_control_request(frame: Frame) -> ControlRequest:
     if request_type == "list_machines":
         _exact_header(frame.header, {"protocol", "type"}, label="list_machines request")
         return ListMachinesRequest()
+    if request_type == "runtime_owner":
+        _exact_header(
+            frame.header,
+            {"challenge", "protocol", "type"},
+            label="runtime_owner request",
+        )
+        try:
+            return RuntimeOwnerRequest(frame.header["challenge"])
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError(str(exc)) from exc
     if request_type == "list_jobs":
         _exact_header(
             frame.header,
@@ -528,6 +623,33 @@ def decode_control_response(request: ControlRequest, frame: Frame) -> ControlRes
         except ValueError as exc:
             raise ProtocolError(str(exc)) from exc
 
+    if isinstance(request, RuntimeOwnerRequest):
+        expected = {
+            "boot_id", "challenge", "executable_device", "executable_inode",
+            "instance_id", "pid", "process_start_ticks", "protocol",
+            "started_at_ns", "type", "uid",
+        }
+        _exact_header(frame.header, expected, label="runtime_owner response")
+        if response_type != "runtime_owner_result" or frame.payload:
+            raise ProtocolError("broker sent an invalid runtime owner response")
+        try:
+            proof = RuntimeOwnerProof(
+                challenge=frame.header["challenge"],
+                instance_id=frame.header["instance_id"],
+                pid=frame.header["pid"],
+                uid=frame.header["uid"],
+                boot_id=frame.header["boot_id"],
+                process_start_ticks=frame.header["process_start_ticks"],
+                executable_device=frame.header["executable_device"],
+                executable_inode=frame.header["executable_inode"],
+                started_at_ns=frame.header["started_at_ns"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError(str(exc)) from exc
+        if proof.challenge != request.challenge:
+            raise ProtocolError("runtime owner challenge was not echoed exactly")
+        return proof
+
     assert isinstance(request, ReadVerifiedResultRequest)
     expected = {
         "eof", "exit_status", "manifest_sha256", "next_offset", "offset",
@@ -608,6 +730,7 @@ class BrokerControlService:
         result_spool: ResultSpool,
         *,
         machine_enabled: Callable[[str], bool] | None = None,
+        runtime_owner: object | None = None,
     ) -> None:
         summaries: list[MachineSummary] = []
         if isinstance(machines, Mapping):
@@ -634,6 +757,7 @@ class BrokerControlService:
         self._machine_enabled = machine_enabled
         self._state_store = state_store
         self._result_spool = result_spool
+        self._runtime_owner = runtime_owner
 
     def handle(self, request: ControlRequest) -> ControlResponse:
         if isinstance(request, ListMachinesRequest):
@@ -661,6 +785,13 @@ class BrokerControlService:
                     )
                 )
             return MachineList(tuple(machines))
+        if isinstance(request, RuntimeOwnerRequest):
+            if self._runtime_owner is None:
+                raise BrokerControlError(
+                    "runtime_owner_unavailable",
+                    "broker runtime owner proof is unavailable",
+                )
+            return RuntimeOwnerProof.from_owner(request.challenge, self._runtime_owner)
         if isinstance(request, ListJobsRequest):
             return self._list_jobs(request)
         if isinstance(request, ReadVerifiedResultRequest):

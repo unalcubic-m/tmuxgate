@@ -531,6 +531,7 @@ class SshChannelRunner:
         socket_path: Path,
         session_name: str,
         secret_input_recipient: SecretInputRecipient | None = None,
+        adopt_existing: bool = False,
     ) -> "DetachedTmuxViewerProcess":
         """Launch one SSH viewer in its own private local tmux server."""
 
@@ -539,11 +540,18 @@ class SshChannelRunner:
         if _VIEWER_SESSION_RE.fullmatch(session_name) is None:
             raise TransportError("detached viewer session name is invalid")
         if self.prompt_presenter is not None:
-            if not isinstance(secret_input_recipient, SecretInputRecipient):
+            if (
+                not isinstance(secret_input_recipient, SecretInputRecipient)
+                and not adopt_existing
+            ):
                 raise TransportError(
                     "automatic prompt detection requires an exact secret-input recipient"
                 )
-            if session_name != f"tmuxgate-{secret_input_recipient.request_id[:12]}":
+            if (
+                isinstance(secret_input_recipient, SecretInputRecipient)
+                and session_name
+                != f"tmuxgate-{secret_input_recipient.request_id[:12]}"
+            ):
                 raise TransportError(
                     "detached viewer session does not match its exact request"
                 )
@@ -551,8 +559,26 @@ class SshChannelRunner:
             raise TransportError(
                 "secret-input recipient requires an automatic prompt presenter"
             )
+        if type(adopt_existing) is not bool:
+            raise TransportError("detached viewer adoption flag is invalid")
         if socket_path.exists() or socket_path.is_symlink():
-            raise TransportError("refusing a pre-existing detached viewer socket")
+            if not adopt_existing or socket_path.is_symlink():
+                raise TransportError("refusing a pre-existing detached viewer socket")
+            metadata = os.lstat(socket_path)
+            if (
+                not stat.S_ISSOCK(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise TransportError("pre-existing detached viewer socket is unsafe")
+            viewer = DetachedTmuxViewerProcess(
+                self.runner, socket_path, session_name
+            )
+            if viewer.attached:
+                return viewer
+            # The exact private socket is owner-controlled and the exact
+            # request-derived tmux session is authoritatively absent.
+            viewer.terminate()
         completed = _run_completed(
             self.runner(
                 (
@@ -586,8 +612,10 @@ class SshChannelRunner:
         # no controlling terminal, so prompt-like output from it can never be a
         # real secret request and must not be able to propose a handoff.
         if self.prompt_presenter is not None:
-            assert secret_input_recipient is not None
-            if secret_input_recipient.request.interactive:
+            if (
+                secret_input_recipient is not None
+                and secret_input_recipient.request.interactive
+            ):
                 self.prompt_presenter.watch(viewer, secret_input_recipient)
         return viewer
 

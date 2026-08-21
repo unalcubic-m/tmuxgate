@@ -242,6 +242,7 @@ class RealRemoteJobBackend(RemoteJobBackend):
         collection_dir: Path | None = None,
         limits: ResultLimits = ResultLimits(),
         collection_budget: LocalCollectionBudget | None = None,
+        recover_existing_viewer: bool = False,
     ) -> None:
         self.transport = transport
         self.channels = SshChannelRunner() if channels is None else channels
@@ -263,6 +264,9 @@ class RealRemoteJobBackend(RemoteJobBackend):
                     "secret-input recipient does not match the acquired transport"
                 )
         self.secret_input_recipient = secret_input_recipient
+        if type(recover_existing_viewer) is not bool:
+            raise TypeError("recover_existing_viewer must be boolean")
+        self.recover_existing_viewer = recover_existing_viewer
         self.attach_timeout_seconds = float(attach_timeout_seconds)
         self.viewer_dir = viewer_dir
         self.collection_dir = collection_dir
@@ -289,7 +293,8 @@ class RealRemoteJobBackend(RemoteJobBackend):
     def _control_command(identity: RemoteJobIdentity, operation: str) -> str:
         if operation not in {
             "validate", "create", "observe", "release",
-            "attach", "collect-stdout", "collect-stderr", "cleanup",
+            "attach", "collect-stdout", "collect-stderr", "discard-unstarted",
+            "cleanup",
         }:
             raise RemoteJobError("unsupported remote control operation")
         request_id = identity.request_id
@@ -350,6 +355,7 @@ class RealRemoteJobBackend(RemoteJobBackend):
                 socket_path=self.viewer_dir / f"{identity.request_id}.sock",
                 session_name=f"tmuxgate-{identity.request_id[:12]}",
                 secret_input_recipient=self.secret_input_recipient,
+                adopt_existing=self.recover_existing_viewer,
             )
         deadline = time.monotonic() + self.attach_timeout_seconds
         while time.monotonic() < deadline:
@@ -548,4 +554,39 @@ class RealRemoteJobBackend(RemoteJobBackend):
             raise
 
     def cleanup(self, identity: RemoteJobIdentity) -> None:
-        self._batch(identity, "cleanup")
+        # Cleanup must survive a crash after the remote directory was removed
+        # but before the local completion marker was fsynced. The exact guarded
+        # directory is therefore probed outside the directory-resident helper;
+        # an existing directory is still deleted only by that helper's strict
+        # allowlist and completed-result checks.
+        script = r'''set -u
+umask 077
+job_id=$1
+[[ $job_id =~ ^[0-9a-f]{32}$ ]] || exit 125
+parent=$HOME/.cache/tmuxgate/jobs
+job_dir=$parent/$job_id
+[ -d "$parent" ] && [ ! -L "$parent" ] || exit 125
+[ "$(stat -c '%a:%u' "$parent")" = "700:$(id -u)" ] || exit 125
+if [ ! -e "$job_dir" ]; then
+    exit 0
+fi
+[ -d "$job_dir" ] && [ ! -L "$job_dir" ] || exit 125
+[ "$(stat -c '%a:%u' "$job_dir")" = "700:$(id -u)" ] || exit 125
+[ -f "$job_dir/remote_control.sh" ] && [ ! -L "$job_dir/remote_control.sh" ] || exit 125
+/bin/bash "$job_dir/remote_control.sh" cleanup "$job_id" || exit $?
+[ ! -e "$job_dir" ]
+'''
+        command = "/bin/bash -c " + shlex.quote(script) + " tmuxgate-cleanup " + identity.request_id
+        result = self.channels.batch(
+            (*self._batch_prefix(), command),
+            timeout_seconds=30,
+        )
+        if result.returncode != 0:
+            raise RemoteJobError(
+                f"remote cleanup failed with status {result.returncode}"
+            )
+
+    def discard_unstarted(self, identity: RemoteJobIdentity) -> None:
+        """Remove only an exact wrapper that still proves its gate was closed."""
+
+        self._batch(identity, "discard-unstarted")
