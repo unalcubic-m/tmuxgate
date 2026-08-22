@@ -32,10 +32,16 @@ class McpSurfaceTests(unittest.IsolatedAsyncioTestCase):
                 {"run_argv", "run_script", "get_job", "list_jobs"},
             )
             by_name = {tool.name: tool for tool in tools}
-            self.assertFalse(by_name["run_argv"].annotations.read_only_hint)
-            self.assertTrue(by_name["run_argv"].annotations.destructive_hint)
-            self.assertFalse(by_name["get_job"].annotations.destructive_hint)
-            self.assertTrue(by_name["get_job"].annotations.read_only_hint)
+            run_annotations = by_name["run_argv"].annotations
+            get_annotations = by_name["get_job"].annotations
+            self.assertIsNotNone(run_annotations)
+            self.assertIsNotNone(get_annotations)
+            assert run_annotations is not None
+            assert get_annotations is not None
+            self.assertFalse(run_annotations.read_only_hint)
+            self.assertTrue(run_annotations.destructive_hint)
+            self.assertFalse(get_annotations.destructive_hint)
+            self.assertTrue(get_annotations.read_only_hint)
             result = await server.call_tool(
                 "run_argv",
                 {
