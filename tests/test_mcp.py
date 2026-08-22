@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
-from typing import Any
+from typing import Any, cast
 import unittest
+
+from mcp.types import CallToolResult
 
 from tmuxgate.config import Config
 from tmuxgate.credentials import CredentialStore
@@ -29,6 +31,11 @@ class McpSurfaceTests(unittest.IsolatedAsyncioTestCase):
                 {tool.name for tool in tools},
                 {"run_argv", "run_script", "get_job", "list_jobs"},
             )
+            by_name = {tool.name: tool for tool in tools}
+            self.assertFalse(by_name["run_argv"].annotations.read_only_hint)
+            self.assertTrue(by_name["run_argv"].annotations.destructive_hint)
+            self.assertFalse(by_name["get_job"].annotations.destructive_hint)
+            self.assertTrue(by_name["get_job"].annotations.read_only_hint)
             result = await server.call_tool(
                 "run_argv",
                 {
@@ -37,16 +44,26 @@ class McpSurfaceTests(unittest.IsolatedAsyncioTestCase):
                     "argv": ["true"],
                 },
             )
+            self.assertIsInstance(result, CallToolResult)
+            result = cast(CallToolResult, result)
+            self.assertIsNotNone(result.structured_content)
+            assert result.structured_content is not None
             self.assertEqual(result.structured_content["error_code"], "unknown_machine")
             self.assertEqual(result.structured_content["configured_aliases"], ["exact"])
             script_result = await server.call_tool(
                 "run_script",
                 {"machine": "missing", "cwd": "/tmp", "script": "true"},
             )
+            self.assertIsInstance(script_result, CallToolResult)
+            script_result = cast(CallToolResult, script_result)
+            self.assertIsNotNone(script_result.structured_content)
+            assert script_result.structured_content is not None
             self.assertEqual(
                 script_result.structured_content["error_code"], "unknown_machine"
             )
             listed = await server.call_tool("list_jobs", {})
+            self.assertIsInstance(listed, CallToolResult)
+            listed = cast(CallToolResult, listed)
             self.assertEqual(listed.structured_content, {"jobs": []})
 
     async def test_bearer_guard_rejects_missing_wrong_and_duplicate_headers(self) -> None:

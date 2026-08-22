@@ -98,10 +98,10 @@ def create_mcp_server(service: ExecutionService) -> MCPServer:
         name="run_argv",
         description="Run exact argv in one persistent remote tmux job.",
         annotations=ToolAnnotations(
-            readOnlyHint=False,
-            destructiveHint=True,
-            idempotentHint=False,
-            openWorldHint=True,
+            read_only_hint=False,
+            destructive_hint=True,
+            idempotent_hint=False,
+            open_world_hint=True,
         ),
         structured_output=True,
     )
@@ -128,10 +128,10 @@ def create_mcp_server(service: ExecutionService) -> MCPServer:
         name="run_script",
         description="Run one UTF-8 shell script in a persistent remote tmux job.",
         annotations=ToolAnnotations(
-            readOnlyHint=False,
-            destructiveHint=True,
-            idempotentHint=False,
-            openWorldHint=True,
+            read_only_hint=False,
+            destructive_hint=True,
+            idempotent_hint=False,
+            open_world_hint=True,
         ),
         structured_output=True,
     )
@@ -158,10 +158,10 @@ def create_mcp_server(service: ExecutionService) -> MCPServer:
         name="get_job",
         description="Read one durable job and its collected result when complete.",
         annotations=ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            idempotentHint=True,
-            openWorldHint=False,
+            read_only_hint=True,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
         ),
         structured_output=True,
     )
@@ -175,10 +175,10 @@ def create_mcp_server(service: ExecutionService) -> MCPServer:
         name="list_jobs",
         description="List recent durable jobs so interrupted callers can rediscover IDs.",
         annotations=ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            idempotentHint=True,
-            openWorldHint=False,
+            read_only_hint=True,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
         ),
         structured_output=True,
     )
