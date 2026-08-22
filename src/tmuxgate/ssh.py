@@ -45,7 +45,11 @@ async def run(
         "--",
         destination,
         remote_command(arguments),
-        stdin=asyncio.subprocess.PIPE,
+        stdin=(
+            asyncio.subprocess.PIPE
+            if input_data is not None
+            else asyncio.subprocess.DEVNULL
+        ),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=environment,
