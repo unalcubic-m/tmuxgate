@@ -1,59 +1,8 @@
-# All addresses in this file are RFC 5737 documentation ranges.
-# Replace every example alias, address, user, and SSH profile before use.
-version = 2
-
-[broker]
-max_active_remote_commands = 3
-max_open_ssh_masters = 3
-max_pending_requests = 16
-queue_policy = "fifo"
-ssh_master_idle_timeout_seconds = 600
-reboot_recovery_timeout_seconds = 300
-approval_mode = "disabled"
+# Each value is an exact destination accepted by ordinary OpenSSH.
+[machines]
+proxmox = "proxmox"
+homeserver = "homeserver"
+homeassistant = "homeassistant"
 
 [mcp]
-host = "127.0.0.1"
 port = 8765
-
-[limits]
-# Exact byte ceilings. Output at a limit is accepted; one byte over fails closed.
-max_stdout_bytes = 268435456
-max_stderr_bytes = 268435456
-max_total_result_bytes = 536870912
-max_local_collection_bytes = 536870912
-max_remote_capture_bytes = 536870912
-max_aggregate_collection_bytes = 1610612736
-
-[contexts.home]
-gateway = "192.0.2.1"
-source_cidr = "192.0.2.0/24"
-
-# Enroll complete fingerprints while physically connected to the trusted
-# network. Without a fingerprint, the home endpoint remains ineligible.
-fingerprints = []
-
-[contexts.wireguard]
-local_addresses = ["198.51.100.3/32"]
-remote_cidrs = ["198.51.100.128/25"]
-
-[machines.app-server]
-description = "Example application server"
-enabled = true
-ssh_profile = "app-server"
-user = "operator"
-host_key_alias = "tmuxgate-app-server"
-connect_timeout_seconds = 6
-
-[[machines.app-server.endpoints]]
-id = "home-lan"
-address = "192.0.2.20"
-port = 22
-priority = 10
-requires = "home"
-
-[[machines.app-server.endpoints]]
-id = "wireguard"
-address = "198.51.100.200"
-port = 22
-priority = 20
-requires = "wireguard"
