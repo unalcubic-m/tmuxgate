@@ -76,7 +76,7 @@ jobs:
           test ! -e src/tmuxgate/broker.py
           test ! -e src/tmuxgate/textual_interface.py
           test ! -e src/tmuxgate/transport.py
-          ! grep -R -n -E 'textual|/dev/tty|ControlMaster|RUNNING_ATTACHED|MCP-to-Unix' src pyproject.toml
+          ! git grep -n -E 'textual|/dev/tty|ControlMaster|RUNNING_ATTACHED|MCP-to-Unix' -- src pyproject.toml
 
   package:
     name: Package smoke test
