@@ -2,34 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 
 JobState = Literal["starting", "running", "complete", "failed", "unknown"]
 JOB_STATES = frozenset({"starting", "running", "complete", "failed", "unknown"})
-JOB_FIELDS = frozenset(
-    {
-        "job_id",
-        "machine",
-        "sudo",
-        "state",
-        "created_at",
-        "updated_at",
-        "remote_directory",
-        "remote_session",
-        "exit_code",
-        "error_code",
-        "error_detail",
-        "stdout_path",
-        "stderr_path",
-    }
-)
 
 
 class JobStoreError(RuntimeError):
@@ -55,6 +38,9 @@ class Job:
     error_detail: str | None
     stdout_path: str
     stderr_path: str
+
+
+JOB_FIELDS = frozenset(field.name for field in fields(Job))
 
 
 def _validate_job_id(job_id: str) -> None:
@@ -90,21 +76,7 @@ def _from_dict(value: object) -> Job:
     for field in ("error_code", "error_detail"):
         if value[field] is not None and not isinstance(value[field], str):
             raise JobStoreError(f"{field} must be a string or null")
-    return Job(
-        job_id=job_id,
-        machine=cast(str, value["machine"]),
-        sudo=cast(bool, value["sudo"]),
-        state=cast(JobState, state),
-        created_at=cast(str, value["created_at"]),
-        updated_at=cast(str, value["updated_at"]),
-        remote_directory=cast(str, value["remote_directory"]),
-        remote_session=cast(str, value["remote_session"]),
-        exit_code=cast(int | None, value["exit_code"]),
-        error_code=cast(str | None, value["error_code"]),
-        error_detail=cast(str | None, value["error_detail"]),
-        stdout_path=cast(str, value["stdout_path"]),
-        stderr_path=cast(str, value["stderr_path"]),
-    )
+    return Job(**cast(dict[str, Any], value))
 
 
 class JobStore:
@@ -143,16 +115,14 @@ class JobStore:
             stdout_path=str(result_dir / "stdout"),
             stderr_path=str(result_dir / "stderr"),
         )
-        if self._path(job_id).exists():
-            raise JobStoreError(f"job already exists: {job_id}")
-        self.save(job)
+        self.save(job, exclusive=True)
         return job
 
     def _path(self, job_id: str) -> Path:
         _validate_job_id(job_id)
         return self.jobs_dir / f"{job_id}.json"
 
-    def save(self, job: Job) -> Job:
+    def save(self, job: Job, *, exclusive: bool = False) -> Job:
         _validate_job_id(job.job_id)
         if job.state not in JOB_STATES:
             raise JobStoreError("job state is invalid")
@@ -169,7 +139,15 @@ class JobStore:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self._path(job.job_id))
+            path = self._path(job.job_id)
+            if exclusive:
+                try:
+                    os.link(temporary, path)
+                except FileExistsError as exc:
+                    raise JobStoreError(f"job already exists: {job.job_id}") from exc
+                temporary.unlink()
+            else:
+                os.replace(temporary, path)
             directory_descriptor = os.open(self.jobs_dir, os.O_RDONLY)
             try:
                 os.fsync(directory_descriptor)
@@ -192,7 +170,16 @@ class JobStore:
     def load(self, job_id: str) -> Job:
         path = self._path(job_id)
         try:
-            return _from_dict(json.loads(path.read_text(encoding="utf-8")))
+            job = _from_dict(json.loads(path.read_text(encoding="utf-8")))
+            result_dir = self.results_dir / job.job_id
+            if (
+                job.remote_directory != f"~/.cache/tmuxgate/jobs/{job.job_id}"
+                or job.remote_session != f"tmuxgate-{job.job_id}"
+                or job.stdout_path != str(result_dir / "stdout")
+                or job.stderr_path != str(result_dir / "stderr")
+            ):
+                raise JobStoreError("job record contains unsafe derived paths")
+            return job
         except FileNotFoundError:
             raise
         except (OSError, UnicodeError, json.JSONDecodeError, JobStoreError) as exc:

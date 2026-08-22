@@ -7,7 +7,7 @@ load config
 start authenticated loopback MCP
 receive request
 acquire one of three slots
-stage run.sh over SSH
+stage run.sh directly over SSH stdin
 start one remote tmux session
 optionally start it through whole-job sudo
 poll done
@@ -80,14 +80,20 @@ error_code error_detail stdout_path stderr_path
 ```
 
 The only states are `starting`, `running`, `complete`, `failed`, and `unknown`.
-Every JSON update writes a mode-`0600` temporary file, fsyncs it, atomically
-renames it, and fsyncs the jobs directory. No old state is parsed or migrated.
+The `Job` dataclass is the field authority. Initial publication is atomic and
+exclusive; every update writes a mode-`0600` temporary file, fsyncs it,
+atomically renames it, and fsyncs the jobs directory. Current-format records
+remain readable, while extra fields and non-derived paths are rejected. No old
+state is parsed or migrated.
 
 ## Remote lifecycle
 
 The service writes `starting` before any SSH action and acquires one semaphore
-slot before staging. A tar stream stages mode-`0700` `run.sh` into a new remote
-directory. Staging never overwrites an existing directory.
+slot before staging. SSH stdin writes `run.sh` directly into a new remote
+directory under umask `077`, then changes it to mode `0700`. The directory is
+created exclusively, and tmux is not started until the complete staging SSH
+command succeeds, so an interrupted write cannot execute. This direct path is
+permission-correct and easier to inspect than wrapping one file in tar.
 
 The start operation invokes exactly one detached session:
 
@@ -133,11 +139,13 @@ left for conservative startup recovery.
 Sudo is an explicit Boolean request property. tmuxgate never scans command text
 for sudo and never detects or answers prompts.
 
-The executor first runs `sudo -n -- true`. If passwordless sudo is unavailable,
-it reads the machine's owner-only credential, validates it with
-`sudo -S -k -p '' -- true`, and reads it again for the start operation. Password
-bytes are passed only as SSH stdin and the bytearray is overwritten and cleared
-immediately after each subprocess completes.
+One sudo-access function tests an explicitly entered CLI password, or first runs
+`sudo -n -- true` and then loads and validates the machine's owner-only stored
+credential with `sudo -S -k -p '' -- true`. The same failure classifier handles
+SSH disconnects, unavailable sudo, and unsupported `requiretty` policies. A
+password-based start reads the credential again. Password bytes are passed only
+as SSH stdin and the bytearray is overwritten and cleared immediately after
+each subprocess completes.
 
 The remote normal user's UID and GID are obtained before sudo and passed as
 numeric wrapper arguments. The root `run.sh` changes stdout, stderr, exit-code,
@@ -146,8 +154,9 @@ rename the completion marker to `done`. This lets the ordinary SSH user collect
 and clean the result.
 
 `requiretty` policies are unsupported because tmuxgate never requests a TTY.
-Errors are stable, include machine and job ID for execution jobs, and omit the
-password.
+Lower executor operations return a stable code and plain detail. Execution and
+recovery add machine and job ID exactly once; credential CLI errors have no fake
+job context. All error details omit the password.
 
 ## Service lifecycle and logging
 

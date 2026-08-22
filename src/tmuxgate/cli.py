@@ -13,12 +13,17 @@ import sys
 import uvicorn
 
 from tmuxgate import __version__
-from tmuxgate.config import ConfigError, default_state_dir, load_config
+from tmuxgate.config import (
+    ConfigError,
+    UnknownMachineError,
+    default_state_dir,
+    load_config,
+)
 from tmuxgate.credentials import CredentialError, CredentialStore, _erase
-from tmuxgate.executor import ExecutionError, RemoteExecutor
+from tmuxgate.executor import ExecutionError, RemoteExecutor, sudo_access
 from tmuxgate.jobs import JobStore, JobStoreError
 from tmuxgate.mcp import authenticated_app, load_bearer_token
-from tmuxgate.service import ExecutionService, UnknownMachineError, job_view
+from tmuxgate.service import ExecutionService, job_view
 
 
 LOGGER = logging.getLogger(__name__)
@@ -63,15 +68,6 @@ def _paths(args: argparse.Namespace) -> tuple[Path | None, Path]:
     return args.config, state_dir
 
 
-def _stack(args: argparse.Namespace) -> tuple[ExecutionService, RemoteExecutor]:
-    config_path, state_dir = _paths(args)
-    config = load_config(config_path)
-    store = JobStore(state_dir)
-    credentials = CredentialStore(state_dir)
-    executor = RemoteExecutor(store, credentials)
-    return ExecutionService(config, store, executor), executor
-
-
 async def _serve(args: argparse.Namespace) -> int:
     config_path, state_dir = _paths(args)
     config = load_config(config_path)
@@ -106,14 +102,15 @@ def _serve_command(args: argparse.Namespace) -> int:
 
 
 async def _sudo_set(args: argparse.Namespace) -> int:
-    service, executor = _stack(args)
-    destination = service.destination(args.machine)
+    config_path, state_dir = _paths(args)
+    destination = load_config(config_path).destination(args.machine)
+    credentials = CredentialStore(state_dir)
     entered = getpass.getpass(f"Sudo password for {args.machine}: ")
     password = bytearray(entered.encode("utf-8"))
     entered = ""
     try:
-        await executor.test_sudo_password(args.machine, destination, password)
-        executor.credentials.save(args.machine, password)
+        await sudo_access(credentials, args.machine, destination, password)
+        credentials.save(args.machine, password)
     finally:
         _erase(password)
     print(f"Stored tested sudo credential for {args.machine}")
@@ -125,9 +122,10 @@ def _sudo_set_command(args: argparse.Namespace) -> int:
 
 
 async def _sudo_test(args: argparse.Namespace) -> int:
-    service, executor = _stack(args)
-    destination = service.destination(args.machine)
-    mode = await executor.test_stored_sudo(args.machine, destination)
+    config_path, state_dir = _paths(args)
+    destination = load_config(config_path).destination(args.machine)
+    credentials = CredentialStore(state_dir)
+    mode = await sudo_access(credentials, args.machine, destination)
     print(f"Sudo access for {args.machine}: {mode}")
     return 0
 
@@ -137,25 +135,26 @@ def _sudo_test_command(args: argparse.Namespace) -> int:
 
 
 def _sudo_clear_command(args: argparse.Namespace) -> int:
-    service, executor = _stack(args)
-    service.destination(args.machine)
-    removed = executor.credentials.clear(args.machine)
+    config_path, state_dir = _paths(args)
+    load_config(config_path).destination(args.machine)
+    removed = CredentialStore(state_dir).clear(args.machine)
     status = "Cleared" if removed else "No stored"
     print(f"{status} sudo credential for {args.machine}")
     return 0
 
 
 def _jobs_command(args: argparse.Namespace) -> int:
-    service, _executor = _stack(args)
+    _config_path, state_dir = _paths(args)
+    store = JobStore(state_dir)
     if args.job_id is None:
         value: object = {
             "jobs": [
                 job_view(job, include_result=False)
-                for job in service.list_jobs(args.limit)
+                for job in store.list(args.limit)
             ]
         }
     else:
-        value = job_view(service.get_job(args.job_id))
+        value = job_view(store.load(args.job_id))
     print(json.dumps(value, ensure_ascii=False, indent=2))
     return 0
 

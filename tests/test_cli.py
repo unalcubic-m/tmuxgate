@@ -52,12 +52,16 @@ class CliTests(unittest.TestCase):
             self.assertEqual(main(self.arguments("sudo", "test", "machine")), 0)
             self.assertEqual(main(self.arguments("sudo", "clear", "machine")), 0)
             self.assertIsNone(store.read("machine"))
+            self.assertFalse((self.state / "jobs").exists())
+            self.assertFalse((self.state / "results").exists())
 
     def test_jobs_lists_empty_durable_state(self) -> None:
+        self.config.unlink()
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(main(self.arguments("jobs")), 0)
         self.assertEqual(output.getvalue().strip(), '{\n  "jobs": []\n}')
+        self.assertFalse((self.state / "sudo").exists())
 
 
 if __name__ == "__main__":
