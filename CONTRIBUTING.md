@@ -20,7 +20,7 @@ Preserve the core invariants:
 
 - exact configured machine aliases;
 - ordinary OpenSSH policy and fatal host-key verification;
-- one remote tmux session per job and no local tmux session;
+- exactly one remote tmux session per job;
 - stdin closed from `/dev/null`;
 - local collection before `complete` and cleanup only afterward;
 - no automatic rerun of possibly-started work;

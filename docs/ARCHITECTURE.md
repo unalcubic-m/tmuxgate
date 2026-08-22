@@ -16,10 +16,6 @@ save the durable local result
 clean the remote directory
 ```
 
-There is no local broker socket, frame protocol, approval process, terminal
-ownership, local tmux session, route planner, transport pool, installer, or
-parallel execution implementation.
-
 ## Modules
 
 - `config.py` accepts only `[machines]` and optional `[mcp].port` TOML data.
@@ -82,9 +78,8 @@ error_code error_detail stdout_path stderr_path
 The only states are `starting`, `running`, `complete`, `failed`, and `unknown`.
 The `Job` dataclass is the field authority. Initial publication is atomic and
 exclusive; every update writes a mode-`0600` temporary file, fsyncs it,
-atomically renames it, and fsyncs the jobs directory. Current-format records
-remain readable, while extra fields and non-derived paths are rejected. No old
-state is parsed or migrated.
+atomically renames it, and fsyncs the jobs directory. Records with extra fields
+or non-derived paths are rejected.
 
 ## Remote lifecycle
 

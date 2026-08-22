@@ -43,7 +43,6 @@ journalctl --user -u tmuxgate -n 200 --no-pager
 Logs may contain sanitized remote error text and job metadata. Avoid placing
 secrets in command output when possible.
 
-## Supported versions
+## Security support
 
-The current `main` branch is supported. Older pre-simplification state formats
-and installations are not migrated or supported.
+Security fixes target the current `main` branch.

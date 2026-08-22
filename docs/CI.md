@@ -15,8 +15,7 @@ coverage report
 PYTHONPATH=src:tests python -m unittest test_ci_policy -v
 ```
 
-It also asserts that removed source and custom installation paths have not
-returned. Third-party GitHub Actions must be pinned to full commit hashes.
+Third-party GitHub Actions must be pinned to full commit hashes.
 
 The package job installs the project without development dependencies, runs the
 CLI outside the checkout, and reads an empty durable job list from isolated XDG

@@ -13,10 +13,8 @@ authenticated local MCP
   → durable local result
 ```
 
-tmuxgate has no approvals, dashboard, terminal UI, local tmux viewer, route
-planner, SSH connection pool, automatic key enrollment, configuration editor,
-or custom installer. OpenSSH configuration owns hosts, users, ports, keys,
-ProxyJump, and host-key verification.
+OpenSSH configuration owns hosts, users, ports, keys, ProxyJump, and host-key
+verification.
 
 ## Five-minute setup
 

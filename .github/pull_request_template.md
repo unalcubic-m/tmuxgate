@@ -13,9 +13,9 @@
 ## Validation
 
 - [ ] `PYTHONPATH=src:tests python3 -m unittest discover -s tests -v`
-- [ ] `ruff check src tests scripts`
+- [ ] `ruff check src tests`
 - [ ] `pyright`
-- [ ] `shellcheck install.sh bin/tmuxgate src/tmuxgate/assets/*.sh`
+- [ ] `shellcheck src/tmuxgate/assets/remote_job.sh`
 - [ ] Branch coverage remains at or above the documented threshold
 - [ ] No real addresses, credentials, fingerprints, runtime state, or result data are included
 - [ ] Architecture/security documentation is updated when required

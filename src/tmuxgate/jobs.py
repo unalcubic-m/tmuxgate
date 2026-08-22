@@ -50,7 +50,7 @@ def _validate_job_id(job_id: str) -> None:
 
 def _from_dict(value: object) -> Job:
     if not isinstance(value, dict) or set(value) != JOB_FIELDS:
-        raise JobStoreError("job record does not use the current minimal format")
+        raise JobStoreError("job record fields are invalid")
     job_id = value["job_id"]
     if not isinstance(job_id, str):
         raise JobStoreError("job_id must be a string")
