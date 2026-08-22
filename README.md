@@ -169,7 +169,9 @@ tmuxgate serve
 It always binds `127.0.0.1`, requires the owner-only bearer-token file, and
 logs through Python's standard logging module for journald capture. The unit
 explicitly removes inherited `TMUXGATE_MCP_TOKEN` and
-`TMUXGATE_BEARER_TOKEN` values before starting the server.
+`TMUXGATE_BEARER_TOKEN` values before starting the server. It uses
+`KillMode=mixed` so a restart lets the server release SSH monitors gracefully;
+the next instance then recovers their remote tmux jobs.
 
 ```bash
 systemctl --user start tmuxgate

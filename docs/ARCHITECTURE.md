@@ -155,7 +155,10 @@ password.
 surface, and uvicorn listener directly. The packaged non-root systemd user unit
 uses `Restart=on-failure`; systemd owns restart and journald owns logs. The unit
 also removes client-side bearer variables inherited from the user manager; the
-server reads its credential only from the owner-only token file.
+server reads its credential only from the owner-only token file. `KillMode=mixed`
+signals the server before its SSH monitor children, so graceful shutdown can
+leave running remote tmux jobs recoverable instead of misclassifying a killed
+local monitor as a remote failure.
 
 Logging uses only the standard library. Records may contain job ID, machine,
 state, derived remote directory, error code, and bounded control-character-
