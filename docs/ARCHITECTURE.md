@@ -153,7 +153,9 @@ password.
 
 `tmuxgate serve` constructs the store, credentials, executor, service, MCP
 surface, and uvicorn listener directly. The packaged non-root systemd user unit
-uses `Restart=on-failure`; systemd owns restart and journald owns logs.
+uses `Restart=on-failure`; systemd owns restart and journald owns logs. The unit
+also removes client-side bearer variables inherited from the user manager; the
+server reads its credential only from the owner-only token file.
 
 Logging uses only the standard library. Records may contain job ID, machine,
 state, derived remote directory, error code, and bounded control-character-

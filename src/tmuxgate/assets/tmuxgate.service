@@ -6,6 +6,7 @@ After=network-online.target
 
 [Service]
 Type=simple
+UnsetEnvironment=TMUXGATE_MCP_TOKEN TMUXGATE_BEARER_TOKEN
 ExecStart=%h/.local/bin/tmuxgate serve
 Restart=on-failure
 RestartSec=3
