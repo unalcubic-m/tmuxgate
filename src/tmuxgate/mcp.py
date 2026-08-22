@@ -12,7 +12,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from tmuxgate import __version__
-from tmuxgate.service import ExecutionService, UnknownMachineError, job_view
+from tmuxgate.config import UnknownMachineError
+from tmuxgate.service import ExecutionService, job_view
 
 
 MAX_MCP_REQUEST_BYTES = 24 * 1024 * 1024

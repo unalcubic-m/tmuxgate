@@ -107,10 +107,12 @@ directory: ~/.cache/tmuxgate/jobs/<job-id>/
 ```
 
 The remote directory contains `run.sh`, `stdout`, `stderr`, `exit-code`, and
-`done`. `exit-code` is atomically renamed and `done` appears only after output
-is final. tmuxgate polls only for `done`, collects all three result values
-locally, marks the job complete, and then removes the remote directory. A
-collection failure retains the remote directory.
+`done`. `run.sh` is written directly from SSH stdin into a newly created
+owner-only job directory before tmux can start it. `exit-code` is atomically
+renamed and `done` appears only after output is final. tmuxgate polls only for
+`done`, collects all three result values locally with tar framing, marks the job
+complete, and then removes the remote directory. A collection failure retains
+the remote directory.
 
 Local job records live at:
 

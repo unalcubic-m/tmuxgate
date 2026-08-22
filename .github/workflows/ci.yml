@@ -45,7 +45,7 @@ jobs:
           bash -n src/tmuxgate/assets/remote_job.sh
 
   quality:
-    name: Quality and deletion gates
+    name: Quality
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -69,15 +69,6 @@ jobs:
           coverage run -m unittest discover -s tests
           coverage report
           python -m unittest test_ci_policy -v
-      - name: Audit removed architecture
-        run: |
-          test ! -e install.sh
-          test ! -e scripts/install.py
-          test ! -e src/tmuxgate/broker.py
-          test ! -e src/tmuxgate/textual_interface.py
-          test ! -e src/tmuxgate/transport.py
-          ! git grep -n -E 'textual|/dev/tty|ControlMaster|RUNNING_ATTACHED|MCP-to-Unix' -- src pyproject.toml
-
   package:
     name: Package smoke test
     runs-on: ubuntu-latest

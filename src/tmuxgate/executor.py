@@ -22,7 +22,6 @@ from tmuxgate import ssh
 
 LOGGER = logging.getLogger(__name__)
 ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-REMOTE_PARENT = ".cache/tmuxgate/jobs"
 
 
 class ExecutionError(RuntimeError):
@@ -77,7 +76,6 @@ def _render_run_script(
     script: str | None,
     environment: Mapping[str, str],
 ) -> bytes:
-    _validate_request(cwd, argv, script, environment)
     template = (
         importlib.resources.files("tmuxgate")
         .joinpath("assets/remote_job.sh")
@@ -103,19 +101,6 @@ def _render_run_script(
     return (prefix + payload).encode("utf-8")
 
 
-def _tar_run_script(content: bytes) -> bytes:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w") as archive:
-        member = tarfile.TarInfo("run.sh")
-        member.size = len(content)
-        member.mode = 0o700
-        member.mtime = 0
-        member.uid = 0
-        member.gid = 0
-        archive.addfile(member, io.BytesIO(content))
-    return buffer.getvalue()
-
-
 def _classify_failure(result: ssh.SSHResult, phase_code: str) -> ExecutionError:
     code = "ssh_failed" if result.returncode == 255 else phase_code
     detail = result.stderr_text or f"remote command exited {result.returncode}"
@@ -128,6 +113,76 @@ def _requires_tty(stderr: str) -> bool:
         phrase in value
         for phrase in ("require", "must have", "no tty", "terminal is required")
     )
+
+
+def _sudo_failure(
+    result: ssh.SSHResult, failure_code: str | None
+) -> ExecutionError | None:
+    if result.returncode == 0:
+        return None
+    if result.returncode == 255:
+        return _classify_failure(result, "sudo_unavailable")
+    detail = result.stderr_text
+    if _requires_tty(detail):
+        return ExecutionError(
+            "sudo_unavailable",
+            "sudo requires a TTY; configure noninteractive sudo for this host",
+        )
+    lowered = detail.lower()
+    if "not found" in lowered or "may not run sudo" in lowered:
+        return ExecutionError("sudo_unavailable", detail or "sudo unavailable")
+    if failure_code is None:
+        return None
+    if failure_code == "sudo_auth_failed":
+        detail = "stored sudo credential was rejected"
+    return ExecutionError(
+        failure_code, detail or f"remote command exited {result.returncode}"
+    )
+
+
+async def _run_with_sudo_password(
+    credentials: CredentialStore,
+    machine: str,
+    destination: str,
+    arguments: Sequence[str],
+    password: bytes | bytearray | None = None,
+) -> ssh.SSHResult:
+    credential = credentials.read(machine) if password is None else bytearray(password)
+    if credential is None:
+        raise ExecutionError("sudo_password_missing", "no stored sudo credential")
+    credential.append(10)
+    try:
+        return await ssh.run(destination, arguments, input_data=credential)
+    finally:
+        _erase(credential)
+
+
+async def sudo_access(
+    credentials: CredentialStore,
+    machine: str,
+    destination: str,
+    password: bytes | bytearray | None = None,
+) -> Literal["passwordless", "password"]:
+    """Validate one explicit password or the machine's current sudo access."""
+
+    if password is None:
+        result = await ssh.run(destination, ["sudo", "-n", "--", "true"])
+        failure = _sudo_failure(result, None)
+        if failure is not None:
+            raise failure
+        if result.returncode == 0:
+            return "passwordless"
+    result = await _run_with_sudo_password(
+        credentials,
+        machine,
+        destination,
+        ["sudo", "-S", "-k", "-p", "", "--", "true"],
+        password,
+    )
+    failure = _sudo_failure(result, "sudo_auth_failed")
+    if failure is not None:
+        raise failure
+    return "password"
 
 
 class RemoteExecutor:
@@ -157,19 +212,19 @@ class RemoteExecutor:
         run_script = _render_run_script(
             cwd=cwd, argv=argv, script=script, environment=environment
         )
-        archive = _tar_run_script(run_script)
         remote = """set -eu
 umask 077
 parent=$HOME/.cache/tmuxgate/jobs
 mkdir -p -- "$parent"
 job=$parent/$1
 mkdir -- "$job"
-tar -xf - -C "$job"
+cat > "$job/run.sh"
+chmod 700 -- "$job/run.sh"
 """
         result = await ssh.run(
             destination,
             ["/bin/sh", "-c", remote, "tmuxgate-stage", job.job_id],
-            input_data=archive,
+            input_data=run_script,
         )
         if result.returncode != 0:
             raise _classify_failure(result, "remote_stage_failed")
@@ -179,114 +234,6 @@ tar -xf - -C "$job"
             job.machine,
             job.remote_directory,
         )
-
-    async def _passwordless_sudo(
-        self, machine: str, job_id: str, destination: str
-    ) -> bool:
-        result = await ssh.run(destination, ["sudo", "-n", "--", "true"])
-        if result.returncode == 0:
-            return True
-        if result.returncode == 255:
-            failure = _classify_failure(result, "sudo_unavailable")
-            raise ExecutionError(failure.code, _context(machine, job_id, failure.detail))
-        detail = result.stderr_text
-        if _requires_tty(detail):
-            raise ExecutionError(
-                "sudo_unavailable",
-                _context(
-                    machine,
-                    job_id,
-                    "sudo requires a TTY; configure noninteractive sudo for this host",
-                ),
-            )
-        if "not found" in detail.lower() or "may not run sudo" in detail.lower():
-            raise ExecutionError(
-                "sudo_unavailable", _context(machine, job_id, detail or "sudo unavailable")
-            )
-        return False
-
-    async def test_sudo_password(
-        self,
-        machine: str,
-        destination: str,
-        password: bytes | bytearray,
-        *,
-        job_id: str = "credential-test",
-    ) -> None:
-        attempt = bytearray(password)
-        attempt.append(10)
-        try:
-            result = await ssh.run(
-                destination,
-                ["sudo", "-S", "-k", "-p", "", "--", "true"],
-                input_data=attempt,
-            )
-        finally:
-            _erase(attempt)
-        if result.returncode == 0:
-            return
-        detail = result.stderr_text
-        if result.returncode == 255:
-            failure = _classify_failure(result, "sudo_unavailable")
-            raise ExecutionError(failure.code, _context(machine, job_id, failure.detail))
-        if _requires_tty(detail):
-            raise ExecutionError(
-                "sudo_unavailable",
-                _context(
-                    machine,
-                    job_id,
-                    "sudo requires a TTY; configure noninteractive sudo for this host",
-                ),
-            )
-        if "not found" in detail.lower() or "may not run sudo" in detail.lower():
-            raise ExecutionError(
-                "sudo_unavailable", _context(machine, job_id, detail or "sudo unavailable")
-            )
-        raise ExecutionError(
-            "sudo_auth_failed",
-            _context(machine, job_id, "stored sudo credential was rejected"),
-        )
-
-    async def check_sudo(
-        self, job: Job, destination: str
-    ) -> Literal["passwordless", "password"]:
-        if await self._passwordless_sudo(job.machine, job.job_id, destination):
-            return "passwordless"
-        password = self.credentials.read(job.machine)
-        if password is None:
-            raise ExecutionError(
-                "sudo_password_missing",
-                _context(job.machine, job.job_id, "no stored sudo credential"),
-            )
-        try:
-            await self.test_sudo_password(
-                job.machine, destination, password, job_id=job.job_id
-            )
-        finally:
-            _erase(password)
-        return "password"
-
-    async def test_stored_sudo(
-        self, machine: str, destination: str
-    ) -> Literal["passwordless", "password"]:
-        """Validate current sudo access for the credential CLI."""
-
-        job_id = "credential-test"
-        if await self._passwordless_sudo(machine, job_id, destination):
-            return "passwordless"
-        password = self.credentials.read(machine)
-        if password is None:
-            raise ExecutionError(
-                "sudo_password_missing",
-                _context(machine, job_id, "no stored sudo credential"),
-            )
-        try:
-            await self.test_sudo_password(
-                machine, destination, password, job_id=job_id
-            )
-        finally:
-            _erase(password)
-        return "password"
 
     async def start(self, job: Job, destination: str) -> None:
         if not job.sudo:
@@ -312,7 +259,9 @@ exec tmux new-session -d -s "$1" /bin/bash "$job/run.sh" 0 '' ''
                     possibly_started=failure.code == "ssh_failed",
                 )
         else:
-            mode = await self.check_sudo(job, destination)
+            mode = await sudo_access(
+                self.credentials, job.machine, destination
+            )
             sudo_arguments = (
                 "sudo -n --" if mode == "passwordless" else "sudo -S -k -p '' --"
             )
@@ -321,36 +270,28 @@ owner_uid=$(id -u) || exit 125
 owner_gid=$(id -g) || exit 125
 exec {sudo_arguments} tmux new-session -d -s "$1" /bin/bash "$job/run.sh" 1 "$owner_uid" "$owner_gid"
 """
-            password: bytearray | None = None
+            arguments = [
+                "/bin/sh",
+                "-c",
+                remote,
+                "tmuxgate-sudo-start",
+                job.remote_session,
+                job.job_id,
+            ]
             if mode == "password":
-                password = self.credentials.read(job.machine)
-                if password is None:
-                    raise ExecutionError(
-                        "sudo_password_missing",
-                        _context(job.machine, job.job_id, "sudo credential disappeared"),
-                    )
-                password.append(10)
-            try:
-                result = await ssh.run(
+                result = await _run_with_sudo_password(
+                    self.credentials,
+                    job.machine,
                     destination,
-                    [
-                        "/bin/sh",
-                        "-c",
-                        remote,
-                        "tmuxgate-sudo-start",
-                        job.remote_session,
-                        job.job_id,
-                    ],
-                    input_data=password,
+                    arguments,
                 )
-            finally:
-                _erase(password)
-            if result.returncode != 0:
-                failure = _classify_failure(result, "sudo_job_start_failed")
-                code = "sudo_job_start_failed" if failure.code != "ssh_failed" else failure.code
+            else:
+                result = await ssh.run(destination, arguments)
+            failure = _sudo_failure(result, "sudo_job_start_failed")
+            if failure is not None:
                 raise ExecutionError(
-                    code,
-                    _context(job.machine, job.job_id, failure.detail),
+                    failure.code,
+                    failure.detail,
                     possibly_started=failure.code == "ssh_failed",
                 )
         LOGGER.info(
@@ -376,38 +317,41 @@ exec {sudo_arguments} tmux new-session -d -s "$1" /bin/bash "$job/run.sh" 1 "$ow
         while not await self.completion_exists(job, destination):
             await asyncio.sleep(self.poll_interval)
 
-    async def _sudo_session_result(self, job: Job, destination: str) -> ssh.SSHResult:
-        mode = await self.check_sudo(job, destination)
-        arguments = ["sudo", "-n", "--", "tmux", "has-session", "-t", job.remote_session]
-        password: bytearray | None = None
-        if mode == "password":
-            arguments = [
-                "sudo",
-                "-S",
-                "-k",
-                "-p",
-                "",
-                "--",
-                "tmux",
-                "has-session",
-                "-t",
-                job.remote_session,
-            ]
-            password = self.credentials.read(job.machine)
-            if password is None:
-                raise ExecutionError(
-                    "sudo_password_missing",
-                    _context(job.machine, job.job_id, "no stored sudo credential"),
-                )
-            password.append(10)
-        try:
-            return await ssh.run(destination, arguments, input_data=password)
-        finally:
-            _erase(password)
-
     async def session_running(self, job: Job, destination: str) -> bool:
         if job.sudo:
-            result = await self._sudo_session_result(job, destination)
+            mode = await sudo_access(
+                self.credentials, job.machine, destination
+            )
+            if mode == "password":
+                arguments = [
+                    "sudo",
+                    "-S",
+                    "-k",
+                    "-p",
+                    "",
+                    "--",
+                    "tmux",
+                    "has-session",
+                    "-t",
+                    job.remote_session,
+                ]
+                result = await _run_with_sudo_password(
+                    self.credentials, job.machine, destination, arguments
+                )
+            else:
+                arguments = [
+                    "sudo",
+                    "-n",
+                    "--",
+                    "tmux",
+                    "has-session",
+                    "-t",
+                    job.remote_session,
+                ]
+                result = await ssh.run(destination, arguments)
+            failure = _sudo_failure(result, None)
+            if failure is not None:
+                raise failure
         else:
             result = await ssh.run(
                 destination, ["tmux", "has-session", "-t", job.remote_session]
@@ -503,10 +447,7 @@ exec tar -cf - -C "$directory" stdout stderr exit-code
                 or (current.state == "running" and exc.code == "ssh_failed")
                 else "failed"
             )
-            prefix = f"machine={current.machine} job_id={current.job_id}:"
-            detail = exc.detail if exc.detail.startswith(prefix) else _context(
-                current.machine, current.job_id, exc.detail
-            )
+            detail = _context(current.machine, current.job_id, exc.detail)
             LOGGER.error(
                 "job failed job_id=%s machine=%s state=%s remote_directory=%s "
                 "error_code=%s detail=%s",
@@ -529,7 +470,11 @@ exec tar -cf - -C "$directory" stdout stderr exit-code
             if await self.completion_exists(job, destination):
                 return await self.collect(job, destination)
             if await self.session_running(job, destination):
-                running = job if job.state == "running" else self.store.update(job, state="running")
+                running = (
+                    job
+                    if job.state == "running"
+                    else self.store.update(job, state="running")
+                )
                 await self.monitor(running, destination)
                 return await self.collect(running, destination)
             detail = _context(
@@ -546,10 +491,7 @@ exec tar -cf - -C "$directory" stdout stderr exit-code
         except asyncio.CancelledError:
             raise
         except ExecutionError as exc:
-            prefix = f"machine={job.machine} job_id={job.job_id}:"
-            detail = exc.detail if exc.detail.startswith(prefix) else _context(
-                job.machine, job.job_id, exc.detail
-            )
+            detail = _context(job.machine, job.job_id, exc.detail)
             return self.store.update(
                 job,
                 state="unknown",

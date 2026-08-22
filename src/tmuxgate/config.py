@@ -15,6 +15,16 @@ class ConfigError(ValueError):
     """The configuration is missing or invalid."""
 
 
+class UnknownMachineError(ConfigError):
+    def __init__(self, machine: str, aliases: list[str]) -> None:
+        self.machine = machine
+        self.aliases = tuple(aliases)
+        available = ", ".join(self.aliases) or "(none)"
+        super().__init__(
+            f"unknown_machine: {machine!r}; configured aliases: {available}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     """Configured OpenSSH destinations and the local MCP port."""
@@ -26,10 +36,7 @@ class Config:
         try:
             return self.machines[machine]
         except KeyError as exc:
-            aliases = ", ".join(sorted(self.machines)) or "(none)"
-            raise ConfigError(
-                f"unknown_machine: {machine!r}; configured aliases: {aliases}"
-            ) from exc
+            raise UnknownMachineError(machine, sorted(self.machines)) from exc
 
 
 def default_config_path(environ: dict[str, str] | None = None) -> Path:

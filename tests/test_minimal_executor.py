@@ -5,16 +5,17 @@ import json
 import logging
 import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from fake_remote import FakeRemote
-from tmuxgate.config import Config
+from tmuxgate.config import Config, UnknownMachineError
 from tmuxgate.credentials import CredentialStore
 from tmuxgate.executor import RemoteExecutor
 from tmuxgate.jobs import Job, JobStore
-from tmuxgate.service import ExecutionService, UnknownMachineError, job_view
+from tmuxgate.service import ExecutionService, job_view
 
 
 class MinimalExecutorTests(unittest.IsolatedAsyncioTestCase):
@@ -93,6 +94,19 @@ class MinimalExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.exit_code, 0)
         self.assertEqual(Path(job.stdout_path).read_text(encoding="utf-8"), "İstanbul ✓\nclosed\n")
 
+    async def test_non_utf8_output_is_returned_as_base64(self) -> None:
+        job = await self.service.run_script("machine", "/tmp", "printf '\\377'")
+        result = job_view(job)
+        self.assertEqual(result["stdout"], "/w==")
+        self.assertEqual(result["stdout_encoding"], "base64")
+
+    async def test_invalid_request_does_not_create_a_durable_job(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cwd"):
+            await self.service.run_argv("machine", "", ["true"])
+        with self.assertRaisesRegex(ValueError, "timeout"):
+            await self.service.run_argv("machine", "/tmp", ["true"], timeout=0)
+        self.assertEqual(self.service.list_jobs(), [])
+
     async def test_unknown_machine_is_exact_and_returns_aliases(self) -> None:
         with self.assertRaises(UnknownMachineError) as caught:
             await self.service.run_argv("Machine", "/tmp", ["true"])
@@ -136,6 +150,13 @@ class MinimalExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(item["has_bearer_token"] for item in self.remote.commands()))
         self.assertFalse(self.remote.remote_job(job.job_id).exists())
 
+    async def test_passwordless_sudo_job_succeeds(self) -> None:
+        job = await self.service.run_argv(
+            "machine", "/tmp", ["/usr/bin/id", "-u"], sudo=True
+        )
+        self.assertEqual(job.state, "complete")
+        self.assertEqual(job.exit_code, 0)
+
     async def test_sudo_errors_are_structured(self) -> None:
         self.environment.stop()
         self.environment = patch.dict(
@@ -166,6 +187,16 @@ class MinimalExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("configure noninteractive sudo", requiretty.error_detail or "")
 
         self.environment.stop()
+        self.environment = patch.dict(
+            os.environ, self.remote.environment(sudo_mode="unavailable"), clear=False
+        )
+        self.environment.start()
+        unavailable = await self.service.run_argv(
+            "machine", "/tmp", ["true"], sudo=True
+        )
+        self.assertEqual(unavailable.error_code, "sudo_unavailable")
+
+        self.environment.stop()
         values = self.remote.environment(sudo_mode="passwordless")
         values["TMUXGATE_TEST_SUDO_START_FAIL"] = "1"
         self.environment = patch.dict(os.environ, values, clear=False)
@@ -174,6 +205,18 @@ class MinimalExecutorTests(unittest.IsolatedAsyncioTestCase):
             "machine", "/tmp", ["true"], sudo=True
         )
         self.assertEqual(launch.error_code, "sudo_job_start_failed")
+        run_script = self.remote.remote_job(launch.job_id) / "run.sh"
+        self.assertEqual(stat.S_IMODE(run_script.stat().st_mode), 0o700)
+        self.assertFalse(
+            any(
+                "tar -xf" in item["command"]
+                for item in self.remote.commands()
+                if "tmuxgate-stage" in item["command"]
+            )
+        )
+        for failed in (missing, rejected, requiretty, unavailable, launch):
+            prefix = f"machine={failed.machine} job_id={failed.job_id}:"
+            self.assertEqual((failed.error_detail or "").count(prefix), 1)
 
     async def test_client_cancellation_does_not_stop_remote_job(self) -> None:
         call = asyncio.create_task(
@@ -288,6 +331,12 @@ class MinimalExecutorTests(unittest.IsolatedAsyncioTestCase):
                 job.job_id, {"unknown"}, service=other
             )
             self.assertEqual(unknown.error_code, "remote_job_unknown")
+            self.assertEqual(
+                (unknown.error_detail or "").count(
+                    f"machine={job.machine} job_id={job.job_id}:"
+                ),
+                1,
+            )
             self.assertFalse(
                 any("tmux new-session" in item["command"] for item in self.remote.commands())
             )

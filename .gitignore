@@ -39,7 +39,6 @@ dist/
 # Syncthing metadata and conflict files
 .stignore
 .stfolder/
-.stversions/
 .syncthing.*.tmp
 *.sync-conflict-*
 
