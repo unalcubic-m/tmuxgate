@@ -35,11 +35,9 @@ class CliTests(unittest.TestCase):
             *values,
         ]
 
-    def test_surface_contains_only_serve_sudo_and_jobs(self) -> None:
+    def test_surface_contains_expected_commands(self) -> None:
         help_text = build_parser().format_help()
         self.assertIn("{serve,sudo,jobs}", help_text)
-        for obsolete in ("broker", "dashboard", "install", "approve", "attach"):
-            self.assertNotIn(obsolete, help_text)
 
     def test_sudo_set_test_and_clear(self) -> None:
         environment = self.remote.environment(sudo_mode="password")

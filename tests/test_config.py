@@ -21,11 +21,11 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.mcp_port, 9000)
 
-    def test_old_architecture_sections_are_rejected(self) -> None:
+    def test_unexpected_sections_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.toml"
             path.write_text(
-                '[machines]\nhome = "home"\n[broker]\nmax_active_remote_commands = 3\n',
+                '[machines]\nhome = "home"\n[unexpected]\nenabled = true\n',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ConfigError, "unsupported"):

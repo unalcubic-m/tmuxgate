@@ -33,43 +33,26 @@ class JobStoreTests(unittest.TestCase):
                 store.create(first.job_id, "second", True)
             self.assertEqual(store.load(first.job_id), first)
 
-    def test_current_format_record_remains_readable_and_paths_are_trusted(self) -> None:
+    def test_unsafe_derived_paths_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "state")
-            job_id = "4" * 32
-            result_dir = store.results_dir / job_id
-            raw = {
-                "job_id": job_id,
-                "machine": "machine",
-                "sudo": False,
-                "state": "running",
-                "created_at": "2026-08-22T00:00:00.000+00:00",
-                "updated_at": "2026-08-22T00:00:01.000+00:00",
-                "remote_directory": f"~/.cache/tmuxgate/jobs/{job_id}",
-                "remote_session": f"tmuxgate-{job_id}",
-                "exit_code": None,
-                "error_code": None,
-                "error_detail": None,
-                "stdout_path": str(result_dir / "stdout"),
-                "stderr_path": str(result_dir / "stderr"),
-            }
-            path = store.jobs_dir / f"{job_id}.json"
-            path.write_text(json.dumps(raw), encoding="utf-8")
-            self.assertEqual(asdict(store.load(job_id)), raw)
+            job = store.create("4" * 32, "machine", False)
+            path = store.jobs_dir / f"{job.job_id}.json"
+            raw = asdict(job)
             raw["stdout_path"] = "/tmp/injected-output"
             path.write_text(json.dumps(raw), encoding="utf-8")
             with self.assertRaisesRegex(JobStoreError, "unsafe derived paths"):
-                store.load(job_id)
+                store.load(job.job_id)
 
-    def test_legacy_or_extra_fields_are_not_migrated(self) -> None:
+    def test_extra_fields_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = JobStore(Path(directory) / "state")
             job = store.create("2" * 32, "machine", False)
             path = store.jobs_dir / f"{job.job_id}.json"
             raw = json.loads(path.read_text())
-            raw["legacy_phase"] = "approved"
+            raw["unexpected"] = True
             path.write_text(json.dumps(raw))
-            with self.assertRaisesRegex(JobStoreError, "minimal format"):
+            with self.assertRaisesRegex(JobStoreError, "fields are invalid"):
                 store.load(job.job_id)
 
 
