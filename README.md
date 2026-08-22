@@ -133,6 +133,12 @@ tmuxgate jobs
 tmuxgate jobs <job-id>
 ```
 
+List the configured machine aliases and their OpenSSH destinations:
+
+```bash
+tmuxgate machines
+```
+
 ## Whole-job sudo
 
 Credential commands read passwords locally with `getpass`:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -37,7 +38,26 @@ class CliTests(unittest.TestCase):
 
     def test_surface_contains_expected_commands(self) -> None:
         help_text = build_parser().format_help()
-        self.assertIn("{serve,sudo,jobs}", help_text)
+        self.assertIn("{serve,sudo,jobs,machines}", help_text)
+
+    def test_machines_lists_configured_destinations(self) -> None:
+        self.config.write_text(
+            '[machines]\nzeta = "user@zeta"\nalpha = "alpha-host"\n',
+            encoding="utf-8",
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(self.arguments("machines")), 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "machines": [
+                    {"alias": "alpha", "destination": "alpha-host"},
+                    {"alias": "zeta", "destination": "user@zeta"},
+                ]
+            },
+        )
+        self.assertFalse(self.state.exists())
 
     def test_sudo_set_test_and_clear(self) -> None:
         environment = self.remote.environment(sudo_mode="password")
