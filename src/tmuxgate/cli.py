@@ -60,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     jobs.add_argument("job_id", nargs="?")
     jobs.add_argument("--limit", type=int, default=50)
     jobs.set_defaults(handler=_jobs_command)
+
+    machines = subparsers.add_parser(
+        "machines", help="list configured machines and destinations"
+    )
+    machines.set_defaults(handler=_machines_command)
     return parser
 
 
@@ -155,6 +160,19 @@ def _jobs_command(args: argparse.Namespace) -> int:
         }
     else:
         value = job_view(store.load(args.job_id))
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _machines_command(args: argparse.Namespace) -> int:
+    config_path, _state_dir = _paths(args)
+    config = load_config(config_path)
+    value = {
+        "machines": [
+            {"alias": alias, "destination": config.machines[alias]}
+            for alias in sorted(config.machines)
+        ]
+    }
     print(json.dumps(value, ensure_ascii=False, indent=2))
     return 0
 
