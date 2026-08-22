@@ -1,67 +1,33 @@
-# Contributing to tmuxgate
+# Contributing
 
-Thank you for helping improve tmuxgate. This project sits on a sensitive trust
-boundary, so changes should be small, explicit, and backed by failure-path
-tests.
-
-## Development setup
-
-tmuxgate requires Linux and Python 3.11 or newer. Its declared runtime
-dependencies include the official Python MCP SDK and Uvicorn; the editable
-install below installs them with the package.
+Use Python 3.11 or newer and keep the implementation focused on automatic,
+noninteractive remote execution.
 
 ```bash
-git clone https://github.com/unalcubic-m/tmuxgate.git
-cd tmuxgate
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e ".[dev]"
+python3 -m pip install -e '.[dev]'
 PYTHONPATH=src:tests python3 -m unittest discover -s tests -v
+ruff check src tests
+pyright
+shellcheck src/tmuxgate/assets/remote_job.sh
 ```
 
-Some tests require local Unix sockets, PTYs, OpenSSH tools, and tmux. The test
-suite must not contact real remote machines or depend on a developer's SSH
-configuration, credentials, network, or tmux sessions.
+Tests use `unittest.TestCase` and should describe observable behavior at the
+SSH/tmux boundary. Use temporary local resources and never contact a real host
+from a unit test. Every bug fix needs a regression test, including failure and
+secret-handling paths.
 
-See [docs/CI.md](docs/CI.md) for the exact required pull-request checks,
-coverage threshold, pinned tooling, isolation contract, intentional platform
-prerequisites, and commands for reproducing each gate.
+Preserve the core invariants:
 
-## Making a change
+- exact configured machine aliases;
+- ordinary OpenSSH policy and fatal host-key verification;
+- one remote tmux session per job and no local tmux session;
+- stdin closed from `/dev/null`;
+- local collection before `complete` and cleanup only afterward;
+- no automatic rerun of possibly-started work;
+- sudo passwords only through SSH stdin;
+- exactly four MCP tools and one concurrency semaphore of three.
 
-1. Open an issue first for a large feature, protocol change, or security-model
-   change.
-2. Keep the change focused and preserve fail-closed behavior.
-3. Add regression tests for successful and rejected paths, including exact
-   byte handling where relevant.
-4. Update `docs/ARCHITECTURE.md` when changing approval binding, route
-   evidence, SSH policy, durable state, remote execution, collection, cleanup,
-   or recovery.
-5. Run the complete test suite and applicable quality gates before opening a
-   pull request.
-
-Follow the existing Python style: four-space indentation, type annotations,
-standard-library solutions, explicit validation at trust boundaries, and
-immutable value objects where appropriate. Use short imperative commit
-subjects.
-
-## Pull requests
-
-Pull requests should explain:
-
-- what changed and why;
-- security and failure-mode implications;
-- compatibility or migration impact; and
-- the exact checks that passed.
-
-Never include real host addresses, usernames, network fingerprints, host keys,
-credentials, runtime state, result spools, or private configuration in a pull
-request, issue, test fixture, screenshot, or log.
-
-## Security reports
-
-Do not open a public issue for a suspected vulnerability. Follow
-[SECURITY.md](SECURITY.md) instead.
-
-By contributing, you agree that your contribution is licensed under the
-project's [GNU General Public License v3.0 only](LICENSE).
+Keep commits narrow with imperative subjects. Pull requests should explain
+behavior, security effects, deletion impact, tests, and any real-machine checks.
+Update `docs/ARCHITECTURE.md` whenever execution lifecycle, job recovery,
+credential handling, or authentication changes.

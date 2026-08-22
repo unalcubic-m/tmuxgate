@@ -2,20 +2,20 @@
 
 ## Project Structure & Module Organization
 
-`tmuxgate` is a Python 3.11+ package using a `src/` layout. Production code lives in `src/tmuxgate/`; `cli.py` and `__main__.py` expose the command-line interface, while broker, transport, approval, planning, state, and remote-execution concerns are separated into focused modules. Packaged shell helpers are under `src/tmuxgate/assets/`. Tests mirror these modules in `tests/test_*.py`. See `docs/ARCHITECTURE.md` before changing lifecycle or security behavior, and use `examples/config.toml` only as a non-secret configuration example.
+`tmuxgate` is a Python 3.11+ package using a `src/` layout. Production code lives in `src/tmuxgate/`; configuration, credentials, jobs, SSH, execution, service, MCP, and CLI responsibilities stay in the small same-named modules. Packaged remote and systemd assets are under `src/tmuxgate/assets/`. Tests use a process-level fake SSH/tmux boundary. See `docs/ARCHITECTURE.md` before changing lifecycle or security behavior, and use `examples/config.toml` only as a non-secret configuration example.
 
 ## Build, Test, and Development Commands
 
 - `PYTHONPATH=src python3 -m tmuxgate --help` runs the CLI directly from the checkout.
 - `PYTHONPATH=src python3 -m unittest discover -s tests -v` runs the complete test suite.
-- `PYTHONPATH=src python3 -m unittest tests.test_models -v` runs one test module during focused development.
+- `PYTHONPATH=src:tests python3 -m unittest test_minimal_executor -v` runs the main behavior suite during focused development.
 - `python3 -m build` creates package artifacts when the optional `build` frontend is installed.
 
-Runtime dependencies, including the official Python MCP SDK and Uvicorn, are declared in `pyproject.toml`; install the package before running tests directly from the checkout. Some integration tests require local Linux facilities such as Unix sockets, PTYs, OpenSSH, or tmux; keep unit tests deterministic and isolated from real remote hosts.
+Runtime dependencies, including the official Python MCP SDK and Uvicorn, are declared in `pyproject.toml`; install the package before running tests directly from the checkout. Keep unit tests deterministic and isolated from real remote hosts.
 
 ## Coding Style & Naming Conventions
 
-Follow the existing Python style: four-space indentation, type annotations, concise module docstrings, and immutable `@dataclass(frozen=True, slots=True)` value objects where appropriate. Use `snake_case` for modules, functions, and variables; `PascalCase` for classes; and `UPPER_SNAKE_CASE` for constants. Prefer standard-library solutions and explicit validation at trust boundaries. There is no configured formatter or linter, so keep imports grouped consistently and review diffs for readability.
+Follow the existing Python style: four-space indentation, type annotations, concise module docstrings, and immutable `@dataclass(frozen=True, slots=True)` value objects where appropriate. Use `snake_case` for modules, functions, and variables; `PascalCase` for classes; and `UPPER_SNAKE_CASE` for constants. Prefer standard-library solutions and explicit validation at trust boundaries. Ruff and Pyright are configured in `pyproject.toml`.
 
 ## Testing Guidelines
 
@@ -23,7 +23,7 @@ Tests use `unittest.TestCase`. Name files `test_<module>.py`, classes `<Subject>
 
 ## Commit & Pull Request Guidelines
 
-Use short, imperative commit subjects such as `Reject stale route evidence`. Keep commits narrowly scoped. Pull requests should explain the behavior change, security implications, and tests run; link relevant issues and include sanitized terminal output or screenshots when CLI/approval UI behavior changes.
+Use short, imperative commit subjects such as `Reject ambiguous remote jobs`. Keep commits narrowly scoped. Pull requests should explain the behavior change, security implications, and tests run; link relevant issues and include sanitized terminal output when CLI behavior changes.
 
 ## Concurrent Codex Sessions & Worktrees
 
@@ -58,4 +58,4 @@ performed by one designated session at a time.
 
 ## Security & Configuration
 
-Preserve fail-closed behavior: clients provide logical machine names, never SSH options or endpoints, and approval remains broker-terminal-owned. Never commit real host addresses, credentials, known-host data, runtime state, or user configuration. Document any change to approval binding, route evidence, durable state, or remote cleanup in `docs/ARCHITECTURE.md`.
+Preserve fail-closed behavior: clients provide exact logical machine aliases, never SSH options or endpoints; ambiguous possibly-started jobs become `unknown` and are never automatically rerun. Never commit real host addresses, credentials, known-host data, runtime state, or user configuration. Document any change to authentication, sudo handling, durable state, or remote cleanup in `docs/ARCHITECTURE.md`.

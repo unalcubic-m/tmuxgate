@@ -1,1124 +1,604 @@
-"""Composition of approved planning, SSH transport, remote jobs, and spool."""
+"""Direct staging, remote tmux execution, monitoring, and result collection."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-import threading
-import time
+import asyncio
+from dataclasses import dataclass
+import importlib.resources
+import io
+import logging
+import os
+from pathlib import Path
+import re
+import shlex
+import tarfile
+import tempfile
+from typing import Literal, Mapping, Sequence
 
-from tmuxgate.approval import ApprovalDecision
-from tmuxgate.connection_plan import ConnectionPlan, PlannedEndpoint
-from tmuxgate.models import DisconnectPolicy, RequestSpec
-from tmuxgate.operator_interface import (
-    ActivityKind,
-    ConnectionPhase,
-    MachineDisablePrompt,
-    OperationalActivity,
-    OperatorInterface,
-    OperatorInterfaceError,
-    RemoteMutationState,
-    RouteFallbackPrompt,
-    SecretInputRecipient,
-    SshRetryPrompt,
-    require_operator_decision,
-    resolve_operator_prompt,
-)
-from tmuxgate.planning import BoundRequestPlanner
-from tmuxgate.remote_job import (
-    CollectedRemoteFiles,
-    RemoteJob,
-    RemoteJobCoordinator,
-    RemoteJobError,
-    RemoteJobState,
-)
-from tmuxgate.real_ssh import AutomaticSecretInputError
-from tmuxgate.reboot_recovery import BootIdProbeError
-from tmuxgate.recovery_coordinator import (
-    ExpectedRebootRecoveryCoordinator,
-    RecoveryCoordinatorError,
-)
-from tmuxgate.result import ExecutionResult, ResultCode, TransportStatus
-from tmuxgate.scheduler import RequestState
-from tmuxgate.ssh import ResolvedSshEndpoint
-from tmuxgate.spool import ResultSpool
-from tmuxgate.state import (
-    DurableJobRecord,
-    DurableStateStore,
-    RemotePhase,
-    new_approved_job_record,
-)
-from tmuxgate.transport import (
-    KeyEnrollmentMutationError,
-    MasterTransport,
-    MasterTransportPool,
-    SshMasterStartError,
-    TransportError,
-    TransportLease,
-    issue_fallback_transport_authorization,
-    issue_selected_transport_authorization,
-)
+from tmuxgate.credentials import CredentialStore, _erase
+from tmuxgate.jobs import Job, JobStore
+from tmuxgate import ssh
 
 
-class ExecutorError(RuntimeError):
-    """The composed executor violated a lifecycle invariant."""
+LOGGER = logging.getLogger(__name__)
+ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+REMOTE_PARENT = ".cache/tmuxgate/jobs"
 
 
-class SshEndpointsExhaustedError(TransportError):
-    """Every approved endpoint exhausted its bounded SSH master retry."""
-
-
-class KeyEnrollmentBoundaryError(TransportError):
-    """The durable enrollment boundary could not be established safely."""
-
-
-class RemoteSetupFailure(TransportError):
-    """A remote setup mutation occurred, so retry and fallback are forbidden."""
-
-    def __init__(self, detail: str, record: DurableJobRecord) -> None:
+class ExecutionError(RuntimeError):
+    def __init__(
+        self, code: str, detail: str, *, possibly_started: bool = False
+    ) -> None:
         super().__init__(detail)
-        self.record = record
+        self.code = code
+        self.detail = detail
+        self.possibly_started = possibly_started
 
 
-class AutomationPolicyDeniedError(TransportError):
-    """A validated pre-remote decision was denied by Automation policy."""
+@dataclass(frozen=True, slots=True)
+class CollectedResult:
+    stdout: bytes
+    stderr: bytes
+    exit_code: int
 
 
-def _automation_mode(operator_interface: OperatorInterface) -> bool:
-    try:
-        return getattr(operator_interface, "approval_mode") == "disabled"
-    except BaseException:
+def _context(machine: str, job_id: str, detail: str) -> str:
+    return f"machine={machine} job_id={job_id}: {detail}"
+
+
+def _validate_request(
+    cwd: str,
+    argv: Sequence[str] | None,
+    script: str | None,
+    environment: Mapping[str, str],
+) -> None:
+    if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
+        raise ValueError("cwd must be a non-empty NUL-free string")
+    if (argv is None) == (script is None):
+        raise ValueError("provide exactly one of argv or script")
+    if argv is not None:
+        if not argv or any(not isinstance(item, str) or "\x00" in item for item in argv):
+            raise ValueError("argv must contain non-empty NUL-free string arguments")
+    if script is not None:
+        if not isinstance(script, str) or "\x00" in script:
+            raise ValueError("script must be NUL-free UTF-8 text")
+        script.encode("utf-8")
+    for name, value in environment.items():
+        if not isinstance(name, str) or not ENVIRONMENT_NAME.fullmatch(name):
+            raise ValueError(f"invalid environment name: {name!r}")
+        if not isinstance(value, str) or "\x00" in value:
+            raise ValueError(f"environment value for {name} must be a NUL-free string")
+
+
+def _render_run_script(
+    *,
+    cwd: str,
+    argv: Sequence[str] | None,
+    script: str | None,
+    environment: Mapping[str, str],
+) -> bytes:
+    _validate_request(cwd, argv, script, environment)
+    template = (
+        importlib.resources.files("tmuxgate")
+        .joinpath("assets/remote_job.sh")
+        .read_text(encoding="utf-8")
+    )
+    setup = [f"cd -- {shlex.quote(cwd)} || exit 125"]
+    for name in sorted(environment):
+        setup.append(f"export {name}={shlex.quote(environment[name])}")
+    if argv is not None:
+        command = f"exec {shlex.join(list(argv))}"
+    else:
+        command = 'exec /bin/bash <(tail -n +__TMUXGATE_PAYLOAD_LINE__ -- "$0")'
+    rendered = template.replace("__TMUXGATE_SETUP__", "\n".join(setup))
+    rendered = rendered.replace("__TMUXGATE_COMMAND__", command)
+    prefix, marker, suffix = rendered.partition("# __TMUXGATE_PAYLOAD__")
+    if not marker or suffix.strip():
+        raise RuntimeError("remote job asset has an invalid payload marker")
+    payload_line = prefix.count("\n") + 1
+    prefix = prefix.replace("__TMUXGATE_PAYLOAD_LINE__", str(payload_line))
+    if script is None:
+        return prefix.encode("utf-8")
+    payload = script if script.endswith("\n") else script + "\n"
+    return (prefix + payload).encode("utf-8")
+
+
+def _tar_run_script(content: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        member = tarfile.TarInfo("run.sh")
+        member.size = len(content)
+        member.mode = 0o700
+        member.mtime = 0
+        member.uid = 0
+        member.gid = 0
+        archive.addfile(member, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def _classify_failure(result: ssh.SSHResult, phase_code: str) -> ExecutionError:
+    code = "ssh_failed" if result.returncode == 255 else phase_code
+    detail = result.stderr_text or f"remote command exited {result.returncode}"
+    return ExecutionError(code, detail)
+
+
+def _requires_tty(stderr: str) -> bool:
+    value = stderr.lower()
+    return "tty" in value and any(
+        phrase in value
+        for phrase in ("require", "must have", "no tty", "terminal is required")
+    )
+
+
+class RemoteExecutor:
+    def __init__(
+        self,
+        store: JobStore,
+        credentials: CredentialStore,
+        *,
+        poll_interval: float = 1.0,
+    ) -> None:
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+        self.store = store
+        self.credentials = credentials
+        self.poll_interval = poll_interval
+
+    async def stage(
+        self,
+        job: Job,
+        destination: str,
+        *,
+        cwd: str,
+        argv: Sequence[str] | None,
+        script: str | None,
+        environment: Mapping[str, str],
+    ) -> None:
+        run_script = _render_run_script(
+            cwd=cwd, argv=argv, script=script, environment=environment
+        )
+        archive = _tar_run_script(run_script)
+        remote = """set -eu
+umask 077
+parent=$HOME/.cache/tmuxgate/jobs
+mkdir -p -- "$parent"
+job=$parent/$1
+mkdir -- "$job"
+tar -xf - -C "$job"
+"""
+        result = await ssh.run(
+            destination,
+            ["/bin/sh", "-c", remote, "tmuxgate-stage", job.job_id],
+            input_data=archive,
+        )
+        if result.returncode != 0:
+            raise _classify_failure(result, "remote_stage_failed")
+        LOGGER.info(
+            "job staged job_id=%s machine=%s state=starting remote_directory=%s",
+            job.job_id,
+            job.machine,
+            job.remote_directory,
+        )
+
+    async def _passwordless_sudo(
+        self, machine: str, job_id: str, destination: str
+    ) -> bool:
+        result = await ssh.run(destination, ["sudo", "-n", "--", "true"])
+        if result.returncode == 0:
+            return True
+        if result.returncode == 255:
+            failure = _classify_failure(result, "sudo_unavailable")
+            raise ExecutionError(failure.code, _context(machine, job_id, failure.detail))
+        detail = result.stderr_text
+        if _requires_tty(detail):
+            raise ExecutionError(
+                "sudo_unavailable",
+                _context(
+                    machine,
+                    job_id,
+                    "sudo requires a TTY; configure noninteractive sudo for this host",
+                ),
+            )
+        if "not found" in detail.lower() or "may not run sudo" in detail.lower():
+            raise ExecutionError(
+                "sudo_unavailable", _context(machine, job_id, detail or "sudo unavailable")
+            )
         return False
 
-
-def _bounded_detail(detail: str, fallback: str) -> str:
-    """Keep a durable failure detail non-empty, NUL-free, and bounded."""
-
-    text = detail.replace("\x00", "\ufffd")[:1000].strip()
-    return text or fallback
-
-
-class _DurablePreRemoteBoundary:
-    """Own the approved request's durable record before any remote mutation.
-
-    The record exists from the moment the bound approval is consumed, so a
-    request that fails before SSH transport is established still leaves a
-    truthful terminal record instead of nothing at all.
-    """
-
-    def __init__(
+    async def test_sudo_password(
         self,
-        state: DurableStateStore,
-        request_id: str,
-        request: RequestSpec,
-        plan: ConnectionPlan,
+        machine: str,
+        destination: str,
+        password: bytes | bytearray,
+        *,
+        job_id: str = "credential-test",
     ) -> None:
-        self.state = state
-        self.request_id = request_id
-        self.request = request
-        self.plan = plan
-        self.record: DurableJobRecord | None = None
-
-    def approve(self, endpoint: PlannedEndpoint | None = None) -> DurableJobRecord:
-        if self.record is not None:
-            raise ExecutorError("the approved durable record was already written")
-        approved = new_approved_job_record(
-            self.request_id,
-            self.request,
-            self.plan,
-            planned_endpoint=endpoint,
-        )
-        self.record = self.state.write(approved)
-        return self.record
-
-    def require_record(self) -> DurableJobRecord:
-        if self.record is None:
-            raise ExecutorError("the approved durable record was never written")
-        return self.record
-
-    def retarget(self, endpoint: PlannedEndpoint) -> DurableJobRecord:
-        self.record = self.state.retarget_pre_remote_endpoint(
-            self.require_record(),
-            self.plan,
-            endpoint,
-        )
-        return self.record
-
-    def mark_connection_attempted(self) -> DurableJobRecord:
-        self.record = self.state.mark_remote_connection_attempted(
-            self.require_record()
-        )
-        return self.record
-
-    def arm_key_enrollment(self) -> DurableJobRecord:
-        self.record = self.state.arm_key_enrollment(self.require_record())
-        return self.record
-
-    def mark_key_enrollment_verified(self) -> DurableJobRecord:
-        self.record = self.state.mark_key_enrollment_verified(self.require_record())
-        return self.record
-
-    def fail_pre_remote(self, detail: str) -> None:
-        """Terminalize an approved record that never reached a remote host."""
-
-        record = self.record
-        if record is None or record.state is not RequestState.APPROVED_PRE_REMOTE:
+        attempt = bytearray(password)
+        attempt.append(10)
+        try:
+            result = await ssh.run(
+                destination,
+                ["sudo", "-S", "-k", "-p", "", "--", "true"],
+                input_data=attempt,
+            )
+        finally:
+            _erase(attempt)
+        if result.returncode == 0:
             return
-        try:
-            self.record = self.state.fail_pre_remote(
-                record,
-                detail=_bounded_detail(
-                    detail, "the request failed before SSH transport was established"
+        detail = result.stderr_text
+        if result.returncode == 255:
+            failure = _classify_failure(result, "sudo_unavailable")
+            raise ExecutionError(failure.code, _context(machine, job_id, failure.detail))
+        if _requires_tty(detail):
+            raise ExecutionError(
+                "sudo_unavailable",
+                _context(
+                    machine,
+                    job_id,
+                    "sudo requires a TTY; configure noninteractive sudo for this host",
                 ),
             )
-        except BaseException:
-            # The already-fsynced approved record stays truthful and startup
-            # recovery terminalizes it; the caller's failure result still holds.
-            pass
-
-    def fail_remote_setup(self, detail: str) -> DurableJobRecord:
-        record = self.require_record()
-        try:
-            if record.state in {
-                RequestState.KEY_ENROLLMENT_MAY_HAVE_STARTED,
-                RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE,
-            }:
-                self.record = self.state.fail_remote_setup(
-                    record,
-                    detail=_bounded_detail(
-                        detail, "remote setup failed after a possible key enrollment"
-                    ),
-                )
-        except BaseException:
-            # The already-fsynced may-have-started record remains truthful and
-            # startup recovery will terminalize it conservatively.
-            pass
-        return self.require_record()
-
-
-class _DurableRemoteLifecycle:
-    """Advance exact remote phases only after their evidence is observed."""
-
-    def __init__(
-        self,
-        state: DurableStateStore,
-        boundary: _DurablePreRemoteBoundary,
-    ) -> None:
-        self.state = state
-        self.boundary = boundary
-
-    @property
-    def record(self) -> DurableJobRecord:
-        return self.boundary.require_record()
-
-    def request_staging(self):
-        self.boundary.record, permit = self.state.request_remote_staging(self.record)
-        return permit
-
-    def staging_verified(self) -> None:
-        self.boundary.record = self.state.mark_remote_staging_verified(self.record)
-
-    def before_remote_wrapper(self) -> None:
-        self.boundary.record = self.state.request_remote_wrapper(self.record)
-
-    def remote_wrapper_created(self) -> None:
-        self.boundary.record = self.state.mark_remote_wrapper_created(self.record)
-
-    def user_command_started(self) -> None:
-        self.boundary.record = self.state.mark_user_command_started(self.record)
-
-
-class _DurableKeyEnrollmentLifecycle:
-    """Bind a possible key append to the approved request before it starts."""
-
-    def __init__(
-        self,
-        boundary: _DurablePreRemoteBoundary,
-        endpoint: PlannedEndpoint,
-    ) -> None:
-        self.boundary = boundary
-        self.endpoint = endpoint
-        self.armed = False
-
-    @property
-    def record(self) -> DurableJobRecord:
-        return self.boundary.require_record()
-
-    def before_remote_mutation(self, resolved: ResolvedSshEndpoint) -> None:
-        if resolved != self.endpoint.resolved:
-            raise KeyEnrollmentBoundaryError(
-                "key enrollment endpoint differs from the approved route"
+        if "not found" in detail.lower() or "may not run sudo" in detail.lower():
+            raise ExecutionError(
+                "sudo_unavailable", _context(machine, job_id, detail or "sudo unavailable")
             )
-        if self.armed:
-            raise KeyEnrollmentBoundaryError(
-                "key enrollment mutation boundary was requested more than once"
-            )
-        self.armed = True
-        try:
-            self.boundary.arm_key_enrollment()
-        except BaseException as exc:
-            self.boundary.fail_pre_remote("durable SSH key-enrollment boundary failed")
-            raise KeyEnrollmentBoundaryError(
-                "durable SSH key-enrollment boundary failed before remote mutation"
-            ) from exc
-
-    def remote_mutation_verified(self, resolved: ResolvedSshEndpoint) -> None:
-        if resolved != self.endpoint.resolved or not self.armed:
-            raise KeyEnrollmentMutationError(
-                "key enrollment verification is not bound to the armed endpoint"
-            )
-        self.boundary.mark_key_enrollment_verified()
-
-    def fail_after_remote_mutation(self, detail: str) -> DurableJobRecord:
-        if not self.record.remote_mutation_started:
-            raise ExecutorError("key enrollment failure lacks a durable mutation record")
-        return self.boundary.fail_remote_setup(detail)
-
-
-RemoteBackendFactory = Callable[[MasterTransport, SecretInputRecipient], object]
-DetachedHandler = Callable[[str], str]
-
-
-def _ignore_machine_disable(_machine_name: str) -> None:
-    return None
-
-
-def _machine_enabled(_machine_name: str) -> bool:
-    return True
-
-
-def reattach_detached_job(request_id: str) -> str:
-    """Automatically restore an unexpectedly lost isolated viewer."""
-
-    return "reattach"
-
-
-class RealExecutor:
-    """Synchronous single-command executor called by the broker terminal worker."""
-
-    def __init__(
-        self,
-        *,
-        planner: BoundRequestPlanner,
-        transports: MasterTransportPool,
-        state: DurableStateStore,
-        spool: ResultSpool,
-        backend_factory: RemoteBackendFactory,
-        operator_interface: OperatorInterface,
-        machine_disabler: Callable[[str], object] = _ignore_machine_disable,
-        machine_enabled: Callable[[str], bool] = _machine_enabled,
-        detached_handler: DetachedHandler = reattach_detached_job,
-        poll_interval_seconds: float = 0.25,
-        detached_wait_seconds: float = 5.0,
-        reboot_recovery: ExpectedRebootRecoveryCoordinator | None = None,
-    ) -> None:
-        for name, callback in (
-            ("backend_factory", backend_factory),
-            ("machine_disabler", machine_disabler),
-            ("machine_enabled", machine_enabled),
-            ("detached_handler", detached_handler),
-        ):
-            if not callable(callback):
-                raise TypeError(f"{name} must be callable")
-        for method_name in (
-            "request_ssh_retry",
-            "request_fallback",
-            "request_machine_disable",
-            "publish_activity",
-        ):
-            if not callable(getattr(operator_interface, method_name, None)):
-                raise TypeError(
-                    f"operator_interface must provide callable {method_name}"
-                )
-        self.planner = planner
-        self.transports = transports
-        self.state = state
-        self.spool = spool
-        self.backend_factory = backend_factory
-        self.operator_interface = operator_interface
-        self.machine_disabler = machine_disabler
-        self.machine_enabled = machine_enabled
-        self.detached_handler = detached_handler
-        self.poll_interval_seconds = float(poll_interval_seconds)
-        self.detached_wait_seconds = float(detached_wait_seconds)
-        self.reboot_recovery = reboot_recovery
-        self._delivery_records: dict[str, DurableJobRecord] = {}
-        self._recovery_leases: dict[str, TransportLease] = {}
-        self._recovery_jobs: dict[str, tuple[RemoteJobCoordinator, RemoteJob]] = {}
-        self._records_lock = threading.Lock()
-
-    @property
-    def recovery_request_ids(self) -> tuple[str, ...]:
-        with self._records_lock:
-            return tuple(sorted(self._recovery_jobs))
-
-    def _publish_connection(
-        self,
-        request_id: str,
-        request: RequestSpec,
-        phase: ConnectionPhase,
-        message: str,
-        *,
-        endpoint_id: str | None = None,
-        remote_mutation_state: RemoteMutationState = RemoteMutationState.NOT_STARTED,
-        details: tuple[tuple[str, str], ...] = (),
-    ) -> None:
-        self.operator_interface.publish_activity(
-            OperationalActivity.create(
-                ActivityKind.CONNECTION,
-                message,
-                request_id=request_id,
-                machine_name=request.machine_alias,
-                endpoint_id=endpoint_id,
-                details=details,
-                connection_phase=phase,
-                remote_mutation_state=remote_mutation_state,
-            )
+        raise ExecutionError(
+            "sudo_auth_failed",
+            _context(machine, job_id, "stored sudo credential was rejected"),
         )
 
-    def _acquire_transport(
-        self,
-        request_id: str,
-        request: RequestSpec,
-        plan: ConnectionPlan,
-        boundary: _DurablePreRemoteBoundary,
-    ) -> tuple[TransportLease, PlannedEndpoint, DurableJobRecord]:
-        failure: BaseException | None = None
-        failure_diagnostics = b""
-        all_endpoints_exhausted = True
-        for index, endpoint in enumerate(plan.endpoints):
-            if index == 0:
-                authorization = issue_selected_transport_authorization(
-                    request_id,
-                    request,
-                    plan,
-                    ApprovalDecision.APPROVED,
-                )
-            else:
-                previous = plan.endpoints[index - 1]
-                self._publish_connection(
-                    request_id,
-                    request,
-                    ConnectionPhase.FALLBACK_DECISION,
-                    "SSH setup failed before remote mutation; a separate route "
-                    "fallback decision is required.",
-                    endpoint_id=previous.resolved.endpoint_id,
-                )
-                prompt = RouteFallbackPrompt.create(
-                        request_id,
-                        request,
-                        plan,
-                        failed_endpoint_id=previous.resolved.endpoint_id,
-                        fallback_endpoint_id=endpoint.resolved.endpoint_id,
-                        failure_detail=str(failure)[:500],
-                        remote_mutation_state=RemoteMutationState.NOT_STARTED,
-                        openssh_diagnostics=failure_diagnostics,
-                    )
-                decision = require_operator_decision(
-                    prompt,
-                    resolve_operator_prompt(self.operator_interface, prompt),
-                )
-                if decision is not ApprovalDecision.APPROVED:
-                    detail = f"{failure}; next approved fallback was denied"
-                    if _automation_mode(self.operator_interface):
-                        raise AutomationPolicyDeniedError(detail)
-                    raise TransportError(
-                        f"{failure}; human denied the next approved fallback"
-                    )
-                self._publish_connection(
-                    request_id,
-                    request,
-                    ConnectionPhase.CONNECTING,
-                    "Connecting through the separately approved fallback route; "
-                    "the remote command has not started.",
-                    endpoint_id=endpoint.resolved.endpoint_id,
-                )
-                authorization = issue_fallback_transport_authorization(
-                    request_id,
-                    request,
-                    plan,
-                    failed_endpoint_id=previous.resolved.endpoint_id,
-                    fallback_endpoint_id=endpoint.resolved.endpoint_id,
-                    fallback_decision=decision,
-                )
-            # Route fallback happens only before remote mutation, so the
-            # approved record can truthfully follow the plan to this endpoint.
-            boundary.retarget(endpoint)
-            boundary.mark_connection_attempted()
-            ssh_attempt = 0
-            failure_diagnostics = b""
-            while True:
-                if ssh_attempt == 0:
-                    self._publish_connection(
-                        request_id,
-                        request,
-                        ConnectionPhase.CONNECTING,
-                        "Establishing the approved SSH connection; remote setup "
-                        "is occurring and the requested command has not started.",
-                        endpoint_id=endpoint.resolved.endpoint_id,
-                    )
-                enrollment = _DurableKeyEnrollmentLifecycle(boundary, endpoint)
-                try:
-                    lease = self.transports.acquire(
-                        authorization,
-                        endpoint.resolved,
-                        key_enrollment_lifecycle=enrollment,
-                    )
-                except KeyEnrollmentBoundaryError:
-                    raise
-                except KeyEnrollmentMutationError as exc:
-                    detail = (
-                        f"SSH key enrollment on {endpoint.resolved.endpoint_id} "
-                        f"failed after remote mutation may have started: {exc}; "
-                        "retry and route fallback were not attempted"
-                    )
-                    record = enrollment.fail_after_remote_mutation(detail)
-                    self._publish_connection(
-                        request_id,
-                        request,
-                        ConnectionPhase.FAILED,
-                        detail,
-                        endpoint_id=endpoint.resolved.endpoint_id,
-                        remote_mutation_state=RemoteMutationState.MAY_HAVE_STARTED,
-                    )
-                    raise RemoteSetupFailure(detail, record) from exc
-                except SshMasterStartError as exc:
-                    failure = exc
-                    failure_diagnostics = exc.diagnostics
-                    if ssh_attempt == 0:
-                        self._publish_connection(
-                            request_id,
-                            request,
-                            ConnectionPhase.RETRY_DECISION,
-                            "OpenSSH setup failed before remote mutation; one "
-                            "same-endpoint retry is available.",
-                            endpoint_id=endpoint.resolved.endpoint_id,
-                            details=(("retry_limit", "1"),),
-                        )
-                        prompt = SshRetryPrompt.create(
-                                request_id,
-                                request,
-                                plan,
-                                endpoint_id=endpoint.resolved.endpoint_id,
-                                failure_detail=str(exc)[:500],
-                                remote_mutation_state=(
-                                    RemoteMutationState.NOT_STARTED
-                                ),
-                                openssh_diagnostics=failure_diagnostics,
-                            )
-                        decision = require_operator_decision(
-                            prompt,
-                            resolve_operator_prompt(self.operator_interface, prompt),
-                        )
-                        if decision is ApprovalDecision.APPROVED:
-                            self.planner.revalidate_connection_plan(
-                                request_id,
-                                request,
-                                plan,
-                                retried_endpoint_id=endpoint.resolved.endpoint_id,
-                            )
-                            ssh_attempt += 1
-                            self._publish_connection(
-                                request_id,
-                                request,
-                                ConnectionPhase.RETRYING,
-                                "Retrying approved SSH setup once; the remote "
-                                "command has not started.",
-                                endpoint_id=endpoint.resolved.endpoint_id,
-                                details=(("retry", "1 of 1"),),
-                            )
-                            continue
-                        all_endpoints_exhausted = False
-                        detail = f"{exc}; same-endpoint retry was denied"
-                        failure = (
-                            AutomationPolicyDeniedError(detail)
-                            if _automation_mode(self.operator_interface)
-                            else TransportError(
-                                f"{exc}; operator cancelled the same-endpoint retry"
-                            )
-                        )
-                    else:
-                        failure = TransportError(
-                            f"{exc}; the broker-terminal-confirmed retry also failed"
-                        )
-                    break
-                except TransportError as exc:
-                    if enrollment.record.remote_mutation_started:
-                        detail = (
-                            f"SSH setup on {endpoint.resolved.endpoint_id} failed "
-                            f"after verified key enrollment: {exc}; retry and route "
-                            "fallback were not attempted"
-                        )
-                        record = enrollment.fail_after_remote_mutation(detail)
-                        self._publish_connection(
-                            request_id,
-                            request,
-                            ConnectionPhase.FAILED,
-                            detail,
-                            endpoint_id=endpoint.resolved.endpoint_id,
-                            remote_mutation_state=RemoteMutationState.STARTED,
-                        )
-                        raise RemoteSetupFailure(detail, record) from exc
-                    all_endpoints_exhausted = False
-                    failure = exc
-                    break
-                return lease, endpoint, enrollment.record
-            if index + 1 == len(plan.endpoints):
-                assert failure is not None
-                if all_endpoints_exhausted:
-                    raise SshEndpointsExhaustedError(str(failure)) from failure
-                raise failure
-        raise TransportError("no approved endpoint transport could be established")
-
-    def _retain_recovery(
-        self,
-        request_id: str,
-        record: DurableJobRecord,
-        lease: TransportLease,
-        detail: str,
-        coordinator: RemoteJobCoordinator | None = None,
-        job: RemoteJob | None = None,
-        result_code: ResultCode = ResultCode.UNEXPECTED_DISCONNECT,
-    ) -> ExecutionResult:
+    async def check_sudo(
+        self, job: Job, destination: str
+    ) -> Literal["passwordless", "password"]:
+        if await self._passwordless_sudo(job.machine, job.job_id, destination):
+            return "passwordless"
+        password = self.credentials.read(job.machine)
+        if password is None:
+            raise ExecutionError(
+                "sudo_password_missing",
+                _context(job.machine, job.job_id, "no stored sudo credential"),
+            )
         try:
-            record = self.state.mark_recovery_required(record, detail=detail[:1000])
-        except BaseException:
-            pass
-        with self._records_lock:
-            self._recovery_leases[request_id] = lease
-            if coordinator is not None and job is not None:
-                self._recovery_jobs[request_id] = (coordinator, job)
-        return ExecutionResult(
-            request_id,
-            TransportStatus.INCOMPLETE,
-            detail=detail + "; command lease retained for recovery",
-            result_code=result_code,
-        )
+            await self.test_sudo_password(
+                job.machine, destination, password, job_id=job.job_id
+            )
+        finally:
+            _erase(password)
+        return "password"
 
-    def _monitor(self, request_id: str, coordinator: RemoteJobCoordinator, job: RemoteJob) -> None:
-        while True:
-            state = coordinator.refresh(job)
-            if state is RemoteJobState.COMPLETE_DETACHED:
-                return
-            if state is RemoteJobState.RECOVERY_REQUIRED:
-                raise RemoteJobError("remote job entered recovery-required state")
-            if state is RemoteJobState.RUNNING_DETACHED:
-                action = self.detached_handler(request_id)
-                if action == "reattach":
-                    coordinator.reattach(job)
-                elif action == "wait":
-                    time.sleep(self.detached_wait_seconds)
-                else:
-                    raise ExecutorError("detached handler returned an invalid action")
-                continue
-            time.sleep(self.poll_interval_seconds)
+    async def test_stored_sudo(
+        self, machine: str, destination: str
+    ) -> Literal["passwordless", "password"]:
+        """Validate current sudo access for the credential CLI."""
 
-    def _finalize_completed_remote(
-        self,
-        request_id: str,
-        request: RequestSpec,
-        endpoint: PlannedEndpoint,
-        record: DurableJobRecord,
-        lease: TransportLease,
-        coordinator: RemoteJobCoordinator,
-        job: RemoteJob,
-        backend: object,
-    ) -> ExecutionResult:
-        observation = backend.observe(job.identity)
-        if not observation.completion_proven or observation.attached_clients != 0:
-            raise RemoteJobError("completion/detach could not be proven")
-        record = self.state.mark_completion_proven(
-            record,
-            exit_status=observation.exit_status,
-        )
-        record = self.state.mark_viewer_detached(record)
-        if job.viewer is not None and not job.viewer.attached:
+        job_id = "credential-test"
+        if await self._passwordless_sudo(machine, job_id, destination):
+            return "passwordless"
+        password = self.credentials.read(machine)
+        if password is None:
+            raise ExecutionError(
+                "sudo_password_missing",
+                _context(machine, job_id, "no stored sudo credential"),
+            )
+        try:
+            await self.test_sudo_password(
+                machine, destination, password, job_id=job_id
+            )
+        finally:
+            _erase(password)
+        return "password"
+
+    async def start(self, job: Job, destination: str) -> None:
+        if not job.sudo:
+            remote = """job=$HOME/.cache/tmuxgate/jobs/$2
+exec tmux new-session -d -s "$1" /bin/bash "$job/run.sh" 0 '' ''
+"""
+            result = await ssh.run(
+                destination,
+                [
+                    "/bin/sh",
+                    "-c",
+                    remote,
+                    "tmuxgate-start",
+                    job.remote_session,
+                    job.job_id,
+                ],
+            )
+            if result.returncode != 0:
+                failure = _classify_failure(result, "remote_start_failed")
+                raise ExecutionError(
+                    failure.code,
+                    failure.detail,
+                    possibly_started=failure.code == "ssh_failed",
+                )
+        else:
+            mode = await self.check_sudo(job, destination)
+            sudo_arguments = (
+                "sudo -n --" if mode == "passwordless" else "sudo -S -k -p '' --"
+            )
+            remote = f"""job=$HOME/.cache/tmuxgate/jobs/$2
+owner_uid=$(id -u) || exit 125
+owner_gid=$(id -g) || exit 125
+exec {sudo_arguments} tmux new-session -d -s "$1" /bin/bash "$job/run.sh" 1 "$owner_uid" "$owner_gid"
+"""
+            password: bytearray | None = None
+            if mode == "password":
+                password = self.credentials.read(job.machine)
+                if password is None:
+                    raise ExecutionError(
+                        "sudo_password_missing",
+                        _context(job.machine, job.job_id, "sudo credential disappeared"),
+                    )
+                password.append(10)
             try:
-                job.viewer.wait(timeout=0)
-            except (AttributeError, TimeoutError):
-                pass
-        record = self.state.mark_terminal_restored(record)
-        collected = coordinator.collect(job)
-        if isinstance(collected, CollectedRemoteFiles):
-            try:
-                spooled = self.spool.store_files(
-                    request_id,
-                    collected.stdout_path,
-                    collected.stderr_path,
-                    stdout_size=collected.stdout_size,
-                    stdout_sha256=collected.stdout_sha256,
-                    stderr_size=collected.stderr_size,
-                    stderr_sha256=collected.stderr_sha256,
-                    exit_status=collected.exit_status,
+                result = await ssh.run(
+                    destination,
+                    [
+                        "/bin/sh",
+                        "-c",
+                        remote,
+                        "tmuxgate-sudo-start",
+                        job.remote_session,
+                        job.job_id,
+                    ],
+                    input_data=password,
                 )
             finally:
-                collected.close()
+                _erase(password)
+            if result.returncode != 0:
+                failure = _classify_failure(result, "sudo_job_start_failed")
+                code = "sudo_job_start_failed" if failure.code != "ssh_failed" else failure.code
+                raise ExecutionError(
+                    code,
+                    _context(job.machine, job.job_id, failure.detail),
+                    possibly_started=failure.code == "ssh_failed",
+                )
+        LOGGER.info(
+            "job started job_id=%s machine=%s state=running remote_directory=%s",
+            job.job_id,
+            job.machine,
+            job.remote_directory,
+        )
+
+    async def completion_exists(self, job: Job, destination: str) -> bool:
+        remote = 'test -f "$HOME/.cache/tmuxgate/jobs/$1/done"'
+        result = await ssh.run(
+            destination,
+            ["/bin/sh", "-c", remote, "tmuxgate-done", job.job_id],
+        )
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        raise _classify_failure(result, "ssh_failed")
+
+    async def monitor(self, job: Job, destination: str) -> None:
+        while not await self.completion_exists(job, destination):
+            await asyncio.sleep(self.poll_interval)
+
+    async def _sudo_session_result(self, job: Job, destination: str) -> ssh.SSHResult:
+        mode = await self.check_sudo(job, destination)
+        arguments = ["sudo", "-n", "--", "tmux", "has-session", "-t", job.remote_session]
+        password: bytearray | None = None
+        if mode == "password":
+            arguments = [
+                "sudo",
+                "-S",
+                "-k",
+                "-p",
+                "",
+                "--",
+                "tmux",
+                "has-session",
+                "-t",
+                job.remote_session,
+            ]
+            password = self.credentials.read(job.machine)
+            if password is None:
+                raise ExecutionError(
+                    "sudo_password_missing",
+                    _context(job.machine, job.job_id, "no stored sudo credential"),
+                )
+            password.append(10)
+        try:
+            return await ssh.run(destination, arguments, input_data=password)
+        finally:
+            _erase(password)
+
+    async def session_running(self, job: Job, destination: str) -> bool:
+        if job.sudo:
+            result = await self._sudo_session_result(job, destination)
         else:
-            spooled = self.spool.store(
-                request_id,
-                collected.stdout,
-                collected.stderr,
-                collected.exit_status,
+            result = await ssh.run(
+                destination, ["tmux", "has-session", "-t", job.remote_session]
             )
-        record = self.state.mark_local_spool_verified(
-            record,
-            manifest_sha256=spooled.manifest_payload_sha256,
+        if result.returncode == 0:
+            return True
+        if result.returncode in {1, 127}:
+            return False
+        if result.returncode == 255:
+            raise _classify_failure(result, "ssh_failed")
+        return False
+
+    async def collect(self, job: Job, destination: str) -> Job:
+        remote = """directory=$HOME/.cache/tmuxgate/jobs/$1
+exec tar -cf - -C "$directory" stdout stderr exit-code
+"""
+        result = await ssh.run(
+            destination,
+            ["/bin/sh", "-c", remote, "tmuxgate-collect", job.job_id],
         )
+        if result.returncode != 0:
+            failure = _classify_failure(result, "result_collection_failed")
+            raise ExecutionError("result_collection_failed", failure.detail)
         try:
-            coordinator.cleanup(job)
-        except BaseException:
-            pass
-        else:
-            record = self.state.mark_remote_cleanup_completed(record)
-        record = self.state.release_lease(record)
-        lease.release()
-        record = self.state.begin_result_delivery(record)
-        with self._records_lock:
-            self._delivery_records[request_id] = record
-        self._publish_connection(
-            request_id,
-            request,
-            ConnectionPhase.COMPLETED,
-            "Remote execution completed and its result was verified locally.",
-            endpoint_id=endpoint.resolved.endpoint_id,
-            remote_mutation_state=RemoteMutationState.STARTED,
+            collected = _read_result_archive(result.stdout)
+            _atomic_output(Path(job.stdout_path), collected.stdout)
+            _atomic_output(Path(job.stderr_path), collected.stderr)
+        except (OSError, ValueError, tarfile.TarError) as exc:
+            raise ExecutionError("result_collection_failed", str(exc)) from exc
+        complete = self.store.update(
+            job,
+            state="complete",
+            exit_code=collected.exit_code,
+            error_code=None,
+            error_detail=None,
         )
-        return ExecutionResult(
-            request_id,
-            TransportStatus.COMPLETE,
-            stdout=spooled.stdout,
-            stderr=spooled.stderr,
-            remote_exit_status=spooled.exit_status,
+        LOGGER.info(
+            "job collected job_id=%s machine=%s state=complete remote_directory=%s",
+            job.job_id,
+            job.machine,
+            job.remote_directory,
         )
+        await self.cleanup(complete, destination)
+        return complete
 
-    def __call__(self, request_id: str, request: RequestSpec) -> ExecutionResult:
-        expected_reboot = (
-            request.disconnect_policy is DisconnectPolicy.EXPECT_FULL_REBOOT
+    async def cleanup(self, job: Job, destination: str) -> None:
+        remote = 'rm -rf -- "$HOME/.cache/tmuxgate/jobs/$1"'
+        result = await ssh.run(
+            destination,
+            ["/bin/sh", "-c", remote, "tmuxgate-cleanup", job.job_id],
         )
-        if self.reboot_recovery is not None:
-            try:
-                self.reboot_recovery.require_machine_available(
-                    request.machine_alias, request_id
-                )
-                if expected_reboot:
-                    self.reboot_recovery.claim_expected_reboot(
-                        request.machine_alias, request_id
-                    )
-            except RecoveryCoordinatorError as exc:
-                return ExecutionResult(
-                    request_id,
-                    TransportStatus.RECOVERY_IN_PROGRESS,
-                    detail=str(exc),
-                    result_code=ResultCode.RECOVERY_IN_PROGRESS,
-                )
-        elif expected_reboot:
-            return ExecutionResult(
-                request_id,
-                TransportStatus.PRE_REMOTE_FAILURE,
-                detail="expected reboot recovery is not configured",
-                result_code=ResultCode.AUTOMATION_POLICY_DENIED,
+        if result.returncode != 0:
+            LOGGER.warning(
+                "remote cleanup retained job_id=%s machine=%s state=%s "
+                "remote_directory=%s error_code=result_collection_failed ssh_stderr=%s",
+                job.job_id,
+                job.machine,
+                job.state,
+                job.remote_directory,
+                result.stderr_text,
             )
 
-        def release_expected_claim() -> None:
-            if expected_reboot and self.reboot_recovery is not None:
-                self.reboot_recovery.release_claim(request.machine_alias, request_id)
-
+    async def execute(
+        self,
+        job: Job,
+        destination: str,
+        *,
+        cwd: str,
+        argv: Sequence[str] | None,
+        script: str | None,
+        environment: Mapping[str, str],
+    ) -> Job:
+        current = job
         try:
-            # Consuming the approved plan is still entirely local.  In
-            # particular, a runtime machine disable can invalidate a queued
-            # approval here before any SSH transport or durable remote-start
-            # boundary exists.
-            context = self.planner.take(request_id, request)
-        except BaseException as exc:
-            release_expected_claim()
-            self._publish_connection(
-                request_id,
-                request,
-                ConnectionPhase.FAILED,
-                "The approved connection plan was unusable; no remote command "
-                "or mutation started.",
-            )
-            return ExecutionResult(
-                request_id,
-                TransportStatus.PRE_REMOTE_FAILURE,
-                detail=f"approved connection plan was not usable: {exc}",
-            )
-        # Approval is final once the one-shot plan has been consumed, so the
-        # approved record is written here.  Everything after this point leaves
-        # a durable trace even when no remote host is ever contacted.
-        boundary = _DurablePreRemoteBoundary(
-            self.state,
-            request_id,
-            request,
-            context.connection_plan,
-        )
-        try:
-            boundary.approve()
-        except BaseException as exc:
-            release_expected_claim()
-            self._publish_connection(
-                request_id,
-                request,
-                ConnectionPhase.FAILED,
-                "The approved request could not be recorded durably; no remote "
-                "command or mutation started.",
-            )
-            return ExecutionResult(
-                request_id,
-                TransportStatus.PRE_REMOTE_FAILURE,
-                detail=f"approved request could not be recorded durably: {exc}",
-            )
-        try:
-            lease, endpoint, approved = self._acquire_transport(
-                request_id,
-                request,
-                context.connection_plan,
-                boundary,
-            )
-        except RemoteSetupFailure as exc:
-            release_expected_claim()
-            return ExecutionResult(
-                request_id,
-                TransportStatus.REMOTE_SETUP_FAILURE,
-                detail=str(exc),
-            )
-        except SshEndpointsExhaustedError as exc:
-            disable_detail = "; machine remains enabled"
-            automation_policy_denied = False
-            try:
-                enabled = self.machine_enabled(request.machine_alias)
-                if type(enabled) is not bool:
-                    raise ExecutorError(
-                        "machine availability callback returned invalid state"
-                    )
-                if not enabled:
-                    disable_detail = "; machine was already disabled"
-                else:
-                    prompt = MachineDisablePrompt.create(
-                            request_id,
-                            request,
-                            context.connection_plan,
-                            failure_detail=str(exc)[:500],
-                            remote_mutation_state=RemoteMutationState.NOT_STARTED,
-                        )
-                    decision = require_operator_decision(
-                        prompt,
-                        resolve_operator_prompt(self.operator_interface, prompt),
-                    )
-                    if decision is ApprovalDecision.APPROVED:
-                        self.machine_disabler(request.machine_alias)
-                        disable_detail = "; machine disabled by operator"
-                    elif _automation_mode(self.operator_interface):
-                        automation_policy_denied = True
-                        disable_detail = (
-                            "; Automation denied persistent machine disable and "
-                            "the machine remains enabled"
-                        )
-                    elif not self.machine_enabled(request.machine_alias):
-                        # Another failed request may have disabled the machine
-                        # while this request waited for the terminal arbiter.
-                        disable_detail = "; machine was already disabled"
-            except BaseException as disable_exc:
-                disable_detail = (
-                    "; machine remains enabled because disabling failed: "
-                    f"{str(disable_exc)[:500]}"
-                )
-            detail = f"SSH transport was not established: {exc}{disable_detail}"
-            boundary.fail_pre_remote(detail)
-            release_expected_claim()
-            self._publish_connection(
-                request_id,
-                request,
-                ConnectionPhase.FAILED,
-                "All approved SSH setup attempts ended before remote execution.",
-            )
-            return ExecutionResult(
-                request_id,
-                TransportStatus.PRE_REMOTE_FAILURE,
-                detail=detail,
-                result_code=(
-                    ResultCode.AUTOMATION_POLICY_DENIED
-                    if automation_policy_denied
-                    else None
-                ),
-            )
-        except BaseException as exc:
-            detail = f"SSH transport was not established: {exc}"
-            boundary.fail_pre_remote(detail)
-            release_expected_claim()
-            self._publish_connection(
-                request_id,
-                request,
-                ConnectionPhase.FAILED,
-                "SSH transport was not established; no requested command started.",
-            )
-            return ExecutionResult(
-                request_id,
-                TransportStatus.PRE_REMOTE_FAILURE,
-                detail=detail,
-                result_code=(
-                    ResultCode.AUTOMATION_POLICY_DENIED
-                    if _automation_mode(self.operator_interface)
-                    and isinstance(
-                        exc,
-                        (AutomationPolicyDeniedError, OperatorInterfaceError),
-                    )
-                    else None
-                ),
-            )
-
-        if expected_reboot:
-            assert self.reboot_recovery is not None
-            try:
-                approved = self.reboot_recovery.capture_pre_reboot(approved, lease)
-                boundary.record = approved
-            except BootIdProbeError as exc:
-                if approved.state is RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE:
-                    boundary.fail_remote_setup(
-                        f"pre-reboot boot ID probe failed before command start: {exc}"
-                    )
-                else:
-                    boundary.fail_pre_remote(
-                        f"pre-reboot boot ID probe failed before command start: {exc}"
-                    )
-                lease.release()
-                release_expected_claim()
-                return ExecutionResult(
-                    request_id,
-                    TransportStatus.PRE_REMOTE_FAILURE,
-                    detail=str(exc),
-                    result_code=ResultCode.PRE_REBOOT_BOOT_ID_UNAVAILABLE,
-                )
-            except BaseException as exc:
-                if approved.state is RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE:
-                    boundary.fail_remote_setup(
-                        f"pre-reboot evidence binding failed before command start: {exc}"
-                    )
-                else:
-                    boundary.fail_pre_remote(
-                        f"pre-reboot evidence binding failed before command start: {exc}"
-                    )
-                lease.release()
-                release_expected_claim()
-                return ExecutionResult(
-                    request_id,
-                    TransportStatus.PRE_REMOTE_FAILURE,
-                    detail=str(exc),
-                    result_code=ResultCode.PRE_REBOOT_BOOT_ID_UNAVAILABLE,
-                )
-
-        remote_lifecycle = _DurableRemoteLifecycle(self.state, boundary)
-        try:
-            permit = remote_lifecycle.request_staging()
-            self._publish_connection(
-                request_id,
-                request,
-                ConnectionPhase.REMOTE_STARTING,
-                "SSH setup is complete; remote staging is starting. The user "
-                "command has not crossed its start gate.",
-                endpoint_id=endpoint.resolved.endpoint_id,
-                remote_mutation_state=(
-                    RemoteMutationState.STARTED
-                    if approved.remote_mutation_started
-                    else RemoteMutationState.NOT_STARTED
-                ),
-            )
-        except BaseException as exc:
-            try:
-                if approved.state is RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE:
-                    boundary.fail_remote_setup(
-                        "durable command-start boundary failed after verified "
-                        f"SSH key enrollment: {str(exc)[:800]}"
-                    )
-                else:
-                    boundary.fail_pre_remote(
-                        f"durable remote-start boundary failed: {exc}"
-                    )
-            finally:
-                lease.release()
-                release_expected_claim()
-            if approved.remote_mutation_started:
-                self._publish_connection(
-                    request_id,
-                    request,
-                    ConnectionPhase.FAILED,
-                    "Remote setup mutation is durable, but the requested command "
-                    "did not cross its start boundary.",
-                    endpoint_id=endpoint.resolved.endpoint_id,
-                    remote_mutation_state=RemoteMutationState.STARTED,
-                )
-                return ExecutionResult(
-                    request_id,
-                    TransportStatus.REMOTE_SETUP_FAILURE,
-                    detail=(
-                        "SSH key enrollment was verified, but the durable command-start "
-                        f"boundary failed: {exc}; no route fallback was attempted"
-                    ),
-                )
-            self._publish_connection(
-                request_id,
-                request,
-                ConnectionPhase.FAILED,
-                "The durable remote-start boundary failed before remote execution.",
-                endpoint_id=endpoint.resolved.endpoint_id,
-            )
-            return ExecutionResult(
-                request_id,
-                TransportStatus.PRE_REMOTE_FAILURE,
-                detail=f"durable remote-start boundary failed: {exc}",
-            )
-
-        coordinator: RemoteJobCoordinator | None = None
-        job: RemoteJob | None = None
-        backend: object | None = None
-        try:
-            recipient = SecretInputRecipient(
-                request_id,
-                request,
-                context.connection_plan,
-                endpoint.resolved.endpoint_id,
-            )
-            backend = self.backend_factory(lease.transport, recipient)
-            coordinator = RemoteJobCoordinator(
-                backend,
-                lifecycle=remote_lifecycle,
-            )
-            job = coordinator.prepare(request_id, request, permit)
-            coordinator.attach_and_start(job)
-            armed = remote_lifecycle.record
-            self._publish_connection(
-                request_id,
-                request,
-                ConnectionPhase.RUNNING,
-                "Remote execution is running; SSH setup has completed.",
-                endpoint_id=endpoint.resolved.endpoint_id,
-                remote_mutation_state=RemoteMutationState.STARTED,
-            )
-            self._monitor(request_id, coordinator, job)
-
-            result = self._finalize_completed_remote(
-                request_id,
-                request,
-                endpoint,
-                armed,
-                lease,
-                coordinator,
-                job,
-                backend,
-            )
-            release_expected_claim()
-            return result
-        except BaseException as exc:
-            current = remote_lifecycle.record
-            if current.remote_phase in {
-                RemotePhase.STAGING_REQUESTED,
-                RemotePhase.STAGING_VERIFIED,
-            }:
-                detail = (
-                    "remote staging failed before a verified wrapper or command-start "
-                    f"marker existed: {exc}"
-                )
-                if current.state is RequestState.KEY_ENROLLMENT_VERIFIED_PRE_REMOTE:
-                    boundary.fail_remote_setup(detail)
-                else:
-                    boundary.fail_pre_remote(detail)
-                lease.release()
-                release_expected_claim()
-                self._publish_connection(
-                    request_id,
-                    request,
-                    ConnectionPhase.FAILED,
-                    "Remote staging failed before any verified wrapper or user "
-                    "command start; the request was reconciled automatically.",
-                    endpoint_id=endpoint.resolved.endpoint_id,
-                    remote_mutation_state=(
-                        RemoteMutationState.STARTED
-                        if current.remote_mutation_started
-                        else RemoteMutationState.NOT_STARTED
-                    ),
-                )
-                return ExecutionResult(
-                    request_id,
-                    (
-                        TransportStatus.REMOTE_SETUP_FAILURE
-                        if current.remote_mutation_started
-                        else TransportStatus.PRE_REMOTE_FAILURE
-                    ),
-                    detail=detail,
-                )
-            self._publish_connection(
-                request_id,
-                request,
-                ConnectionPhase.FAILED,
-                "Remote execution is incomplete; recovery evidence was retained.",
-                endpoint_id=endpoint.resolved.endpoint_id,
-                remote_mutation_state=RemoteMutationState.STARTED,
-            )
-            if isinstance(exc, AutomaticSecretInputError):
-                result_code = ResultCode(exc.code)
-                if expected_reboot:
-                    assert self.reboot_recovery is not None
-                    with self._records_lock:
-                        self._recovery_leases[request_id] = lease
-                        if coordinator is not None and job is not None:
-                            self._recovery_jobs[request_id] = (coordinator, job)
-                    return self.reboot_recovery.fail_closed_after_remote_start(
-                        current,
-                        code=result_code,
-                        detail=f"automatic secret input failed: {exc}",
-                    )
-                return self._retain_recovery(
-                    request_id,
-                    current,
-                    lease,
-                    f"automatic secret input failed: {exc}",
-                    coordinator,
-                    job,
-                    result_code=result_code,
-                )
-            if expected_reboot:
-                assert self.reboot_recovery is not None
-
-                def resume_same_boot(
-                    same_boot_record: DurableJobRecord,
-                    _current: ResolvedSshEndpoint,
-                ) -> ExecutionResult | None:
-                    if coordinator is None or job is None or backend is None:
-                        return None
-                    resumed_state = coordinator.refresh(job)
-                    if resumed_state is not RemoteJobState.COMPLETE_DETACHED:
-                        return None
-                    return self._finalize_completed_remote(
-                        request_id,
-                        request,
-                        endpoint,
-                        same_boot_record,
-                        lease,
-                        coordinator,
-                        job,
-                        backend,
-                    )
-
-                return self.reboot_recovery.recover(
-                    current,
-                    endpoint.resolved,
-                    lease=lease,
-                    same_boot_resumer=resume_same_boot,
-                )
-            return self._retain_recovery(
-                request_id,
+            await self.stage(
                 current,
-                lease,
-                f"remote execution is incomplete: {exc}",
-                coordinator,
-                job,
+                destination,
+                cwd=cwd,
+                argv=argv,
+                script=script,
+                environment=environment,
+            )
+            await self.start(current, destination)
+            current = self.store.update(current, state="running")
+            await self.monitor(current, destination)
+            return await self.collect(current, destination)
+        except asyncio.CancelledError:
+            raise
+        except ExecutionError as exc:
+            state = (
+                "unknown"
+                if exc.possibly_started
+                or (current.state == "running" and exc.code == "ssh_failed")
+                else "failed"
+            )
+            prefix = f"machine={current.machine} job_id={current.job_id}:"
+            detail = exc.detail if exc.detail.startswith(prefix) else _context(
+                current.machine, current.job_id, exc.detail
+            )
+            LOGGER.error(
+                "job failed job_id=%s machine=%s state=%s remote_directory=%s "
+                "error_code=%s detail=%s",
+                current.job_id,
+                current.machine,
+                state,
+                current.remote_directory,
+                exc.code,
+                detail,
+            )
+            return self.store.update(
+                current,
+                state=state,
+                error_code=exc.code,
+                error_detail=detail,
             )
 
-    def result_delivery_finished(self, request_id: str, delivered: bool) -> None:
-        with self._records_lock:
-            record = self._delivery_records.pop(request_id, None)
-        if record is None or not delivered:
-            return
-        self.state.mark_done(record)
+    async def recover(self, job: Job, destination: str) -> Job:
+        try:
+            if await self.completion_exists(job, destination):
+                return await self.collect(job, destination)
+            if await self.session_running(job, destination):
+                running = job if job.state == "running" else self.store.update(job, state="running")
+                await self.monitor(running, destination)
+                return await self.collect(running, destination)
+            detail = _context(
+                job.machine,
+                job.job_id,
+                "no completion marker or convincing remote tmux session",
+            )
+            return self.store.update(
+                job,
+                state="unknown",
+                error_code="remote_job_unknown",
+                error_detail=detail,
+            )
+        except asyncio.CancelledError:
+            raise
+        except ExecutionError as exc:
+            prefix = f"machine={job.machine} job_id={job.job_id}:"
+            detail = exc.detail if exc.detail.startswith(prefix) else _context(
+                job.machine, job.job_id, exc.detail
+            )
+            return self.store.update(
+                job,
+                state="unknown",
+                error_code=exc.code,
+                error_detail=detail,
+            )
 
-    def discard_approval(self, request_id: str) -> None:
-        self.planner.discard(request_id)
+
+def _read_result_archive(payload: bytes) -> CollectedResult:
+    values: dict[str, bytes] = {}
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
+        for member in archive.getmembers():
+            if member.name not in {"stdout", "stderr", "exit-code"} or not member.isfile():
+                raise ValueError("unexpected member in result archive")
+            if member.name in values:
+                raise ValueError("duplicate member in result archive")
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise ValueError("missing result member data")
+            values[member.name] = extracted.read()
+    if set(values) != {"stdout", "stderr", "exit-code"}:
+        raise ValueError("incomplete result archive")
+    try:
+        exit_text = values["exit-code"].decode("ascii").strip()
+        if not exit_text.isdecimal():
+            raise ValueError
+        exit_code = int(exit_text)
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("invalid remote exit code") from exc
+    if not 0 <= exit_code <= 255:
+        raise ValueError("remote exit code is outside 0..255")
+    return CollectedResult(values["stdout"], values["stderr"], exit_code)
+
+
+def _atomic_output(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise

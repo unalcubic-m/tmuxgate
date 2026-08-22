@@ -1,0 +1,14 @@
+[Unit]
+Description=tmuxgate automatic SSH/tmux executor
+Documentation=https://github.com/unalcubic-m/tmuxgate
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tmuxgate serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,1423 +1,161 @@
-# tmuxgate architecture
+# Architecture
 
-## Unified process boundary
-
-Running `tmuxgate` with no subcommand starts one foreground application with
-three coordinated components:
-
-1. The existing same-UID Unix-socket broker and execution workers.
-2. An authenticated MCP Streamable HTTP endpoint at `/mcp` on the configured
-   literal loopback address.
-3. The local dashboard in the application's controlling terminal.
-
-`tmuxgate dashboard` starts the same application explicitly. `tmuxgate broker`
-is a deprecated compatibility alias and no longer starts a broker-only mode.
-There is no `tmuxgate-mcp` executable or Codex-launched helper process. The
-former public `tmuxgate exec` and `tmuxgate script` commands are removed; the
-underlying `RequestSpec` and Unix-socket client remain internal interfaces for
-MCP and tests. Administrative `jobs`, `attach`, `collect`, `recover`, and
-configuration commands remain public. Standalone remote `cleanup` remains
-deliberately disabled and fails closed until its broker-control protocol is
-implemented.
-
-The MCP server is embedded in the same OS process but runs its ASGI event loop
-in a dedicated thread. Its transport is authenticated Streamable HTTP on
-`127.0.0.1`, not stdio. Consequently, MCP protocol bytes cannot consume
-process stdin or the application's `/dev/tty`, and Codex connects to an
-already-running service instead of spawning it.
+tmuxgate implements one execution path:
 
 ```text
-Codex
-  -> Authorization: Bearer ...
-  -> http://127.0.0.1:<port>/mcp
-  -> embedded typed MCP handlers
-  -> internal one-shot Unix-socket client
-  -> same-UID broker
-  -> approval/planning/execution or broker-owned durable read
+load config
+start authenticated loopback MCP
+receive request
+acquire one of three slots
+stage run.sh over SSH
+start one remote tmux session
+optionally start it through whole-job sudo
+poll done
+collect stdout, stderr, and exit code
+save the durable local result
+clean the remote directory
 ```
 
-The internal MCP-to-broker hop is intentional even though both endpoints share
-a process. MCP handlers retain only the broker socket path and a bounded local
-worker dispatcher. They do not receive the planner, SSH pool, state store,
-spool, machine endpoints, credentials, or cleanup capability. This preserves
-the existing validation and execution trust boundary and ensures that new MCP
-inputs cannot become an alternate execution path.
-
-### Startup and shutdown
-
-The unified lifecycle starts resources in fail-closed order:
-
-1. Load and validate the owner-only configuration as one immutable snapshot.
-2. Prepare private runtime/state directories, then acquire `state.lock` and
-   `broker.lock` as one runtime-ownership operation. Both owner-only lock files
-   receive the same fsynced process-incarnation record before any secret,
-   durable state, recovery, stale socket, or listener operation begins.
-3. Securely load or create the MCP bearer-token and credential files, open
-   durable state and the result spool, then perform startup recovery.
-4. Construct the shared terminal arbiter, planner, transport pool, prompt
-   presenter, executor, broker, and broker control service.
-5. Resolve the current configured SSH identities and reconcile only their
-   exact derived ControlMaster sockets before exposing a listener.
-6. Inspect stale broker-socket state and open the Unix listener while retaining
-   both lifecycle locks. Distinct lock names preserve both protections when the
-   configured state and runtime directories are the same.
-7. Start the broker, then start and await readiness of the MCP HTTP listener.
-8. Report only sanitized listener/token-path information and enter the
-   selected dashboard loop. The Textual operator interface is the default;
-   explicit `--plain` selects the supported line-oriented fail-safe.
-
-Startup reconstructs every durable remote-active request before accepting new
-work. Ordinary records enter the broker-owned automatic recovery coordinator;
-their logical machine remains blocked while exact authenticated evidence is
-reconciled, each record counts against configured capacity, and unrelated
-machines may use the remaining slots. Records explicitly bound to
-`EXPECT_FULL_REBOOT` use the changed-boot coordinator instead. Recovery begins
-without an approval or credential dialog;
-the dashboard cannot report Ready while a forbidden prompt is pending. An MCP
-bind or startup failure stops the already-started broker and unwinds owned
-resources; there is no silent broker-only mode. The lifecycle locks are the
-authoritative exclusion mechanism for issue #73. Their metadata binds PID,
-Linux boot ID, process start ticks, executable device/inode, UID, creation
-time, and one random instance/lease nonce. When `/proc` cannot see an
-otherwise matching live owner, read-only status sends a fresh challenge over
-the same-UID broker socket and accepts the locks as active only when the
-response echoes that challenge and every metadata field including the nonce.
-This lets a healthy replacement broker prove its own locks across PID
-namespaces without weakening PID-reuse protection.
-A contending default-TUI process reports a standalone, non-owning conflict
-dialog only when the held record exactly matches the live process incarnation.
-The safe focused action exits and uses the existing broker; another action
-prints the read-only runtime status after the dialog closes. "Stop & start
-here" opens a second, armed confirmation and then uses the same bounded
-PIDFD/SIGTERM-only takeover before retrying startup once. The conflict dialog
-does not read secrets or durable state, reconcile sockets, open a listener, or
-accept work. Explicit `--plain`, a noninteractive terminal, or a dialog failure
-retains the complete stderr diagnostic and exits unavailable. Malformed metadata,
-PID reuse, mismatched identity, an active record without a matching lock, or
-disagreement between the two locks is ambiguous and is left untouched.
-Validated metadata on a free lock is reconciled as a stale crash remnant, while
-legacy empty metadata on a free private lock is migrated safely.
-
-`tmuxgate runtime status` is read-only. `tmuxgate runtime reconcile` acquires
-both locks before performing the same bounded stale-owner, SSH-control, and
-broker-socket reconciliation as normal startup. `tmuxgate runtime takeover`
-requires `--yes`, exact agreement between both active owner records, an exact
-live process-incarnation match, and PID-descriptor delivery of `SIGTERM`. It
-never unlinks a held lock, targets a numeric PID without that proof, or
-escalates to `SIGKILL`; a timeout remains visibly unresolved.
-
-`SIGINT`, `SIGTERM`, or dashboard quit sets the shared stop event. Shutdown is
-two-phase around MCP: it first tells the HTTP listener to stop accepting work,
-then performs the broker's bounded worker shutdown so in-flight MCP handlers
-blocked in the internal Unix client can finish, and only then joins the MCP
-server. A clean shutdown subsequently closes the secret-prompt presenter,
-idle SSH masters, and dedicated MCP broker-call pools, followed by the broker
-listener and spool/state. Each singleton writes and fsyncs an explicit released
-marker before it unlocks, so a subsequent owner can distinguish clean shutdown
-from crash residue. If a bounded network component
-does not stop cleanly, tmuxgate reports a software failure and retains its
-owned resources until process exit rather than closing them underneath live
-workers. That diagnostic names the component that did not stop, states that
-new work is no longer accepted and that the process returns software-error
-status 70, and directs the operator to inspect durable jobs because an already
-approved remote job can continue independently. Disconnecting or timing out an
-MCP call is not a cancellation
-boundary: its internal blocking Unix-socket client may remain connected until
-the broker produces a result. Its bounded execution-worker slot remains
-charged until that synchronous client really returns. The existing
-pre-approval cancellation rule applies only when that Unix client actually
-disconnects. An approved request is never killed, retried, or made nondurable
-because Codex disappeared.
-
-### Configuration and migration
-
-Configuration is still exclusively backed by the owner-only TOML file at
-`$XDG_CONFIG_HOME/tmuxgate/config.toml` or
-`~/.config/tmuxgate/config.toml`. Dashboard configuration actions invoke the
-same `tmuxgate config` handlers. Structured actions use the same parser,
-validation, serializer, and atomic publisher; the advanced `config edit`
-action captures parsed settings and exact bytes from one secure descriptor,
-then compares the current exact bytes under the owner-only writer lock. It
-reopens the editor output securely under that lock and copies its exact
-validated bytes into a broker-owned `0600` temporary that is fsynced before
-atomic replacement. Comment-only concurrent changes therefore conflict rather
-than being silently overwritten. The running application does not depend on
-dashboard state. It retains its startup snapshot until restart so a
-configuration edit cannot change an already approved route or execution
-identity.
-
-Schema version 2 adds:
-
-```toml
-[mcp]
-host = "127.0.0.1"
-port = 8765
-```
-
-The host must be the literal IPv4 loopback address and the port must be from 1
-through 65535. Version-1 files remain valid without an `[mcp]` table and are
-normalized in memory to these defaults. Structured managed writes always
-publish version 2, so they require no separate migration command. The raw
-`config edit` workflow preserves version 1 unless the operator changes it.
-Version 1 deliberately does not accept an `[mcp]` table; change the top-level
-version to 2 when configuring a nondefault port.
-
-Operational migration replaces a broker-only launch with the no-argument
-unified application, removes any Codex stdio/`tmuxgate-mcp` registration, and
-registers the authenticated loopback URL. Callers move from the removed public
-`exec`/`script` commands to the typed `run_argv`/`run_script` tools. Existing
-administrative CLI workflows and durable records are retained.
-
-### User installation and Codex registration
-
-The root `./install.sh` is a user-scoped deployment transaction, not a service
-manager. It refuses root, takes a private installer lock, and builds each
-release in a new timestamped virtual environment below
-`$XDG_DATA_HOME/tmuxgate/releases`. Python packages, including the official MCP
-SDK and Uvicorn, are installed only into that environment; Node.js is not part
-of the runtime or installation path. Imports, the installed CLI, and any
-existing tmuxgate configuration are validated before the managed `current` and
-user launcher symlinks are atomically switched.
-
-The legacy checkout-backed `~/.local/bin/tmuxgate` symlink and a launcher from
-an earlier managed install are recognized replacement targets. An unrelated
-file or symlink fails closed unless the operator supplies
-`--replace-existing`. The installer does not rewrite
-`config.toml`, durable job records, verified result spools, or an existing
-`mcp-token`; it invokes the installed token loader only to validate and reuse
-that token, or to create the normal owner-only token when none exists. The
-default protected configuration must exist before installation. A newly
-created token is durable application state and is intentionally retained if a
-later deployment step fails.
-
-A verified candidate is not an active release. `pip` reports
-`Successfully installed tmuxgate` inside the unpublished candidate long before
-the `current` and launcher symlinks are switched, so a run blocked between
-those two points would otherwise read as a successful update. Every
-`InstallError` exit therefore prints the failure reason and then a final-state
-block naming the candidate release, whether it was discarded or retained, which
-release is active or that none is, whether publication was attempted, and what
-persistent state the run left behind, including whether it created the MCP
-token. Releases are identified by release ID, because development builds can
-report the same package version and only the release ID distinguishes them; a
-successful run prints the release it published for the same reason. Uncatchable
-termination and interruption checkpoints are not yet covered by this contract.
-
-Retention runs only after the commit point, while the run still holds the
-install lock, so no concurrent installer can be staging into a directory it
-removes and nothing left to roll back can still need one. It keeps the newest
-`--keep-releases` releases, three by default. Three matters because rollback is
-a `current` symlink flip and a flip to a deleted release would leave a dangling
-launcher: the active release, the release `current` pointed at before this run,
-and any release a live process was started from are therefore protected
-unconditionally. In-use detection reads `/proc` for exe targets below the
-releases directory; it never signals or starts a process, and pruning is skipped
-entirely if that evidence cannot be gathered. Backups are trimmed per kind with
-the oldest pre-image of each always retained, since only that copy predates
-tmuxgate managing the file. Every removal is named on stdout, so a release
-retained after a failed publish is never reclaimed silently. Retention failure
-is reported but never fails an install that already published its release.
-
-Codex registration is written directly to the single
-`[mcp_servers.tmuxgate]` table using the configured
-`http://127.0.0.1:<port>/mcp` Streamable HTTP URL,
-`TMUXGATE_MCP_TOKEN` as `bearer_token_env_var`, and
-`tool_timeout_sec = 604900`. The full candidate is validated with Python's TOML
-parser. For compatibility verification, `codex mcp list --json` receives only
-the canonical tmuxgate table in a private disposable `CODEX_HOME` and runs from
-that isolated directory; neither the live config nor unrelated hooks and
-settings are exposed to CLI serialization. The installer refuses a different
-registration named `tmuxgate` unless `--replace-codex` is explicit, and even
-then replaces only an unambiguous simple table; nested, quoted, or complex
-layouts fail closed for manual review. Codex rewrites this file, so the
-installer recognizes its own registration in the shape Codex leaves it: a
-`tool_timeout_sec` rendered as a float, and the
-`[mcp_servers.tmuxgate.tools.*]` approval sub-tables Codex appends when an
-operator approves a tool. Both are treated as already installed rather than as
-a competing entry, and the sub-tables are preserved even when a genuinely
-conflicting table is replaced, because they are the operator's approval policy.
-A scalar named `tools` is not a Codex sub-table and remains a conflict. An
-owner-controlled Codex home is
-hardened to mode `0700` before its configuration is changed. Installer
-children receive neither the MCP bearer token nor `PYTHONPATH`, `PYTHONHOME`,
-or `VIRTUAL_ENV`, preventing credentials or checkout imports from leaking into
-pip build isolation, smoke tests, or Codex commands.
-
-For Bash launches, the installer writes an owner-only
-`$XDG_CONFIG_HOME/tmuxgate/codex-env.sh` and a delimited managed source block
-in `.bashrc` and `.profile`. The environment file contains a fixed token-file
-path and canonical-token validation, never the credential bytes; each new
-shell reads the credential directly from the owner-only durable state file.
-The installer cannot alter an already-running process environment or MCP
-registry snapshot, so a new Bash shell and a Codex restart are required.
-
-Before changing a pre-existing Codex config or Bash profile, the installer
-writes an owner-only backup below `$XDG_DATA_HOME/tmuxgate/backups`. It retains
-snapshots of every managed mutation until the launcher switch and install
-manifest complete. Immediately before a managed replacement, the installer
-refuses to proceed if the captured preimage has changed. Failure restores a
-file or link only while its exact installer-written post-image is still
-present. The public launcher is also rechecked against replacement policy at
-publication time so a launcher introduced during the build is not claimed.
-These checks narrow but cannot eliminate the filesystem race between the last
-comparison and an atomic replacement; retained owner-only backups are the
-recovery path if another process writes in that interval. An unpublished
-incomplete release is removed; a release that may already have been observed
-through `current` is retained even after rollback so a running process cannot
-lose packaged assets. Successful installations retain older versioned
-releases and backups for operator recovery. The application itself is never
-started, stopped, or killed by the installer: `tmuxgate` must still run in the
-foreground in the terminal that owns approvals and authentication.
-
-The packaged configuration uses `approval_mode = "disabled"`, and installation
-accepts that automatic policy without a second acknowledgement flag. The
-bearer token plus Codex's tool approval authorizes execution in this mode;
-`approval_mode = "always"` restores the independent broker-terminal decision.
-The dashboard switch applies this change to the running operator interface and
-atomically persists it for the next launch.
-
-Configuration edits are validated and atomically published but require a
-restart. Direct-home enrollment still requires complete local link,
-source-address, route, router-neighbor, and NetworkManager identity evidence
-and refuses a routed WireGuard view. When the otherwise-proven direct gateway
-lacks a cached neighbor entry, enrollment alone may send one bounded ICMP
-request to that configured gateway, then recollect and re-prove the full
-snapshot before publication. Ordinary planning remains passive. These settings
-actions do not open SSH or mutate a remote machine.
-
-### MCP authentication and transport security
-
-Loopback TCP has no Unix peer-credential equivalent, so every HTTP request must
-present `Authorization: Bearer <token>`. A small ASGI middleware compares the
-complete header in constant time and rejects failures before MCP parsing. The
-MCP application also receives its fixed host for Host/Origin and DNS-rebinding
-validation, disables access logging, and caps a request body at 24 MiB. The
-listener cannot be configured on a wildcard, hostname, IPv6 address, or
-non-loopback interface.
-
-Before an execution request opens the Unix socket, the MCP handler serializes
-its broker header and enforces the broker protocol's 256 KiB metadata limit.
-Oversized argv/environment requests therefore produce an input error instead
-of being misclassified as a malformed broker response.
-
-The first unified startup creates `mcp-token` below the selected durable state
-directory, normally `~/.local/state/tmuxgate/mcp-token`. The token is 32 random
-bytes represented as 64 lowercase hexadecimal characters plus one newline.
-Creation uses an exclusive private temporary file, mode `0600`, file `fsync`,
-atomic no-overwrite publication, and directory `fsync`. Every load rejects
-symlinks, non-regular files, the wrong owner or mode, malformed contents, and
-replacement races. The application prints the token path, never the token.
-
-For the credential, Codex configuration stores only the name of the environment
-variable that supplies it:
-
-```toml
-[mcp_servers.tmuxgate]
-url = "http://127.0.0.1:8765/mcp"
-bearer_token_env_var = "TMUXGATE_MCP_TOKEN"
-tool_timeout_sec = 604900
-```
-
-The environment variable must be populated from the token file before Codex
-starts. The recommended timeout covers `RequestSpec`'s seven-day maximum plus
-protocol overhead; shorter local policy is valid but may cause Codex to stop
-waiting while an approved durable job continues. Token rotation requires
-restarting tmuxgate and every Codex process that uses the old credential.
-
-Possession of the bearer token grants request-submission authority. With
-`approval_mode = "disabled"`, that authority can cause remote execution without
-a per-request terminal decision. Authorization headers, request scripts,
-environment values, stdout/stderr, and secret-terminal events must never be
-logged. The token is state, not configuration, and must not be copied into the
-main TOML file.
-
-### Typed MCP tools
-
-The MCP surface contains exactly five tools:
-
-- `list_machines()` returns only logical aliases, descriptions, and the boolean
-  enabled state; endpoints, addresses, SSH identities/options, routes, keys,
-  and host-key evidence remain private to the broker.
-- `run_argv(machine, cwd, argv, purpose, environment?, timeout_seconds?,
-  interactive?)` first resolves the supplied alias or normalized stored
-  description through the broker's sanitized machine list, then validates and
-  creates `RequestSpec(mode=ARGV)` without shell-joining argv. Generic display
-  suffixes such as `VM`, `server`, and `host` may be omitted when the result is
-  unique; unknown or ambiguous names fail closed.
-- `run_script(machine, cwd, purpose, script?, script_base64?, environment?,
-  timeout_seconds?, interactive?)` requires exactly one UTF-8 text script or
-  canonical base64 exact-byte script and creates `RequestSpec(mode=SCRIPT)`.
-- `list_jobs(states?, limit=50, cursor?)` exposes sanitized durable metadata in
-  newest-first pages. Page size is from 1 through 100 and cursors are opaque.
-- `read_verified_result(request_id, stream, offset=0, limit=65536)` reads only
-  `stdout` or `stderr`, with a maximum 1 MiB chunk.
-
-Execution tools are annotated mutating, destructive, non-idempotent, and
-open-world. List/result tools are annotated read-only, non-destructive,
-idempotent, and closed-world. Codex-side approval based on those annotations is
-only additive; broker-terminal approval remains authoritative.
-
-`run_argv` and `run_script` block for the broker result and return the request
-ID, transport status, optional remote exit status/detail, and length plus
-SHA-256 for each stream. A stream of at most 64 KiB is strictly UTF-8 decoded
-and returned as ordinary text with encoding `utf-8`; decoding failure selects
-canonical Base64 and encoding `base64`. Each stream is classified independently.
-Empty output, NUL, and terminal controls remain UTF-8 whenever strict decoding
-succeeds. Larger content and its encoding are both omitted and marked
-truncated. `read_verified_result` applies the same classifier independently to
-every chunk and returns `chunk`, `encoding`, current/next byte offsets, EOF,
-complete stream size/digest, exit status, and manifest digest. A byte range that
-starts or ends inside a multibyte character therefore uses Base64, and
-successive chunks may use different encodings. It never contacts SSH and never
-reads tmux pane history.
-
-This intentionally breaks the MCP response schema: `stdout_base64` and
-`stderr_base64` are replaced by `stdout`/`stdout_encoding` and
-`stderr`/`stderr_encoding`; `chunk_base64` is replaced by `chunk`/`encoding`.
-There are no duplicate legacy fields. Consumers must decode every content value
-according to its adjacent encoding. Lengths, offsets, next offsets, and hashes
-remain byte-based and are computed from the original bytes. Readable remote
-output remains untrusted data, not instructions; its encoding neither verifies
-the result nor changes the transport-status trust rules.
-
-Before a result byte is exposed, the broker requires durable state to mark the
-local spool verified with a manifest digest and binds the current manifest and
-exit status back to that record. It exact-validates both stream files, then
-hashes only the selected stream in fixed 64 KiB reads while retaining at most
-the requested 1 MiB range. Missing, corrupt, mismatched, unverified, abandoned,
-or recovery-required results fail closed. `list_jobs` exposes only the request
-ID, logical machine, state, decision, timestamps, exit status, verified-result
-availability, and recovery requirement.
-
-### Unix broker protocol and implementation boundary
-
-Each client sends exactly one request frame, then shuts down its socket's write
-side. The broker requires EOF before considering the request complete. Frame
-reads have a bounded deadline, and argv/cwd/environment filesystem bytes are
-base64 fields inside the JSON header so non-UTF-8 bytes survive exactly.
-Execution responses may contain multiple status/result frames. The three MCP
-control requests (`list_machines`, `list_jobs`, and `read_verified_result`) use
-the same one-frame, EOF-terminated, same-UID-validated socket boundary and one
-strictly decoded response.
-
-The request header is protocol version 4. It adds one required
-`disconnect_policy` member (`normal` or `expect_full_reboot`) to the exact key
-set, and that member is inside `client_request_sha256`. The broker accepts an
-exact version-3 header conservatively as `normal`, preserving rolling local
-upgrades without giving an older request automatic abandonment authority.
-Other versions and mixed key sets fail closed. An approval or handoff digest
-cannot be reused across the two spellings.
-
-The broker composes that local socket boundary, one-shot bound planner, real
-broker-owned OpenSSH master/channels, durable state, dedicated remote tmux jobs,
-canonical result spool, and client delivery. `--fake` remains available for
-local tests. Successful jobs auto-collect and auto-clean. Local `collect`
-replays a checksummed spool. `attach` enters an active request's private local
-viewer without issuing a new remote command.
-
-The embedded MCP layer uses separate bounded thread pools for execution waits
-and read-only control requests. Long `run_argv`/`run_script` calls therefore
-cannot consume the workers used by `list_machines`, `list_jobs`, or
-`read_verified_result`. The broker client-session limit includes a matching
-control-session reserve, so execution saturation cannot move the starvation
-point down to the Unix listener. A disconnected coroutine does not free its
-execution slot while its synchronous Unix client remains live, preventing
-unbounded queued work after repeated HTTP cancellations.
-
-Ephemeral socket, control, viewer, and `broker.lock` socket-lifecycle files live below
-`$XDG_RUNTIME_DIR/tmuxgate`. The durable boundary is
-`$XDG_STATE_HOME/tmuxgate` (default `~/.local/state/tmuxgate`) with the
-`state.lock` lifecycle singleton, token, job records, and owner-only spool. The
-durable job store uses checksummed,
-generation-checked JSON records, mode `0600`, same-directory atomic replacement,
-file `fsync`, and directory `fsync`. Startup recovery atomically terminalizes
-records proven to be pre-command and hands every ordinary uncertain record to
-automatic evidence reconciliation. An unresolved record blocks only its
-machine while the coordinator owns its capacity. Explicitly armed
-expected-reboot records use their separate changed-boot proof. Before each
-remote effect, and after each authenticated observation, the durable record
-advances one generation through the exact phase sequence described below.
-Completion, viewer detach, terminal restoration, local-spool verification,
-cleanup, lease release, delivery, and done are generation-checked and fsynced;
-the verified spool flag is inseparable from its exact manifest digest. The
-real executor uses this store directly; there is no second state path.
-
-The durable record begins at approval, not at transport. As soon as the
-one-shot approved context is consumed the executor fsyncs
-`APPROVED_PRE_REMOTE`, before it opens any SSH master. Every later
-pre-transport outcome therefore terminalizes an existing record rather than
-leaving nothing: an exhausted endpoint plan, a denied fallback, a cancelled
-retry, a revalidation refusal, or any other failure before the remote-start
-boundary becomes `FAILED_PRE_REMOTE` carrying the same detail the caller
-receives. An authorized request is consequently always visible to `list_jobs`,
-and an operator can tell a failure that reached approval from a request that
-was never submitted. Because the approval is what is recorded, a plan that
-proves unusable while being consumed, such as a machine disabled between
-approval and execution, is deliberately not recorded: nothing was authorized
-to run. The
-volume this creates is intended; a machine that cannot be reached leaves one
-terminal audit record per approved attempt, which is the evidence a
-pre-transport failure otherwise destroys.
-
-Route fallback is offered only before any remote mutation, so the approved
-record is retargeted to the next endpoint under the same generation-checked
-write when the operator authorizes it. Retargeting requires
-`APPROVED_PRE_REMOTE`, an unmutated record, and the record's own approved
-connection-plan digest, so it can never rewrite the identity of a request that
-already touched a host. `FAILED_PRE_REMOTE` is terminal and carries
-`remote_mutation_started = false` with no start time, exit status, or spool
-evidence, so a record that never reached a remote host can never become a
-startup-recovery blocker. If the failing transition cannot itself be written,
-the last fsynced `APPROVED_PRE_REMOTE` record stands untouched, the caller
-still receives `pre_remote_failure`, and startup recovery terminalizes the
-record conservatively.
-
-SSH public-key setup has its own durable sub-lifecycle in the same record. A
-read-only remote check first proves whether the exact dedicated key is already
-present. If it is missing, tmuxgate fsyncs
-`KEY_ENROLLMENT_MAY_HAVE_STARTED`, bound to the request, approved plan, and
-exact endpoint, before it may create `.ssh`, create `authorized_keys`, or
-append the key. Successful append plus a final exact-key check is fsynced as
-`KEY_ENROLLMENT_VERIFIED_PRE_REMOTE` before command setup continues. A channel,
-script, verification, or later setup failure after that first boundary becomes
-`FAILED_REMOTE_SETUP`: it truthfully retains `remote_mutation_started = true`
-without claiming the requested command ran or inventing command output. Startup
-conservatively terminalizes an interrupted enrollment in the same state.
-
-The complete approval document binds the exact client request to the ordered
-route plan, canonical network-snapshot digest, strict `ssh -G` identity, SSH
-policy digest, host-key alias/evidence, proxy configuration, and fallback order.
-The connection-plan component resolves every eligible fallback up front and
-fails the entire plan if any resolved identity is inconsistent. The one-shot
-planner composes collection, route policy, `ssh -G` resolution, and optional
-bound terminal approval without opening SSH. An authorized context contains
-only the request digest and immutable plan, is consumed once, and multiple
-request-bound contexts may await parallel executor workers.
-
-## Operator-interface boundary
-
-`OperatorInterface` is the presentation-independent boundary between broker or
-executor work and operator interaction. `PlainTerminalInterface` preserves the
-line-oriented dashboard and the existing exact approval, SSH-retry, fallback,
-machine-disable, and secret-input renderers. It remains supported when selected
-explicitly with `--plain`. It obtains decision bytes only
-from the controlling `/dev/tty` under `TerminalArbiter`; stdin,
-MCP/Unix-socket frames, request content, remote output, viewer pane content,
-rendered diagnostics, and pager return values are never input sources.
-
-`TextualOperatorInterface` is the default operator interface and is built on
-exactly pinned `textual==8.2.8`; the former `--tui` preview selector is removed.
-Before entering
-application mode it verifies that Textual's real stdin and stdout are the same
-character terminal and that tmuxgate's process group owns that terminal in the
-foreground. Each dashboard refresh re-proves that ownership. Validation,
-driver initialization, snapshot refresh, or terminal ownership failure aborts
-the unified application and directs the operator to restart explicitly with
-`--plain`; there is no automatic fallback, second dashboard, or approval-policy
-change. Textual's driver owns alternate-screen
-entry, resize/full redraw, signal/cancellation unwinding, and restoration of
-the prior terminal modes and contents.
-
-The Textual dashboard has one fixed widget tree with keyboard-accessible
-Dashboard, Jobs, Machines, Activity, queued-request, and Help views. Its
-runtime snapshot reports application/broker readiness, MCP listener and
-approval mode, configured/enabled machines, bounded recent durable jobs,
-retained SSH state, pending prompts, bounded activity, and terminal ownership.
-Every externally derived string is passed as literal non-markup content after
-C0/C1, DEL, format, bidi, and surrogate controls are escaped. Job, machine,
-activity, and prompt rows are bounded without creating per-record widgets. A
-terminal below 72 columns by 20 rows shows only a resize/quit guard when no
-security decision is active. During a decision, the same boundary hides the
-evidence region, keeps Deny/Cancel/Keep enabled visible and focused, and
-disables the positive action until the terminal is large enough to inspect the
-complete evidence again.
-
-The TUI supports execution approval, bounded SSH retry, separately authorized
-adjacent-route fallback, manual-mode secret-input authorization, reusable sudo
-password management, and request-bound local machine-disable decisions. Its
-Dashboard button switches between automatic and manual approval, while the
-Machines button stores, replaces, or removes one password per logical machine.
-Its presenter thread remains the sole FIFO consumer,
-but it schedules each supported prompt through Textual's thread-safe
-`call_from_thread` boundary. The UI thread creates one modal for that exact
-immutable queued item and returns its result through a callback which retains
-the original object identity; no displayed label is parsed or used to select a
-slot. The machine-disable modal shows the exhausted request, complete approved
-request/plan evidence, and exact disable binding; Keep enabled is its fenced
-safe default.
-
-Focus follows the same fence. Every decision modal opens with its safe action
-focused and its positive action disabled. When the fence elapses on execution
-approval and manual-mode secret-input authorization, focus moves to the positive action so
-one Return commits the routine decision; SSH retry, adjacent-route fallback, and
-machine-disable keep the safe action focused because their positive action is
-not the routine outcome. A compact terminal keeps the safe action focused in
-every modal, and Escape always takes the safe action.
-
-Besides the request-bound secret handoff, the interface exposes
-`run_terminal_session(purpose, session)` for a trusted session that exists
-before any request-bound secret can: SSH enrollment authentication. It is named
-by purpose rather than by prompt, has no authorizing modal, waits for the
-interface to be idle instead of competing with an open decision, and otherwise
-uses the identical claim-then-suspend sequence.
-
-The interface tracks three synchronized foreground ownership states: `tui`,
-`modal`, and `external`. This secret-input modal path is reachable only in
-manual approval mode; automatic mode never queues it. A positive secret-input
-modal result atomically reserves
-`external` ownership for that exact prompt ID before its waiting worker is
-released. The SSH and first-use sudo setup handoffs reserve that same single
-slot under their own one-shot tokens, so authentication, enrollment, and a
-secret session can never own the terminal at once. No later modal can open
-during that reservation, and a stale or different prompt cannot consume it.
-The trusted presenter then asks the interface to run the already-bound viewer
-session. On the UI thread, the
-interface acquires the highest-priority `TerminalArbiter` lease and enters
-Textual's `App.suspend()` context. Textual stops its input reader and output,
-leaves alternate-screen/raw application mode, and restores the pre-TUI terminal
-settings before the trusted tmux process is started with all three standard
-streams connected directly to the resolved broker-owned `/dev/pts/...` device.
-The TUI therefore never reads, buffers, renders, or logs secret bytes. Normal
-return, cancellation, process failure, and exceptions all unwind the suspend
-and arbiter contexts, restore `tui` ownership, and force a full layout repaint.
-Concurrent terminal ownership or a missing/exited dashboard fails closed before
-the terminal or viewer is opened.
-
-An execution modal exposes separate Summary, Code, and Technical Details tabs.
-The existing pure ASCII-safe renderers supply complete request, script,
-connection-plan, identity, evidence, diagnostic, and binding content to three
-fixed scrollable non-markup widgets; content size does not create additional
-widgets. The full request ID is independently visible in the modal heading.
-Deny receives initial focus and Enter therefore denies. Escape and modal close
-also deny. Approve has no single-key binding and remains disabled during a
-short opening fence, which consumes already-buffered activation input before a
-later deliberate button action can approve. Dashboard, remote, pane, protocol,
-ANSI, and rendered content remain data and cannot synthesize Textual events.
-
-SSH retry and fallback each have a distinct focused modal with Summary,
-Diagnostics, and Binding Evidence tabs. Cancel receives initial focus and is
-the Enter/Escape/default action. The positive action is fenced like execution
-approval. Retry shows the exact request, endpoint and resolved identity,
-failure summary, requested-command and mutation states, and the enforced
-`1 of 1` retry count. Fallback shows the failed and proposed routes and
-identities and explains why the original RUN decision is insufficient. Both
-retain the complete bounded OpenSSH stderr bytes, render a reversible inert
-spelling, and expose the exact byte length, SHA-256, and hexadecimal evidence.
-
-Workers submit immutable structured objects rather than presentation
-arguments:
-
-- `ExecutionApprovalPrompt` binds a fresh prompt ID, canonical request ID,
-  complete `RequestSpec`, command/script identity digest, client-request
-  digest, and the complete approved `ConnectionPlan` plus its digest. The
-  plan-less form is restricted to the nonremote `--fake` test backend.
-- `SshRetryPrompt` additionally binds the exact endpoint, failure detail,
-  complete OpenSSH diagnostic digest, `1 of 1` retry policy, requested-command
-  state, truthful remote-mutation state, and retry digest.
-- `RouteFallbackPrompt` binds the failed endpoint, the immediately adjacent
-  approved fallback, failure detail, diagnostic digest, requested-command and
-  mutation states, and separate fallback digest. Construction rejects a
-  nonadjacent route or any state in which the command or remote mutation may
-  have started.
-- `MachineDisablePrompt` binds the local mutation decision to the originating
-  request, approved plan, failure, machine, and proven pre-remote state.
-- `SecretInputAuthorizationPrompt` binds the exact request, machine/endpoint,
-  command or script, approved plan, and isolated viewer-session recipient.
-  `SecretInputRecipient` retains that request and route identity while the
-  viewer is live and creates a fresh one-shot prompt for each new prompt
-  episode.
-- `OperationalActivity` carries a typed activity kind and optional canonical
-  request, machine, endpoint, and detail identities. Connection events also
-  carry a typed phase and truthful mutation state. The Textual dashboard
-  replaces each request's connection projection with its latest phase, so
-  approval progresses through connecting, retry/fallback decision, remote
-  execution, completion, or failure in place. Plain mode consumes the same
-  structured transitions linearly. Broker audit transitions enter the
-  interface's bounded history; startup and error events use the same boundary.
-
-Every prompt constructor recalculates the established connection-plan digest
-and the exact client request/command identity. Missing, malformed, mismatched,
-or internally inconsistent fields are rejected before queuing. A prompt gets a
-cryptographically random process-local ID which may be submitted only once for
-the interface lifetime. Human-readable labels and rendered terminal text are
-never parsed to reconstruct these identities.
-
-### Queue and decision ownership
-
-`PromptQueue` is a mutex-protected FIFO. Submission receives a monotonically
-increasing sequence number while holding that mutex, so concurrent worker
-requests have one deterministic presentation order. Each queued item owns its
-own `PendingDecision` condition variable. Each interface has one daemon
-presenter thread and is the sole queue consumer; workers wait only on the slot
-created for their exact prompt. The Textual interface also records a bounded
-projection of every submission, schedules only the active decision item onto
-the UI thread, waits for that item's resolution, and then advances to the next
-FIFO item. Multiple worker requests therefore remain independent and only one
-security modal can be active.
-
-An immutable `OperatorDecision` repeats the prompt ID and canonical binding
-digest in addition to Approved or Denied. `PendingDecision.resolve()` checks
-both values atomically and accepts only its first matching result. A second
-resolution, a decision for another request, a late decision for an earlier
-prompt, or reuse of any prior prompt ID is rejected without affecting the
-current prompt. Thus screen labels, queue position, short request IDs, or
-stale terminal actions cannot select a decision target.
-
-The foreground application owns the interface for the same lifetime as the
-broker and MCP listener. Shutdown first stops new MCP admissions, then closes
-the interface before joining broker workers. Queue close atomically resolves
-every active and queued slot as Denied and makes later submissions immediately
-Denied. Cancellation and worker abandonment use the same one-shot denial;
-presenter/render/input exceptions close the queue and deny all unresolved
-slots. Closing cannot interrupt a kernel-blocked `/dev/tty` read, so
-`PlainTerminalInterface.close()` may report an unjoined presenter thread, but
-the decision slots are already denied and application shutdown is reported
-unclean rather than approving or closing dependencies underneath it.
-
-OpenSSH first-master authentication still uses direct, arbiter-serialized
-external terminal ownership. `SecretPromptPresenter` may detect and report
-prompt-like remote output, but detection is not authority: before it can
-attach a viewer, it submits a fresh `SecretInputAuthorizationPrompt` through
-the same one-shot operator interface.
-
-## Bounded command leases and retained transports
-
-`max_active_remote_commands` defaults to three and may be configured from one
-to three. The broker assigns one isolated lease per request. Each lease remains
-held until:
-
-- remote completion is proven;
-- the canonical completion manifest and separate streams are stored locally;
-- the viewer has exited or detached; and
-- the broker has restored control and settings of its terminal.
-
-Detaching while a command runs does not release that request's lease. An
-uncertain job holds its own lease in recovery-required state; other configured
-slots continue independently.
-
-`approval_mode = "disabled"` is the default Automation policy. One centralized
-decision boundary approves the exact bound execution request, the single exact
-same-endpoint pre-mutation SSH retry, and the next exact adjacent pre-mutation
-route fallback. It emits a broker activity audit before each decision returns.
-Persistent machine disable and human secret-input handoff are denied without
-mutating policy. Automation never renders or queues an operator dialog.
-
-When an owner-only stored password and its enrolled exact sudo prompt are
-available for the target machine, Automation may submit that password for up
-to three distinct prompt episodes. Missing credentials, prompt mismatch,
-submission failure, or retry exhaustion fails the request immediately with a
-stable result code; none opens Forward Input, `getpass`, a TUI dialog, or a
-credential-enrollment flow.
-
-`approval_mode = "always"` disables stored-password submission and
-enables the execution and secret-input approval UI. Automatic mode suppresses
-the Forward Input UI even when a password is missing, rejected, or presented to
-a non-sudo prompt; first-use setup is a separate masked credential-enrollment
-boundary. Its compact decision card contains advisory
-purpose, logical machine, selected route and resolved identity, host-key status,
-working directory, a JSON-quoted shell-escaped argv view or script identity/source,
-environment, timeout, and human-readable advisories. Enter/`y` approves, `n`
-denies, `c` opens the exact structured argv or complete escaped script, and `d`
-opens the exhaustive network/SSH-policy/evidence/binding record. Both views use
-the sealed secure pager and return to the same prompt. Client-controlled text
-is rendered with reversible ASCII escapes, and a final renderer invariant
-rejects every non-newline character outside printable ASCII, preventing ANSI,
-C0/C1, DEL, Unicode bidi, or similar terminal-display injection. Approval is read only
-from the application's `/dev/tty`; pager output, HTTP or Unix-socket data,
-process stdin, and client-supplied purpose text cannot answer it.
-
-Each SSH viewer runs in a separate owner-only local tmux server below the
-runtime directory. A broker-owned monitor checks only the visible cursor row of
-each viewer for a password or passphrase prompt; this deliberately ignores the
-nested remote tmux status row below it. In automatic mode, it accepts the exact
-default `[sudo] password for <resolved-user>:` form or the exact prompt already
-enrolled for that logical machine, plus bounded literal sudo `pwfeedback` stars. It loads
-the per-machine password through tmux stdin, pastes and deletes that private
-named buffer, and reports only that submission occurred. The secret never
-appears in a child argument, environment, activity,
-canonical stream, spool, or durable job record. One automatic submission is
-allowed per distinct prompt episode, capped at three per viewer. That bounded
-retry lets sudo finish its ordinary incorrect-password path without looping
-into account lockout.
-
-Automation never learns a prompt or enrolls a password during command
-execution. Enrollment is an explicit, separate operator workflow. If
-Automation is off, the
-presenter asks the operator to authorize the exact request, logical machine,
-approved command identity, connection plan, endpoint, and isolated viewer
-session. Authorization requires typing the full
-`forward <32-character request ID>` phrase on the broker's `/dev/tty`; Enter or
-an explicit denial denies. Socket/MCP data, request bytes, remote pane content,
-and process stdin are not input sources for this prompt. A stale prompt ID,
-binding, request, command, endpoint, or viewer cannot resolve a replacement
-prompt. Only after an Approved decision does the presenter request an exclusive
-presentation-layer handoff, then revalidate the still-live viewer and
-still-visible prompt and attach to the resolved broker-owned terminal device.
-In Textual mode this happens only while the application is suspended. The
-general prompt matcher accepts at most 256 literal ASCII sudo `pwfeedback`
-stars after an otherwise valid cursor-row prompt, including fewer stars after
-backspacing; it does not accept arbitrary suffix text or alternate mask
-characters.
-
-The presenter has no typing-speed, authentication-check, or retry timeout.
-While the underlying approved job remains active, an attachment remains open
-across a disappearing prompt, PAM delay, rejection output, and a newly visible
-prompt. It detaches automatically only after observing a new exact
-session-bound line
-`TMUXGATE_AUTH_COMPLETE=tmuxgate-<12 hex>`. A reviewed script emits that
-non-secret marker only after its authentication command has returned success,
-for example by obtaining `#S` from its current remote tmux session. The
-presenter counts exact markers already retained in the isolated local viewer's
-bounded scrollback before attachment so an older marker cannot satisfy a later
-prompt episode. Prompt matching continues to use only the visible cursor row;
-history is scanned only for the cooperative marker. The marker is viewer-UX
-signaling, not authentication security or durable completion evidence;
-canonical job state and captured results remain authoritative. Job completion
-and operator `Ctrl-b d` remain the fallback for commands without the marker.
-A denial leaves the remote command running and detached. The same continuously
-visible prompt is not offered again; clearing it and later displaying a new
-prompt creates a fresh independently bound decision. A deliberate detach is
-not automatically reversed while the same prompt
-remains continuously visible; a cleared prompt followed by a new prompt begins
-a new episode. This avoids both premature time-based detachment and
-interception of password bytes. Prompt or marker probe failure attempts a
-targeted detach fail-closed. If targeted tmux detach fails, the presenter
-terminates and reaps the exact local attach process before releasing the
-terminal lock, then reports the presenter error.
-
-After authorization and before displaying its attachment notice, the presenter
-revalidates the opened PTY and discards only input bytes that were already
-queued on the broker terminal. It then writes the notice and starts attachment
-without a second input flush. This prevents the authorization line or an
-earlier dashboard keystroke from becoming a password submission while
-preserving input typed in response to the notice.
-Output is not flushed, and input continues directly to the viewer. Detection
-does not inspect canonical stdout/stderr or store input.
-`tmuxgate attach REQUEST_ID` remains available for arbitrary interaction,
-inspection, Ctrl-C, or manual detach. Lost viewers are recreated automatically.
-Normal completion closes the remote pane and local viewer automatically;
-canonical capture does not depend on pane history.
-
-In plain mode, one process-local `TerminalArbiter` serializes dashboard
-transactions, the optional execution approval UI, manual secret-input
-authorization, fallback approval, interactive first-master SSH authentication, and approved
-viewer attachments. The dashboard polls for a
-complete canonical `/dev/tty` line in bounded slices without retaining a lease
-while idle. It acquires the lowest-priority lease only immediately before
-reading. Any intervening non-dashboard handoff increments a generation and
-makes that pending dashboard line stale.
-
-Non-dashboard plain-mode claims reopen and revalidate `/dev/tty` and discard
-queued input before displaying their trusted interaction. Therefore pretyped
-dashboard text cannot become an approval, fallback acknowledgement, SSH
-password, or sudo secret. In Textual mode each positive modal action is fenced
-while buffered UI input is drained and every other close or activation path
-defaults to Deny. Secret-input approval additionally suspends the whole Textual
-driver before any viewer can receive input. An active terminal transaction is not forcibly
-interrupted; priorities
-choose the next owner. Reentrant ownership allows existing approval and SSH
-components to use the arbiter through their lock-compatible interface. Parallel
-execution never places two password prompts or an approval and password prompt
-on `/dev/tty` concurrently. This serialization applies only to human terminal
-interaction; the remote command leases continue independently. The Textual
-interface handles execution approval, SSH retry, fallback, machine disable,
-secret-input authorization, and password management inside the full-screen
-driver. Manual bytes flow through the separately owned external viewer;
-automatic sudo bytes flow through the exact viewer's private tmux buffer.
-
-Separately, up to three authenticated `ssh -N` ControlMaster transports may
-remain idle. Reusing a transport never reuses request identity. Queued requests
-do not cause connection attempts, health probes, or reconnections.
-
-The transport pool's lock never spans a terminal handoff. Authenticating a
-prompt-capable master gives the operator's terminal to OpenSSH, and in Textual
-mode that handoff completes only when the UI thread runs it; the same thread
-reads the pool to paint the dashboard. A pool lock held across the handoff
-therefore inverted against the renderer and wedged the whole process. Instead,
-`acquire` reserves the machine, releases the lock for the entire master start,
-and republishes the transport and the reservation in one locked step. The
-reservation is what keeps the reuse decision atomic and the derived control
-path exclusive, it counts against the retention limit while it is held, and it
-is always released on the failure path. Readers on the render path take no lock
-at all: `retained_machine_names` returns an immutable snapshot republished
-under the lock at every change. A master authenticated concurrently with
-shutdown is therefore not closed by `close_idle`; like any master that outlives
-its process, the next run reconciles it through its own control channel.
-
-Before a machine's enrollment master is authenticated, the broker creates a
-dedicated per-machine Ed25519 key below the owner-only `~/.ssh/tmuxgate`
-directory. This enrollment-only master may fall back to interactive password
-or keyboard-interactive authentication. It cannot run a requested command;
-over that verified master, the broker idempotently installs only the public key
-into the remote account's mode-`0600` `authorized_keys`.
-If the remote account deliberately exposes `authorized_keys` as a symlink,
-tmuxgate never writes through it. Enrollment succeeds only when the exact
-dedicated public key was already installed through a separately trusted
-administrative path; otherwise it fails closed.
-Enrollment remains part of request execution instead of a separate key-setup
-command. This keeps first use bound to the already approved machine, route, and
-resolved SSH identity without adding a second administrative surface. The
-lifecycle distinguishes local key preparation, authenticated-master readiness,
-read-only enrollment inspection, durable enrollment start, verified enrollment,
-and transport readiness. A key already present is proven read-only and
-introduces no mutation uncertainty. When the key is absent, no remote write is
-attempted unless the durable enrollment boundary succeeds. After that boundary,
-any nonzero command, lost channel, failed final check, or failed durable
-verification prevents same-endpoint retry and route fallback. The result uses
-`remote_setup_failure`, not `pre_remote_failure` or `incomplete`, and releases
-the in-memory command slot because no requested job was started; the durable
-audit record remains available.
-After the exact key is verified, the enrollment master is closed and its
-control socket is removed. A separate post-enrollment master must then
-authenticate with the dedicated public key alone before the request receives a
-transport lease. A missing or rejected key therefore fails closed instead of
-falling back to another workstation identity or SSH password. SSH credentials
-are never stored. Sudo passwords and learned exact prompt bytes may be stored
-separately in the owner-only mode-`0600` `sudo-credentials.json` state file;
-they are never part of SSH configuration, request evidence, results, or
-activity output.
-
-Only the enrollment master reaches the operator's terminal. The backend selects
-its start path from the invocation's own `interactive_terminal` policy: a
-`start-enrollment-master` runs with the controlling terminal on its standard
-input and output, while a `start-master` runs with `stdin` and `stdout` closed
-to `/dev/null` and never opens, claims, or hands off the terminal at all. That
-is sound because the post-enrollment master carries `BatchMode=yes`,
-public-key-only authentication, `IdentityAgent=none`, and a passphrase-less
-dedicated key, so it cannot prompt. Claiming the terminal for it regardless
-previously made every connection fail under the default full-screen interface,
-which holds the controlling terminal in noncanonical mode.
-
-The enrollment master's terminal acquisition goes through the operator
-interface's `run_terminal_session` handoff rather than a direct arbiter claim.
-A line-oriented owner takes the ordinary validating claim; the full-screen
-interface reserves exclusive external ownership, claims without the validating
-flush, and suspends Textual so the pre-TUI canonical settings are restored
-before OpenSSH reads. Secret input and SSH authentication reserve the same
-single external slot, so the two can never overlap. Without a configured
-handoff the backend keeps the historical direct claim, which remains correct
-for any caller whose terminal owner leaves it canonical.
-
-The transport implementation enforces the retention policy and
-exact broker-owned OpenSSH invocation plans. Enrollment authentication is
-broker-terminal interactive with `BatchMode=no` and an explicit preference for
-public-key, keyboard-interactive, then password authentication. The
-post-enrollment master, health checks, control operations, and machine-control
-channel prefixes force `BatchMode=yes`, `PreferredAuthentications=publickey`,
-and disable password and keyboard-interactive authentication. Every path sets
-`IdentityAgent=none`, `IdentitiesOnly=yes`, `PubkeyAuthentication=yes`, and
-disables GSSAPI and host-based authentication with the dedicated per-machine
-key. SSH resolution and execution environments omit `SSH_AUTH_SOCK`.
-Resolution requires the dedicated key to be the sole effective `IdentityFile`
-and rejects profile-added `CertificateFile` entries, preventing unrelated
-agent, default, or profile keys from broadening authentication. The versioned
-policy document binds both enrollment and post-enrollment method sets into
-`ssh_policy_sha256`; the resolved agent, identity file, enabled enrollment
-methods, policy digest, and exact `ssh -G` arguments are also part of the
-approval-bound resolved-identity digest. All invocation categories explicitly
-override `RemoteCommand=none`, `RequestTTY=no`, `-T`, configured
-hostname/user/port, host-key alias, strict host-key policy, and known-host files. The pool
-revalidates the complete resolved identity digest immediately before use. It
-retains at most three
-mode-`0600` sockets in the private control directory, multiplexes separately
-identified job leases on a machine transport, evicts only the least-recent
-idle transport, and reconnects expired command masters through the same
-enrollment verification followed by public-key-only replacement. The
-subprocess backend is enabled only inside
-the broker process.
-
-OpenSSH owns its normal password/passphrase attempts through the broker
-terminal. Its stderr is captured up to the structured-interface bound; an
-oversized or malformed result fails closed without retry. A nonzero
-initial-master exit becomes a typed pre-remote failure carrying the numeric
-exit status and exact diagnostic bytes. Those bytes remain operator evidence,
-are never copied to MCP or durable state, and render inertly with byte length,
-SHA-256, and hexadecimal access. The status alone is not classified as an
-authentication failure because it may also represent host-key, configuration,
-or reachability failure.
-Before considering an approved fallback, the executor may offer exactly one
-same-endpoint retry. It requires an exact operator decision with Cancel as the
-displayed and technical default, keeps the original request and connection-plan
-binding, recollects local network evidence, re-resolves SSH policy and host-key
-evidence, and requires the approved machine, ordered candidate eligibility,
-eligible endpoint order, and
-complete resolved SSH identities to remain equal. The retried endpoint must
-remain eligible. Volatile observation bytes and their snapshot digest may
-change when those security semantics do not. A semantic change fails closed
-and requires a fresh request and approval. A subsequently approved fallback
-endpoint has its own single-retry bound. Failed-start cleanup removes an owned
-control socket only after master shutdown is confirmed; if shutdown fails, the
-socket is retained in cleanup-only pool state and shutdown is retried during
-the broker lifecycle.
-
-Masters are started detached with `ControlPersist`, so one outlives the process
-that created it and no shutdown-side cleanup can cover a crash or a kill. Since
-the control path is derived deterministically, the next process would collide
-with that survivor and could never recover. Before starting a master, the pool
-therefore reconciles a control path it does not own: ownership is proven first,
-and anything that is not a socket owned by this user with mode 0600 is still
-refused and never removed. A survivor that answers a control check is shut down
-through its own control channel rather than by unlinking its path, so it cannot
-be left running and invisible, and the path must be proven gone before a new
-master may use it. Declining or failing the bounded retry starts no remote
-command and cannot create durable remote-job state. No local transport,
-identity-validation, or control-path error is retried; a typed nonzero OpenSSH
-start exit remains opaque except for the terminal diagnostic and numeric
-status.
-
-Retiring a retained master follows the same evidence rule for capacity
-eviction, enrollment cleanup, failed-start cleanup, and final shutdown. If the
-OpenSSH `-O exit` command returns nonzero, tmuxgate independently probes the
-same control path. A positive probe proves the master is still live, so its
-pool entry and socket are retained and capacity remains charged. An ambiguous
-probe also fails closed. Only a definitive dead result permits removal, and
-even then the socket must still have the previously validated device/inode,
-owner, type, mode, exact control directory, and exact derived filename. This
-distinction lets issue #72 recover from the common case where the master exits
-but OpenSSH reports a nonzero status, without ever unlinking a genuinely live
-or unverified endpoint.
-
-Normal startup performs a bounded sweep before the broker listener opens. It
-resolves every currently configured endpoint, derives the complete expected
-control-path set, and applies the same live/dead/ambiguous reconciliation. A
-safe-looking socket without current identity evidence and every unexpected or
-unsafe filesystem entry remain untouched and abort startup with an operator
-diagnostic. Thus startup cannot erase another identity's socket merely because
-it is located below the private control directory.
-
-Fallback is offered only while enrollment is proven not to have started.
-Local key preparation, master authentication, and the read-only key inspection
-can fail before that boundary and retain the normal separately approved
-fallback flow. Once `authorized_keys` may have changed, tmuxgate does not
-render a fallback prompt claiming `remote_mutation_started = false`, does not
-try another endpoint, and does not conceal the first endpoint's mutation.
-
-Only when every eligible endpoint's initial OpenSSH master start and its
-broker-terminal-approved retry have failed does the broker offer to disable the
-logical machine. The local-only prompt is `Disable machine <alias>? [y/N]` and
-defaults to no. Retry denial, fallback denial, plan revalidation failure,
-generic local transport failure, and every post-remote failure do not offer
-this mutation. A confirmed disable performs a locked, compare-and-swap update
-of only that machine's `enabled` flag, preserves unrelated current settings,
-and immediately updates the shared runtime availability registry. New and
-still-queued requests then fail before network collection, approval, or SSH.
-The non-revoking boundary is `BoundRequestPlanner.take()`: an execution that
-already consumed its approved plan before the disable was committed may
-continue, including if it has not reached remote mutation yet. This avoids
-retroactively changing an active execution's approved transport semantics;
-already remote-mutating jobs are likewise not cancelled. The machine remains
-visible through `list_machines()` with `enabled = false` and can be restored
-with `tmuxgate config enable-machine <alias>`.
-
-Canonical local collection is part of the lease gate. Once completion, local
-spool verification, viewer detachment, and terminal restoration all pass, a
-slow or disconnected Codex-side client may receive A's already-collected bytes
-while other isolated jobs progress. Parallelism cannot discard A's canonical
-result.
+There is no local broker socket, frame protocol, approval process, terminal
+ownership, local tmux session, route planner, transport pool, installer, or
+parallel execution implementation.
+
+## Modules
+
+- `config.py` accepts only `[machines]` and optional `[mcp].port` TOML data.
+  Machine values are passed to ordinary OpenSSH as exact destinations.
+- `jobs.py` stores one atomic JSON record per job and local result paths.
+- `credentials.py` stores one mode-`0600` sudo password file per machine under
+  a mode-`0700` directory.
+- `ssh.py` is the sole OpenSSH subprocess helper. It disables terminal
+  allocation and interactive SSH authentication while leaving OpenSSH host,
+  key, ProxyJump, and known-host policy intact.
+- `executor.py` generates and stages `run.sh`, starts remote tmux, handles
+  whole-job sudo, polls, collects, and cleans.
+- `service.py` owns startup recovery, background task lifetime, and the single
+  `asyncio.Semaphore(3)`.
+- `mcp.py` defines exactly `run_argv`, `run_script`, `get_job`, and `list_jobs`
+  plus the bearer guard.
+- `cli.py` defines only `serve`, `sudo set/test/clear`, and local `jobs`
+  inspection.
+- `assets/remote_job.sh` is the complete remote result wrapper.
+
+## Trust boundaries
+
+The MCP listener binds only `127.0.0.1`. An ASGI middleware compares exactly
+one Authorization header with the owner-only local bearer token before MCP
+parsing. Tokens and scripts are never logged.
+
+Callers select a configured logical alias, never an endpoint or SSH option.
+The configured value is an argv element after OpenSSH's `--`. Every remote
+shell command is built with fixed shell text and separately shell-quoted
+positional arguments. Request cwd, environment values, and argv are quoted
+into `run.sh`; passwords are not.
+
+OpenSSH is authoritative for hostnames, usernames, ports, identity files,
+ProxyJump, and known-host verification. A host-key verification error is fatal.
+
+Remote command output is untrusted data. Local result paths are derived only
+from a random hexadecimal job ID. Non-UTF-8 MCP output is base64 encoded.
+
+## Job identity and storage
+
+`secrets.token_hex(16)` produces the 32-character job ID. It exclusively
+derives:
 
 ```text
-A: authorize -> connect/reuse -> private viewer -> run -> complete -> collect
-B: authorize -> connect/reuse -> private viewer -> run -> complete -> collect
-C: authorize -> connect/reuse -> private viewer -> run -> complete -> collect
+~/.cache/tmuxgate/jobs/<job-id>/
+tmuxgate-<job-id>
+~/.local/state/tmuxgate/jobs/<job-id>.json
+~/.local/state/tmuxgate/results/<job-id>/stdout
+~/.local/state/tmuxgate/results/<job-id>/stderr
 ```
 
-## Interactive execution and terminal handoff
-
-`RequestSpec.interactive` is a strict `bool` that the client states explicitly.
-It is never inferred from argv, script bytes, environment, or remote output, it
-is rendered in all three operator documents, and it participates in
-`client_request_sha256`, so it binds the execution approval and every later
-secret-input authorization for the same request.
-
-A controlling terminal is a property of a session, not of a process group. The
-two execution paths therefore differ only in their session boundary:
-
-- **Non-interactive (default).** The command-group program is started under
-  `setsid --fork --wait`, giving it a new session with no controlling terminal.
-  `sudo` and comparable programs correctly fail with *"a terminal is
-  required"*, and nothing in the job can reach `/dev/tty`.
-- **Interactive.** The runner keeps its own session, which is the remote tmux
-  pane's, and enables Bash job control (`set -m`) instead. The command still
-  becomes the leader of its own dedicated process group, and that group becomes
-  the pane's foreground group, so it inherits the pane's controlling terminal,
-  can open `/dev/tty`, and reads without stopping on `SIGTTIN`. The runner
-  refuses the job with a diagnostic and no command start when the pane has no
-  terminal, and it refuses any `interactive` value other than `0` or `1`.
-
-A controlling terminal is only half of what a full-screen program needs; the
-other half is a terminal *type*. Both execution modes build the command with
-`env -i` from a two-name allowlist, `HOME` and `PATH`, which also removed the
-`TERM` tmux had set for the pane, so a curses program had a terminal but no way
-to know what it was drawing onto and exited immediately having written nothing.
-
-The allowlist therefore gains exactly one conditional third name. An
-**interactive** request that did not itself supply `TERM` receives one, and a
-non-interactive request still receives none, because a command with no terminal
-should never be invited to emit escape sequences into canonical captured output.
-Both modes are built from the same array, so `exec` and `script` interactive
-requests now agree; a non-interactive `script` request is still free to have Bash
-invent its own `TERM=dumb` internally, which is the interpreter's business rather
-than a value tmuxgate injected.
-
-The value describes the terminal *tmux emulates*, not the operator's local one,
-so it is read back from the tmux that owns the pane
-(`display-message -p -t <session> '#{default-terminal}'`) rather than propagated
-from the broker, the SSH session, or anywhere outside. That keeps the local
-environment unexposed and avoids claiming capabilities the tmux terminal does not
-have. Because remote tmux configuration is untrusted input that would enter the
-command environment, only a terminfo-shaped name is accepted; a tmux too old to
-expand the option, one that echoes the format back literally, and one offering
-any other shape all fall back to `screen`, which tmux has always been safe to
-claim. A terminal-type lookup never fails the command.
-
-An explicit request `TERM` always wins, in either mode, because the request
-environment is approved and bound and is applied after the implicit one.
-
-The descendant-lifecycle contract from the non-interactive path is unchanged:
-the runner is never a member of the command's group, so the same
-`kill -- -<pgid>` TERM/KILL boundary, `/usr/bin/timeout` supervision, capture
-quota monitor, and drain sealing apply. Two consequences of job control are
-handled explicitly. The runner blocks inside the foreground job and cannot read
-the process-group FIFOs while the command runs, so each inner program publishes
-its group ID twice: the capture-quota monitor consumes one copy during the run
-and the runner consumes the other afterwards. Reading those IDs before the
-command starts would deadlock, because the tee subshells block on opening their
-FIFOs until the command opens the write end. Separately, a foreground job killed
-by a terminal `SIGINT` under job control unwinds Bash out of the enclosing
-compound command, so the interactive command-group leader does not `exec` the
-command: it traps `INT`, runs the command, and exits with its exact status. Its
-children keep the default disposition, so a viewer Ctrl-C still interrupts only
-the submitted command, which then completes normally with status 130.
-
-stdout and stderr are not merged onto a PTY in either path. The prompt and the
-reply travel over `/dev/tty` only, while the two canonical streams keep their
-separate mode-`0600` FIFOs, bounded capture pipelines, byte-exact raw files,
-sizes, and digests. Neither the prompt nor the typed bytes can enter
-`stdout.raw`, `stderr.raw`, the verified spool, or durable state.
-
-Prompt detection is offered only for an interactive request. `SshChannelRunner`
-watches a viewer only when the bound recipient's request asked for it, and
-`SecretPromptPresenter.watch` independently refuses a non-interactive recipient,
-so prompt-like text produced by a command that has no controlling terminal can
-never propose a handoff. The exact default or previously enrolled machine
-prompt may consume the stored password when Automation is on; an unknown prompt
-fails immediately and cannot enroll a credential. With Automation off, every prompt requires the
-separate `SecretInputAuthorizationPrompt` decision described under the
-operator-interface boundary, which names the full request, machine, endpoint,
-approved command identity, and viewer session. Manual typed bytes are not
-buffered or logged, and echo suppression is the remote program's own
-responsibility.
-
-## Request state machine
+The JSON record contains only:
 
 ```text
-RECEIVED
- -> VALIDATED
- -> QUEUED
- -> LEASE_RESERVED
- -> AWAITING_APPROVAL
-    -> DENIED
-    -> APPROVED
-       -> MASTER_REUSE_CHECK
-       -> MASTER_AUTHENTICATING or MASTER_READY
-       -> STAGING
-       -> GATED_WAITING_FOR_VIEWER
-       -> ATTACHING
-       -> RUNNING_ATTACHED <-> RUNNING_DETACHED
-       -> REMOTE_COMPLETE
-       -> WAITING_FOR_VIEWER_DETACH
-       -> COLLECTING
-       -> COMPLETE_VERIFIED_LOCAL
-       -> LEASE_RELEASED
-       -> RESULT_DELIVERING
-       -> DONE
+job_id machine sudo state created_at updated_at
+remote_directory remote_session exit_code
+error_code error_detail stdout_path stderr_path
 ```
 
-`RECOVERY_REQUIRED_POSSIBLY_RUNNING` is deliberately nonterminal and retains
-the lease. A whole-host reboot can also strand `COMPLETION_PROVEN` after the
-wrapper status was observed but before canonical output reached the local
-spool; destroying the pinned SSH control socket makes collection impossible.
+The only states are `starting`, `running`, `complete`, `failed`, and `unknown`.
+Every JSON update writes a mode-`0600` temporary file, fsyncs it, atomically
+renames it, and fsyncs the jobs directory. No old state is parsed or migrated.
 
-Current durable records also carry an orthogonal, atomically fsynced remote
-phase:
+## Remote lifecycle
+
+The service writes `starting` before any SSH action and acquires one semaphore
+slot before staging. A tar stream stages mode-`0700` `run.sh` into a new remote
+directory. Staging never overwrites an existing directory.
+
+The start operation invokes exactly one detached session:
 
 ```text
-NOT_ATTEMPTED
- -> CONNECTION_ATTEMPTED
- -> STAGING_REQUESTED
- -> STAGING_VERIFIED
- -> REMOTE_WRAPPER_REQUESTED
- -> REMOTE_WRAPPER_CREATED
- -> USER_COMMAND_STARTED
- -> RESULT_SPOOL_FINALIZED
- -> RESULT_SPOOL_LOCALLY_VERIFIED
- -> CLEANUP_COMPLETED
+tmux new-session -d -s tmuxgate-<job-id> /bin/bash <job-dir>/run.sh ...
 ```
 
-`REMOTE_WRAPPER_REQUESTED` closes the crash window immediately before wrapper
-creation; it is reconciled from the exact guarded remote job and is not itself
-proof that a wrapper exists. `remote_mutation_started` remains readable for
-compatibility, but for ordinary version-4 records it becomes true only at
-`USER_COMMAND_STARTED`, not before staging. Version-2 and version-3 records are
-loaded byte-for-byte as `LEGACY_UNCERTAIN` when their old broad mutation flag
-is true; tmuxgate never guesses a narrower phase from that flag. A legacy
-record with an exact resolved identity may be atomically upgraded to
-`REMOTE_WRAPPER_CREATED` or `USER_COMMAND_STARTED` only after an authenticated
-exact-job observation positively proves a gated wrapper, released gate,
-running command, or complete spool. An all-missing observation is not proof
-that an older command never started.
+`run.sh` applies cwd and environment, executes exact argv or an appended UTF-8
+script with stdin redirected from `/dev/null`, and redirects stdout and stderr
+to separate files. It publishes `exit-code` by rename. It creates and renames
+`done` only after every result file is final.
 
-For the default `NORMAL` policy, a broker-owned loop repeatedly applies this
-evidence table:
+Normal monitoring tests only for `done`. Once present, a single tar stream
+collects stdout, stderr, and exit-code. tmuxgate atomically writes both local
+streams and only then changes JSON state to `complete`. Remote cleanup happens
+after that local collection. A collection failure changes state to `failed`
+with `result_collection_failed` and deliberately retains the remote directory.
 
-- Connection or staging interruption before a wrapper request becomes
-  `FAILED_PRE_REMOTE` automatically. SSH status 255 is not evidence that a
-  command ran.
-- A requested or created wrapper with an authenticated closed gate, no exact
-  session, no running command, and no completion can be removed only by the
-  guarded `discard-unstarted` control and then becomes `FAILED_PRE_REMOTE`.
-- A gated exact session is reattached and its gate released; a running detached
-  session gets a replacement local viewer. An already-live exact local viewer
-  is adopted after owner, mode, socket type, and request-derived session checks.
-- A complete authenticated remote spool is collected and verified locally.
-  Local viewer metadata is no longer a completion gate once the foreground
-  process is proven finished. Cleanup is idempotent and retried independently
-  after the local result is available.
-- A command-start marker without an authenticated complete result or
-  authoritative termination evidence remains fail-closed. The Jobs view then
-  offers one explained, safe-default workflow: `Acknowledge & unblock`. It
-  changes only the local audit/scheduling state, performs no SSH or cleanup,
-  and claims no exit status, output, completion, or remote absence.
+MCP cancellation does not cancel the background execution task. A tool timeout
+ends only that wait; it does not kill, retry, or detach the remote job because
+remote tmux already owns persistence.
 
-Closing or restarting the dashboard therefore does not abandon a request: the
-remote wrapper, result spool, private viewer, and durable record—not the old
-dashboard pane—are the recovery authorities. Repeated passes are idempotent;
-they may neither rerun a command nor delete an uncertain job. The old
-`recover after-reboot` and `recover after-dead-pane` commands remain only for
-backward compatibility and are not part of routine automatic-mode operation.
+## Recovery and no-rerun invariant
 
-An explicit `EXPECT_FULL_REBOOT` request instead captures
-`/proc/sys/kernel/random/boot_id` through the approved transport before the
-requested command can start. The canonical UUID is durably bound to the
-request ID, policy, logical machine, connection-plan digest, endpoint,
-host-key alias, resolved-identity digest, remote job path, remote start time,
-and state generation. If capture is unavailable or malformed, the start gate
-stays closed.
+Startup loads only `starting` and `running` records. For each record, while
+holding one of the same three semaphore slots, it:
 
-After an expected disconnect the recovery coordinator persists
-`EXPECTED_REBOOT_VERIFICATION_PENDING` and probes through a new one-shot SSH
-connection with `ControlMaster=no`, `ControlPath=none`, `ControlPersist=no`,
-the exact approved identity, and strict host-key checking. It never reuses or
-consults the old master. An unchanged boot ID is durable evidence that the old
-job may still exist, so the original executor resumes observation and
-collection when available. Transient unreachability is retried only within the
-configured `reboot_recovery_timeout_seconds`; endpoint, identity, host-key,
-credential, or request-binding mismatches fail immediately and remain visible.
+1. checks `done` and collects if present;
+2. otherwise checks the exact derived tmux session;
+3. resumes polling if the session convincingly exists;
+4. otherwise stores `unknown`.
 
-Only an exact, canonical changed boot ID permits automatic abandonment. The
-coordinator first commits `EXPECTED_REBOOT_VERIFIED_CLEANUP_PENDING`, including
-the post-boot ID, timestamps, attempts, decision/reason, and evidence digest.
-It then reconciles only the exact locally bound pin/socket under the existing
-safe-socket checks and commits `ABANDONED_AFTER_VERIFIED_REBOOT`. A crash in
-either window resumes idempotently on startup. Cleanup ambiguity never releases
-capacity or fabricates completion evidence, exit status, stdout, or stderr.
-Stopping the broker retires only process-owned leases; durable expected-reboot
-records are reconstructed machine-scoped on the next start.
+It never restages or restarts an existing record. This intentionally sacrifices
+automatic recovery of a job that provably never started in order to prevent a
+duplicate execution when evidence is ambiguous.
 
-This terminal audit state preserves the original start, identity, and job path.
-For an uncertain request it retains null completion evidence. For a stranded
-completion it copies the prior completion timestamp, exit status, and local
-viewer/terminal gates into the failure detail before clearing the structured
-unverified-result gates. The resulting record remains compatible with existing
-state readers without fabricating canonical output or a verified spool.
-Recovery performs no SSH or remote cleanup and is never presented as a command
-result. The attestation proves that the old process cannot overlap later work;
-it does not prove rollback or exclude partial effects before the reboot, so the
-interrupted workflow must be independently verified before it is repeated. A
-queued client disconnect cancels its unapproved request. A client disconnect
-after approval never kills or reruns the remote job.
+Service shutdown cancels only local SSH polling processes. It does not contact,
+kill, or clean the remote job; the durable `starting` or `running` record is
+left for conservative startup recovery.
 
-`ABANDONED_AFTER_PROVEN_UNSTARTED` is a distinct terminal audit state for a
-remote-mutation-boundary failure whose later canonical evidence proves the
-start gate remained closed, no command ran or completed, and the exact remote
-session/directory were removed. It binds the separate evidence request ID and
-verified spool-manifest digest in the failure detail. It never claims a remote
-exit status, command output, viewer restoration, or completion.
+## Whole-job sudo
 
-## Route selection
+Sudo is an explicit Boolean request property. tmuxgate never scans command text
+for sudo and never detects or answers prompts.
 
-The broker still receives only a validated logical machine alias. A Codex MCP
-caller may supply that alias or an unambiguous human form of its stored alias
-or description; the local MCP layer resolves it exclusively against the
-broker's sanitized machine list and never treats input as an address, endpoint,
-user, or SSH option. Before approval,
-the broker takes a local, read-only network snapshot. The implemented
-collector uses bounded, broker-owned `ip -j` and NetworkManager commands to
-read addresses, link flags/types, routes, the cached gateway neighbor,
-connection UUIDs, and the currently associated Wi-Fi BSSID. Wi-Fi scanning is
-explicitly disabled. It does not ping, ARP-probe, resolve DNS, probe a port, or
-start SSH. Individual collection failures are included in the canonical
-snapshot and leave the affected evidence missing so route policy fails closed.
+The executor first runs `sudo -n -- true`. If passwordless sudo is unavailable,
+it reads the machine's owner-only credential, validates it with
+`sudo -S -k -p '' -- true`, and reads it again for the start operation. Password
+bytes are passed only as SSH stdin and the bytearray is overwritten and cleared
+immediately after each subprocess completes.
 
-Home LAN eligibility requires all of the following:
+The remote normal user's UID and GID are obtained before sudo and passed as
+numeric wrapper arguments. The root `run.sh` changes stdout, stderr, exit-code,
+and the temporary completion marker back to that UID/GID. Only then does it
+rename the completion marker to `done`. This lets the ordinary SSH user collect
+and clean the result.
 
-- a direct route to the configured home gateway, with no intermediate gateway;
-- a selected source address in the configured home subnet;
-- the source assigned to the selected interface;
-- a direct route to the machine's LAN address on the same interface/source;
-- a complete configured fingerprint match: link type, cached gateway MAC,
-  NetworkManager connection UUID, and Wi-Fi BSSID when applicable.
+`requiretty` policies are unsupported because tmuxgate never requests a TTY.
+Errors are stable, include machine and job ID for execution jobs, and omit the
+password.
 
-For Ethernet, administrative `UP` is insufficient: the snapshot must also show
-current `LOWER_UP` carrier. For Wi-Fi, a current matching BSSID is the
-association evidence. A stale neighbor entry cannot establish home presence
-without one of those current link signals.
+## Service lifecycle and logging
 
-Missing evidence fails LAN closed. WireGuard remains eligible when its link is
-up, its expected local address is assigned, and the kernel route to the target
-uses that kernel-reported WireGuard link and the configured source. No
-transient interface name is trusted. The exact private endpoint, local tunnel
-address/prefix, link type, route source, and separate SSH host-key evidence all
-remain bound into the approved plan.
+`tmuxgate serve` constructs the store, credentials, executor, service, MCP
+surface, and uvicorn listener directly. The packaged non-root systemd user unit
+uses `Restart=on-failure`; systemd owns restart and journald owns logs.
 
-The approval digest binds the complete ordered endpoint plan and canonical
-network snapshot. A material route, host-key evidence, or SSH-configuration
-change produces a different plan digest and requires fresh approval. Fallback
-is offered only to the next already-approved endpoint, only before remote
-mutation, and requires an exact new broker-terminal
-`FALLBACK <short-id> <endpoint-id>` acknowledgement. Commands are never
-retried.
-
-## SSH identity
-
-All endpoints for one machine use one broker-controlled `HostKeyAlias`, for
-example `tmuxgate-app-server`. Strict host-key checking remains enabled. A
-first-seen key is handled by OpenSSH in the broker terminal; a mismatch stops.
-
-Every machine-control SSH invocation overrides the workstation's global
-interactive settings with `RemoteCommand=none`, `RequestTTY=no`, and `-T`.
-Viewer channels use `RemoteCommand=none` and `-tt`.
-
-## Remote isolation and recovery target
-
-Every authorized command receives a validated job ID, a private directory
-under `~/.cache/tmuxgate/jobs`, and a dedicated tmux server/session. Its runner
-waits on a unique `tmux wait-for` channel until the viewer is attached and that
-attachment is verified. The normal `base` session is never touched.
-
-The remote control script starts the packaged runner with a fixed minimal
-environment containing only the remote account's `HOME` and the fixed
-`/usr/bin:/bin` tool path. The runner does not export submitted environment
-entries into its own shell. It retains them as exact `name=value` arguments
-until the final command boundary, where `/usr/bin/env -i` applies them only to
-the approved argv process or the non-profile script shell, inside any requested
-`/usr/bin/timeout` supervision. Consequently values such as `PATH`,
-`LD_PRELOAD`, `IFS`, `BASH_ENV`, and `ENV` may intentionally affect the
-submitted process but cannot replace or configure tmuxgate's gate, FIFO,
-capture, state-publication, hashing, or cleanup tools. Runner control-plane
-utilities use fixed absolute paths where practical.
-
-The primary argv process or script shell starts as the leader of a dedicated
-process group, and by default also of a dedicated session with no controlling
-terminal; an explicitly interactive request keeps the pane's session so it can
-reach `/dev/tty`, as described under interactive execution above. Configured
-`/usr/bin/timeout` supervision runs
-inside that same boundary. After the primary process exits, the runner sends
-`TERM` to every remaining member, allows one second for orderly shutdown, and
-then sends `KILL` to the group. Timeout, capture-quota termination, viewer
-Ctrl-C, and unexpected runner exit use the same descendant boundary. This is a
-command lifecycle, not a service supervisor: a descendant can deliberately
-escape by creating another session, but it cannot make retained output
-descriptors look like successful completion.
-
-stdout and stderr are drained through separate bounded FIFO pipelines to raw
-result files while remaining visible in the pane. Each pipeline admits at most
-its configured stream limit plus one sentinel byte, and a concurrent monitor
-checks the combined per-job remote-capture ceiling while the submitted command
-runs. Any independent or combined overrun publishes
-`capture-limit-exceeded`, omits the exit-status file, and cannot become proven
-completion. This bounds each raw file and actively monitors combined remote
-disk growth. `capture-pane` is not a canonical result source.
-
-The two capture pipelines also run in dedicated process groups. Once the
-submitted process group has been terminated, the runner allows at most two
-seconds for buffered stdout and stderr to reach their canonical files. If both
-collectors do not finish, including when a detached or double-forked process
-retains a FIFO writer, the runner terminates the complete collector groups,
-unlinks both FIFOs, atomically publishes `capture-incomplete`, and omits the
-exit-status file. The coordinator therefore enters recovery-required state and
-cannot collect, verify, spool, or clean the job as a successful result. A
-descendant that escapes only after closing both streams may continue outside
-tmuxgate's command boundary, but it has no descriptor that can append to the
-canonical streams. `complete` and its exit status are published only after the
-submitted group is gone and both collectors have finished, so no descendant
-can append canonical output after result publication. The policy and ordering
-are identical for argv and script modes.
-
-The real backend implements this lifecycle; fake and real-local-tmux tests
-exercise the same scripts. A durable staging permit is required before staging;
-the requested command is not marked started until the authenticated start-gate
-marker is observed. The coordinator
-proves the dedicated session is gated, proves at least one viewer is attached,
-and only then releases the unique wait channel. A running viewer accepts input
-and Ctrl-C and can detach/reattach without affecting another job. Completion
-closes its pane/viewer automatically; collection requires the remote exit status,
-both byte counts, and both SHA-256 digests to match the separately collected
-raw streams. Collection no longer transports a complete tar archive. Fixed
-`collect-stdout` and `collect-stderr` controls stream the two canonical files
-over separate batch channels into newly created owner-only local temporary
-files. Each SSH pipe is drained incrementally with receive-time byte and
-diagnostic ceilings; hashes and sizes are accumulated as bytes arrive. The
-collector rejects a stream, total, per-job local-space, or shared aggregate
-reservation before publication. The shared reservation object serializes all
-active jobs, so three parallel commands cannot each consume the full aggregate
-allowance.
-
-The canonical local spool copies those private files with no-follow opens and
-bounded blocks into a private temporary result directory. It verifies owner,
-mode, size, and receive-time SHA-256 evidence while copying, fsyncs both raw
-streams and the manifest, and publishes only by atomic directory rename. Local
-write failure, transport truncation, limit failure, changed source evidence,
-or interruption removes the unpublished collection/spool temporary files and
-never marks durable state spool-verified. Missing sessions, mismatched output,
-quota failures, or ambiguous completion enter recovery-required state; remote
-cleanup remains disallowed until verified collection so evidence is retained
-for inspection and recovery.
-
-The `[limits]` configuration table defines independent stdout and stderr
-ceilings, total-result bytes, per-job local temporary bytes, remote per-job
-captured bytes, and aggregate local collection bytes. Limits are inclusive:
-exactly at the boundary succeeds and one byte over fails closed. The packaged
-Bash runner retains pane stdin, uses separate mode-`0600` FIFOs and bounded
-capture pipelines, writes the exit status only after both collectors finish,
-terminates inherited-descriptor holders at the process-group boundary, seals an
-ambiguous drain as incomplete, and cleans up failed-gate FIFOs without
-manufacturing completion. The staged job directory carries the `interactive`
-flag as its own validated file, which the control script requires, allowlists,
-and removes with the rest of the job. Tests also execute the exact staging shell
-and lifecycle in a private real local tmux server, including a background child
-that retains stdout and an interactive job whose sentinel reply is typed into a
-real attached viewer and then proved absent from both captured streams, every
-pane capture, and every collected file. The first approved remote job completed successfully on
-July 19, 2026.
-
-Broker/SSH failure does not rerun the command. State is reported as incomplete
-unless completion and exit status can be proven. Cleanup validates the exact
-parent and job ID and refuses active or uncertain jobs; repeating cleanup after
-the exact directory is already absent succeeds so a crash between remote
-deletion and the local cleanup marker can converge. Only a wrapper that still
-proves its start gate was never released accepts `discard-unstarted`, and that
-operation refuses unknown files. A full machine reboot can instead be recorded
-as operator-confirmed abandonment, without an invented exit status or canonical
-result. Because older tmuxgate builds do not recognize state format 4 or the
-new terminal state, rollback must preserve a pre-upgrade state snapshot and a
-downgrade must not read records written by the newer release.
-
-Every irreversible transition must be atomically written and fsynced under the
-durable state boundary. The state API returns a staging permit only after
-`STAGING_REQUESTED`, fsyncs a wrapper-request marker before creation, and sets
-`REMOTE_MAY_BE_RUNNING` only after the gate-release marker proves the user
-command started. Startup loads and reconciles durable state and refuses work on
-an affected machine while any exact job remains unproven or has not passed its
-completion/spool/viewer/terminal gates. The real coordinator consumes that
-permit and recovery report; bypassing them is not an allowed executor design.
+Logging uses only the standard library. Records may contain job ID, machine,
+state, derived remote directory, error code, and bounded control-character-
+sanitized SSH stderr. Bearer tokens, passwords, credential input, complete
+scripts, and raw process environments are prohibited.
