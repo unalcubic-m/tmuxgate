@@ -167,7 +167,9 @@ tmuxgate serve
 ```
 
 It always binds `127.0.0.1`, requires the owner-only bearer-token file, and
-logs through Python's standard logging module for journald capture.
+logs through Python's standard logging module for journald capture. The unit
+explicitly removes inherited `TMUXGATE_MCP_TOKEN` and
+`TMUXGATE_BEARER_TOKEN` values before starting the server.
 
 ```bash
 systemctl --user start tmuxgate

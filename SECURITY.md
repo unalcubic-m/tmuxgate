@@ -32,7 +32,9 @@ remote directory for investigation.
 
 The systemd service runs as the ordinary user. Protect the user's SSH files,
 state directory, configuration, credential files, systemd unit, and Python
-installation from other users. Review recent logs with:
+installation from other users. The packaged unit removes inherited bearer-token
+environment variables; the server reads its token only from the owner-only
+state file. Review recent logs with:
 
 ```bash
 journalctl --user -u tmuxgate -n 200 --no-pager
