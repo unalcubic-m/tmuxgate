@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Discover and capture existing tmux panes, and send explicitly authorized
+  bounded text or allowlisted keys with target/process guards, local writer
+  exclusion and conservative no-retry input receipts.
 - Support the native Windows foreground broker with protected owner-only ACLs,
   native atomic publication, and AppData defaults; keep remote targets Linux-only.
 - Enforce strict SSH host checking and exclusive broker recovery; reap local SSH

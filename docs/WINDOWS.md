@@ -1,10 +1,21 @@
 # Native Windows broker
 
 Windows supports the local foreground broker, CLI inspection, and sudo
-credential management. The MCP endpoint and its four tools are identical to
+credential management. The MCP endpoint and its eight tools are identical to
 Linux. Every remote target must be Linux with Bash, OpenSSH server, tar, tmux,
 and optionally sudo. Windows remote shells are unsupported. There is no Windows
 service installer in this release.
+
+Existing remote sessions can be inspected using `list_tmux_panes` and
+`capture_tmux_pane` with the IDs returned by discovery; see the README for
+examples and limits. These tools use native OpenSSH directly, create no job
+session, and never send input to an existing pane. No additional Windows
+credentials, tmux installation, or persistent setup are introduced.
+
+Explicitly authorized input uses `send_tmux_text` or `send_tmux_key` with the
+same discovered IDs plus `pane_pid`. Literal text is bounded to 4096 UTF-8 bytes;
+Enter and multiline execution are explicit. See the README for unknown-outcome
+and concurrent-writer rules. No Windows or remote credential setup is changed.
 
 ## Requirements and paths
 

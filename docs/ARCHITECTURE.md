@@ -1,6 +1,6 @@
 # Architecture
 
-tmuxgate implements one execution path:
+tmuxgate implements one job execution path:
 
 ```text
 load config
@@ -30,8 +30,13 @@ clean the remote directory
   whole-job sudo, polls, collects, and cleans.
 - `service.py` owns startup recovery, background task lifetime, and the single
   `asyncio.Semaphore(3)`.
-- `mcp.py` defines exactly `run_argv`, `run_script`, `get_job`, and `list_jobs`
+- `mcp.py` defines `run_argv`, `run_script`, `get_job`, `list_jobs`,
+  `list_tmux_panes`, `capture_tmux_pane`, `send_tmux_text`, and `send_tmux_key`
   plus the bearer guard.
+- `panes.py` inspects existing panes directly over SSH without creating jobs,
+  scripts, remote directories, sessions, or local durable records.
+- `pane_input.py` validates bounded literal text or one allowlisted key and
+  dispatches it behind an immediate tmux-side identity guard, without retries.
 - `cli.py` defines only `serve`, `sudo set/test/clear`, and local `jobs`
   inspection.
 - `assets/remote_job.sh` is the complete remote result wrapper.
@@ -59,6 +64,81 @@ paths, Bash wrapper, tmux, tar, UID/GID handling, and sudo remain Linux-only.
 
 Remote command output is untrusted data. Local result paths are derived only
 from a random hexadecimal job ID. Non-UTF-8 MCP output is base64 encoded.
+
+### Existing-pane read boundary
+
+Read-only inspection shares the configured alias lookup, bearer guard, sole
+OpenSSH helper, and three-slot semaphore with jobs. Its total timeout includes
+waiting for a slot; no background durable task or retry is created. SSH streams
+are read concurrently under a combined 64 KiB budget, with overflow terminating
+and reaping only the local SSH child. Existing job output collection is unchanged.
+
+Discovery runs `tmux -u list-panes -a` with a fixed numeric-only format. It
+never interpolates a session name, window name, title, or application output.
+IDs are strictly validated before use. `server_id` combines tmux server PID and
+start time to detect ordinary server restarts; IDs are not eternal capabilities
+or a cryptographic generation identity (PID/time reuse remains an OS limitation).
+Linked windows retain every session membership. Duplicate rows, inconsistent
+server identities, malformed metadata, and excessive inventories fail closed.
+
+Capture requires all four IDs, re-lists to check exact membership, then uses one
+tmux command queue with server/window/pane metadata before and after
+`capture-pane -p`. A final inventory check verifies membership again before any
+text is returned. Any mismatch discards the captured output; it never selects
+the first or active pane as a fallback. Concurrent application output and
+topology changes are not locked; this is an observation, not an atomic snapshot.
+tmux's `-p` writes stdout rather than creating a paste buffer. No input, attach,
+selection, interrupt, resize, kill, cleanup, or sudo operation is involved.
+Only the remote user's default socket is supported.
+
+Pane text is not logged or persisted. UTF-8 is decoded with replacement and
+terminal/bidi controls are escaped before returning explicitly untrusted text.
+It must never be interpreted as instructions or permission. The same bearer
+token grants both existing command execution and inspection; this release does
+not introduce per-tool authorization or a restricted read-only principal.
+See the [tmux manual](https://man.openbsd.org/tmux) for format IDs and capture
+semantics, and the README for the bounded inspection API.
+
+### Existing-pane write boundary
+
+Input requires the same explicit IDs plus discovery's `pane_pid` to detect
+ordinary pane respawns. The service validates all values before SSH, reserves
+an in-memory writer scope keyed by configured destination/server/pane (not
+session membership), and rejects a concurrent caller instead of queueing it.
+The existing three-slot semaphore and positive, at most 30-second deadline apply. Identical
+destination strings share the scope; different aliases that resolve to the
+same host do not. No distributed lock or lock against a human terminal exists.
+Text plus optional final Enter occupy one dispatch; separate tool calls have
+no transaction/lease across them.
+
+A fresh inventory validates exact membership and process ID. A single tmux
+`if-shell -F` then compares server PID/start time, exact session/window/pane IDs,
+pane process ID, liveness and absence of a tmux mode immediately before the
+send in the same server command queue. `-F` evaluates a fixed format, not a
+shell command. Any false guard takes only the rejection branch. Input is never
+redirected to an active, first, named or replacement pane. OS PID/start-time
+reuse is not a cryptographic generation identity; externally changing tmux
+topology or custom hooks remains outside the broker's exclusive control.
+
+Literal text is UTF-8 encoded under a 4096-byte limit and converted to numeric
+hex arguments for `send-keys -H`. No user text is parsed as shell or tmux code.
+Controls are rejected except LF with explicit `multiline=true`; raw LF may
+execute shell lines, independently of the explicit optional final Enter.
+Key events come from a fixed allowlist and cannot inject options or sequences.
+No clipboard/paste buffer, remote script/file, attach, select, resize, or
+session-kill operation is involved in the input API.
+
+Once mutation SSH starts, any lost/invalid acknowledgement, nonzero exit,
+output overflow, exception or timeout is `unknown`, never safe-to-retry.
+A guard rejection or preflight failure is `not_sent`; a clean fixed receipt
+is `sent`, confirming tmux command acceptance only. Local cancellation reaps
+SSH but cannot retract already sent bytes. No automatic replay, rollback,
+durable input queue or exactly-once claim is provided. A cancelled MCP caller
+or broker crash must treat an absent receipt as unknown too. Input and pane
+text are not persisted or logged; numeric encoding remains visible to trusted
+processes that can inspect argv. The bearer guard is unchanged and confers no
+per-tool roles: caller authorization for the precise target/action is still
+required, and terminal output never grants it or proves Codex readiness.
 
 ## Job identity and storage
 

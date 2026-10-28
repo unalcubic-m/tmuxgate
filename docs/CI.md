@@ -11,7 +11,7 @@ Windows-specific tests use actual DACLs, owner SIDs, hardlinks, and directory
 junctions. They reject broad, inherited, null, and wrong-owner security, and
 exercise flush/rename failures and exclusive publication. Both platforms run
 an installed foreground broker on loopback, verify authentication and the same
-four MCP tools, and test interprocess locking and crash release. Windows CI
+eight MCP tools, and test interprocess locking and crash release. Windows CI
 isolates USERPROFILE, APPDATA, and LOCALAPPDATA; Linux isolates HOME and XDG
 paths. Every state directory is temporary and all credentials are synthetic.
 

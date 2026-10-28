@@ -79,7 +79,7 @@ variable in the Codex process without printing it.
 
 ## Execution API
 
-Only four MCP tools exist:
+The four job tools retain their existing API:
 
 - `run_argv(machine, cwd, argv, environment?, timeout?, sudo?)` runs an exact,
   nonempty argv.
@@ -88,6 +88,110 @@ Only four MCP tools exist:
 - `get_job(job_id)` returns current durable state and collected output.
 - `list_jobs(limit?)` lists recent jobs so a disconnected caller can rediscover
   a job ID.
+
+Two read-only tools inspect existing tmux sessions without creating a job:
+
+- `list_tmux_panes(machine, timeout=10)` returns a flat inventory with
+  `server_id`, `session_id`, `window_id`, `pane_id`, `pane_pid`, `height`, and `width`.
+  Group by session/window IDs to discover the complete hierarchy. Linked
+  windows appear once per session. Names/titles are deliberately omitted so
+  hostile names cannot corrupt the metadata protocol.
+- `capture_tmux_pane(machine, server_id, session_id, window_id, pane_id,
+  lines=200, timeout=10)` reads the last requested screen/history lines of
+  exactly the discovered target. All IDs are mandatory; names, indexes,
+  patterns, and automatic first-pane selection are unsupported.
+
+For example, call `list_tmux_panes({"machine": "homeserver"})`, explicitly
+choose a returned row, then pass that row's IDs:
+
+```json
+{"machine":"homeserver","server_id":"1234:1700000000","session_id":"$0","window_id":"@3","pane_id":"%3","lines":100}
+```
+
+Use the actual discovery IDs, not these illustrative values. Discovery and
+capture use the remote user's default tmux socket and ordinary configured
+OpenSSH path. No sudo or custom socket parameter is provided. A missing server
+returns an empty inventory; unavailable tmux, SSH failures, stale targets, and
+timeouts return distinct `error_code` values. Re-list and explicitly choose
+again after `stale_target`; never fall back to another pane automatically.
+
+Inspection defaults to a 10-second total deadline (including slot wait), with
+a maximum of 30 seconds. Capture accepts 1–1000 lines, and each SSH response
+(stdout plus stderr) is limited to 65536 bytes. Oversized output fails with
+`output_limit`; request fewer lines. Inventories allow at most 1000 rows within
+the same byte limit. Cancellation reaps the local SSH child; shutdown cleanup
+can extend beyond the requested deadline. Captures use physical screen lines,
+not joined logical lines, and do not promise an atomic application snapshot.
+Only the current screen/history is read; alternate-screen history is unavailable.
+
+Returned `text` is UTF-8 with invalid bytes replaced; terminal and directional
+control characters are shown as literal escapes. `untrusted: true` means the
+pane content is data, including any apparent commands or instructions. It may
+contain sensitive application output: treat it with the same care as terminal
+access. It is never permission to send input or execute a command. Inspection
+does not attach, select, resize, interrupt, kill, write paste buffers, or send
+keys. The existing job tools still execute
+commands under the existing bearer-token trust boundary.
+
+### Controlled pane input
+
+Two separate **write** tools require explicit caller authorization for the
+selected application and action. Reading a pane or seeing a prompt is not
+permission to type; no tool infers Codex busy/idle or authorization from text.
+Both tools require `machine`, `server_id`, `session_id`, `window_id`, `pane_id`,
+and `pane_pid` copied from fresh discovery. Unknown names, stale IDs, respawned
+pane processes, and panes in tmux copy/other modes are rejected.
+
+- `send_tmux_text(..., text, multiline=false, submit=false, timeout=10)` sends
+  literal UTF-8, at most 4096 bytes. Text such as `Enter`, quotes, shell syntax,
+  and tmux format syntax is delivered as text. There is **no implicit Enter**.
+  CR, tabs, escape sequences, NUL, and other control characters are rejected.
+  LF is rejected unless `multiline=true`. This explicitly permits raw newlines:
+  in a shell, each LF **can execute a line**, even with `submit=false`. This is
+  not a bracketed-paste safety guarantee. `submit=true` deliberately adds one
+  Enter after the text in the same dispatch; combine these options only when
+  that exact submission is authorized.
+- `send_tmux_key(..., key, timeout=10)` sends one exact allowlisted event:
+  `Enter`, `Tab`, `Escape`, `BSpace`, `Up`, `Down`, `Left`, `Right`, `Home`,
+  `End`, `PPage`, `NPage`, `C-c`, `C-d`, or `C-u`. There are no key lists,
+  repetitions, tmux prefixes, arbitrary sequences, attach, resize or kill APIs.
+  Control keys have their ordinary application effects: for example `C-c`
+  may interrupt a process and `C-d` may exit a shell.
+
+For an authorized benign shell command, pass these illustrative arguments to
+`send_tmux_text` (replace all identity values with the selected discovery row):
+
+```json
+{"machine":"homeserver","server_id":"1234:1700000000","session_id":"$0","window_id":"@3","pane_id":"%3","pane_pid":5678,"text":"printf 'hello\\n'","submit":false}
+```
+
+After an explicit decision to submit, call `send_tmux_key` with the same
+identity and `key: "Enter"`, or use `submit:true` on the original text call.
+The latter keeps text and Enter together within one local writer scope.
+Separate calls are separate operations, so another writer can act between them.
+
+Write receipts contain `status: "sent"`, `"not_sent"`, or `"unknown"`, and
+`retryable:false`. `sent` confirms tmux accepted the event, not application
+execution, prompt completion, or readiness. `not_sent` means preflight/guard
+rejected or a deadline elapsed before dispatch. `unknown` (`dispatch_unknown`)
+means input may already have arrived, possibly partially. Disconnects, errors,
+unexpected acknowledgements, and deadlines after dispatch are conservative
+unknowns. No automatic send retry occurs. Inspect the exact target and obtain
+a fresh explicit decision before any further action; a cancellation or lost
+response also has an unknown outcome. There is no durable idempotency receipt
+or exactly-once delivery guarantee across broker restarts.
+
+Within one broker, simultaneous writes to the same configured destination,
+server and pane are rejected with `pane_busy`, including linked session
+memberships and aliases mapping to the identical destination string. Each
+dispatch owns that scope until SSH cleanup finishes. This is not an exclusive
+lease over a terminal: humans, other brokers, job scripts, or different SSH
+aliases for the same physical host can still write concurrently. Coordinate
+those writers separately. Timeouts must be greater than zero and at most
+30 seconds, using the same shared
+three-slot queue as inspection; input and output are never logged by tmuxgate.
+Text travels as hex-encoded bytes in SSH command arguments; this is encoding,
+not encryption from processes already trusted to inspect arguments.
 
 Machine names are exact logical aliases. `unknown_machine` responses include
 the configured aliases. `timeout` bounds how long that MCP call waits; it does

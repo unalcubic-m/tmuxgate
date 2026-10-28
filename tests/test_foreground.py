@@ -54,7 +54,7 @@ class ForegroundTests(unittest.TestCase):
         with broker_lock(self.state):
             pass
 
-    def test_foreground_serve_authenticates_and_keeps_the_four_tool_api(self) -> None:
+    def test_foreground_serve_authenticates_and_keeps_job_and_inspection_api(self) -> None:
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
@@ -90,7 +90,7 @@ class ForegroundTests(unittest.TestCase):
                 async with ClientSession(streams[0], streams[1]) as session:
                     await session.initialize()
                     tools = await session.list_tools()
-                    self.assertEqual({tool.name for tool in tools.tools}, {"run_argv", "run_script", "get_job", "list_jobs"})
+                    self.assertEqual({tool.name for tool in tools.tools}, {"run_argv", "run_script", "get_job", "list_jobs", "list_tmux_panes", "capture_tmux_pane", "send_tmux_text", "send_tmux_key"})
                     jobs = await session.call_tool("list_jobs", {})
                     self.assertEqual(jobs.structured_content, {"jobs": []})
 
