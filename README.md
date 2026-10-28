@@ -16,10 +16,16 @@ authenticated local MCP
 OpenSSH configuration owns hosts, users, ports, keys, ProxyJump, and host-key
 verification.
 
+The local broker supports Linux and native Windows. Remote targets remain
+Linux-only and require Bash, OpenSSH server, tar, tmux, and optionally sudo.
+Windows runs `tmuxgate serve` in the foreground; Windows service installation
+is deferred. See [Windows setup](docs/WINDOWS.md) for native paths and ACLs.
+
 ## Five-minute setup
 
-Requirements are Python 3.11 or newer, `ssh`, `tar`, and `tmux` on each remote
-machine. Configure and verify every destination with ordinary OpenSSH first.
+The following setup is for Linux. The local broker requires Python 3.11 or
+newer and OpenSSH client. Configure and verify every Linux destination with
+ordinary OpenSSH first; the broker requires an existing verified host key.
 
 ```bash
 git clone https://github.com/unalcubic-m/tmuxgate.git
@@ -125,6 +131,12 @@ session convincingly exists, and marks ambiguous possibly-started work
 `unknown`. It never automatically reruns such a job. One semaphore limits the
 whole service to three active or recovering jobs.
 
+On Windows, local state defaults to `%LOCALAPPDATA%\tmuxgate` and configuration
+to `%APPDATA%\tmuxgate\config.toml`. State directories, records, results,
+credentials, and the token use protected ACLs granting only the current user
+full access. Insecure existing ACLs are rejected. `--config` and `--state-dir`
+override the defaults on either platform; Linux keeps its XDG paths.
+
 The local stdout and stderr paths named in the JSON record remain available
 after an MCP client disconnect or service restart. The CLI can inspect them:
 
@@ -152,6 +164,8 @@ tmuxgate sudo clear MACHINE
 `sudo set` tests the entered value before saving it. Each machine has one
 owner-only file beneath `~/.local/state/tmuxgate/sudo/`; the directory is mode
 `0700` and files are mode `0600`.
+Windows uses protected owner-only ACLs for the same files. Passwords are
+stored as bytes protected by filesystem access control on both platforms.
 
 For `sudo=true`, tmuxgate first tries `sudo -n -- true`. Passwordless sudo uses
 `sudo -n`. Otherwise it validates the stored password and sends it only through
@@ -173,7 +187,10 @@ tmuxgate serve
 ```
 
 It always binds `127.0.0.1`, requires the owner-only bearer-token file, and
-logs through Python's standard logging module for journald capture. The unit
+holds a process lock on its state directory before recovery. A second broker
+using that directory fails; a crash releases the lock without deleting durable
+jobs. It logs through Python's standard logging module to stderr (journald
+captures this under systemd). The Linux unit
 explicitly removes inherited `TMUXGATE_MCP_TOKEN` and
 `TMUXGATE_BEARER_TOKEN` values before starting the server. It uses
 `KillMode=mixed` so a restart lets the server release SSH monitors gracefully;
@@ -209,6 +226,7 @@ The execution surface uses this small vocabulary:
 Standard OpenSSH host-key failure is fatal. tmuxgate does not accept host keys,
 build custom evidence, select alternate routes, or retry a possibly-started
 job.
+`StrictHostKeyChecking=yes` is explicit even if SSH configuration is permissive.
 
 ## Development
 

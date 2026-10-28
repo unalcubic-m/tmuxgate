@@ -41,6 +41,9 @@ class Config:
 
 def default_config_path(environ: dict[str, str] | None = None) -> Path:
     values = os.environ if environ is None else environ
+    if os.name == "nt":
+        base = Path(values["APPDATA"]) if values.get("APPDATA") else Path.home() / "AppData" / "Roaming"
+        return base / "tmuxgate" / "config.toml"
     base = values.get("XDG_CONFIG_HOME")
     if base:
         return Path(base) / "tmuxgate" / "config.toml"
@@ -49,6 +52,9 @@ def default_config_path(environ: dict[str, str] | None = None) -> Path:
 
 def default_state_dir(environ: dict[str, str] | None = None) -> Path:
     values = os.environ if environ is None else environ
+    if os.name == "nt":
+        base = Path(values["LOCALAPPDATA"]) if values.get("LOCALAPPDATA") else Path.home() / "AppData" / "Local"
+        return base / "tmuxgate"
     base = values.get("XDG_STATE_HOME")
     if base:
         return Path(base) / "tmuxgate"

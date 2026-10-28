@@ -35,6 +35,9 @@ clean the remote directory
 - `cli.py` defines only `serve`, `sudo set/test/clear`, and local `jobs`
   inspection.
 - `assets/remote_job.sh` is the complete remote result wrapper.
+- `storage.py` supplies protected files, durable atomic writes, and a broker
+  process lock. `windows_storage.py` implements its native Windows boundary
+  using pywin32; Linux retains POSIX ownership, modes, and directory fsync.
 
 ## Trust boundaries
 
@@ -50,6 +53,9 @@ into `run.sh`; passwords are not.
 
 OpenSSH is authoritative for hostnames, usernames, ports, identity files,
 ProxyJump, and known-host verification. A host-key verification error is fatal.
+The subprocess explicitly sets `StrictHostKeyChecking=yes`, `BatchMode=yes`,
+and no TTY. The local broker can run on Windows; remote command construction,
+paths, Bash wrapper, tmux, tar, UID/GID handling, and sudo remain Linux-only.
 
 Remote command output is untrusted data. Local result paths are derived only
 from a random hexadecimal job ID. Non-UTF-8 MCP output is base64 encoded.
@@ -80,6 +86,29 @@ The `Job` dataclass is the field authority. Initial publication is atomic and
 exclusive; every update writes a mode-`0600` temporary file, fsyncs it,
 atomically renames it, and fsyncs the jobs directory. Records with extra fields
 or non-derived paths are rejected.
+
+On Windows, configuration defaults to `%APPDATA%\tmuxgate\config.toml` and
+state to `%LOCALAPPDATA%\tmuxgate`; explicit CLI paths override both platforms'
+defaults. Windows requires a local fixed filesystem with persistent ACLs.
+Files and directories are created with a protected DACL granting the current
+token user SID full control, and that SID must own them. Existing broad,
+inherited, null, or unfamiliar ACLs are rejected rather than repaired. Secrets,
+job records, and result reads validate the same open handle's owner, DACL,
+type, reparse attributes, and single-link count. All reparse points, including
+ancestor junctions, are rejected. Ancestor handles deny delete sharing during
+operations so they cannot be replaced while paths are in use. File readers
+allow delete sharing so atomic replacement can proceed while an old handle is
+being read. Same-user processes and privileged OS administrators are trusted.
+
+Windows writes a private same-directory temporary file, flushes its contents
+with `FlushFileBuffers`, closes it, and publishes with
+`MoveFileEx(MOVEFILE_WRITE_THROUGH)`; initial publication omits
+`MOVEFILE_REPLACE_EXISTING`. Errors propagate; no cross-volume copy or ignored
+directory flush substitutes for durability. Linux continues to fsync contents,
+publish exclusively with a hard link or replace by rename, and fsync the
+containing directory. Result and credential publication now share these
+durability rules with job records. As with POSIX fsync, storage hardware and
+filesystem behavior bound crash guarantees.
 
 ## Remote lifecycle
 
@@ -128,6 +157,10 @@ duplicate execution when evidence is ambiguous.
 Service shutdown cancels only local SSH polling processes. It does not contact,
 kill, or clean the remote job; the durable `starting` or `running` record is
 left for conservative startup recovery.
+Subprocess creation is shielded so shutdown owns and reaps even a child whose
+native creation is still in flight. Cancellation terminates and drains the
+local SSH process, escalating to kill after a bounded wait; it never sends a
+remote job cancellation command.
 
 ## Whole-job sudo
 
@@ -141,6 +174,9 @@ SSH disconnects, unavailable sudo, and unsupported `requiretty` policies. A
 password-based start reads the credential again. Password bytes are passed only
 as SSH stdin and the bytearray is overwritten and cleared immediately after
 each subprocess completes.
+On Windows these stored bytes are protected by native owner-only ACLs instead
+of POSIX modes; they are not stored in environment variables or encrypted with
+a different credential backend.
 
 The remote normal user's UID and GID are obtained before sudo and passed as
 numeric wrapper arguments. The root `run.sh` changes stdout, stderr, exit-code,
@@ -163,6 +199,21 @@ server reads its credential only from the owner-only token file. `KillMode=mixed
 signals the server before its SSH monitor children, so graceful shutdown can
 leave running remote tmux jobs recoverable instead of misclassifying a killed
 local monitor as a remote failure.
+
+Before recovery, `serve` holds an exclusive `broker.lock` in its private state
+directory for the process lifetime. POSIX uses a nonblocking flock; Windows
+uses a validated native file handle with sharing disabled. A second broker
+fails before recovery even if configured for a different port. Exit or crash
+releases the lock without unlinking its name or changing job state. Native
+Windows initially supports foreground `serve` only; no service installation,
+SCM integration, or restart policy is provided. Ctrl+C follows the same local
+shutdown/recovery boundary. Standard asyncio's Windows Proactor loop supports
+the subprocess pipes; the broker does not select a Selector loop.
+
+Win32 design references: [CreateFile](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew),
+[GetSecurityInfo](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo),
+[persistent ACLs](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getvolumeinformationw),
+and [MoveFileEx](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw).
 
 Logging uses only the standard library. Records may contain job ID, machine,
 state, derived remote directory, error code, and bounded control-character-

@@ -24,6 +24,7 @@ from tmuxgate.executor import ExecutionError, RemoteExecutor, sudo_access
 from tmuxgate.jobs import JobStore, JobStoreError
 from tmuxgate.mcp import authenticated_app, load_bearer_token
 from tmuxgate.service import ExecutionService, job_view
+from tmuxgate.storage import broker_lock
 
 
 LOGGER = logging.getLogger(__name__)
@@ -74,6 +75,12 @@ def _paths(args: argparse.Namespace) -> tuple[Path | None, Path]:
 
 
 async def _serve(args: argparse.Namespace) -> int:
+    _config_path, state_dir = _paths(args)
+    with broker_lock(state_dir):
+        return await _serve_locked(args)
+
+
+async def _serve_locked(args: argparse.Namespace) -> int:
     config_path, state_dir = _paths(args)
     config = load_config(config_path)
     store = JobStore(state_dir)

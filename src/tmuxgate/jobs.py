@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
-import tempfile
 from typing import Any, Literal, cast
+
+from tmuxgate.storage import atomic_write, ensure_directory, read_private
 
 
 JobState = Literal["starting", "running", "complete", "failed", "unknown"]
@@ -92,8 +92,7 @@ class JobStore:
 
     @staticmethod
     def _ensure_directory(path: Path) -> None:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path.chmod(0o700)
+        ensure_directory(path)
 
     def create(self, job_id: str, machine: str, sudo: bool) -> Job:
         _validate_job_id(job_id)
@@ -129,36 +128,10 @@ class JobStore:
         payload = json.dumps(
             asdict(job), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8") + b"\n"
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{job.job_id}.", suffix=".tmp", dir=self.jobs_dir
-        )
-        temporary = Path(temporary_name)
         try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "wb", closefd=True) as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            path = self._path(job.job_id)
-            if exclusive:
-                try:
-                    os.link(temporary, path)
-                except FileExistsError as exc:
-                    raise JobStoreError(f"job already exists: {job.job_id}") from exc
-                temporary.unlink()
-            else:
-                os.replace(temporary, path)
-            directory_descriptor = os.open(self.jobs_dir, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
-        except BaseException:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+            atomic_write(self._path(job.job_id), payload, exclusive=exclusive)
+        except FileExistsError as exc:
+            raise JobStoreError(f"job already exists: {job.job_id}") from exc
         return job
 
     def update(self, job: Job, **changes: object) -> Job:
@@ -170,7 +143,7 @@ class JobStore:
     def load(self, job_id: str) -> Job:
         path = self._path(job_id)
         try:
-            job = _from_dict(json.loads(path.read_text(encoding="utf-8")))
+            job = _from_dict(json.loads(read_private(path).decode("utf-8")))
             result_dir = self.results_dir / job.job_id
             if (
                 job.remote_directory != f"~/.cache/tmuxgate/jobs/{job.job_id}"

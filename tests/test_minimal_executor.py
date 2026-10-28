@@ -18,6 +18,7 @@ from tmuxgate.jobs import Job, JobStore
 from tmuxgate.service import ExecutionService, job_view
 
 
+@unittest.skipIf(os.name == "nt", "executes the Linux remote shell wrapper")
 class MinimalExecutorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

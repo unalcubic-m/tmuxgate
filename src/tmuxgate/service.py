@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 from tmuxgate.config import Config
 from tmuxgate.executor import RemoteExecutor, _validate_request
 from tmuxgate.jobs import Job, JobStore
+from tmuxgate.storage import read_private
 
 
 LOGGER = logging.getLogger(__name__)
@@ -209,7 +210,7 @@ def job_view(job: Job, *, include_result: bool = True) -> dict[str, object]:
 
 
 def _output(path: Path) -> tuple[str, str]:
-    payload = path.read_bytes()
+    payload = read_private(path)
     try:
         return payload.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:

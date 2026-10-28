@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import stat
 import tempfile
 import unittest
 
 from tmuxgate.credentials import CredentialStore
+from tmuxgate.storage import read_private
 
 
 class CredentialStoreTests(unittest.TestCase):
@@ -15,8 +17,10 @@ class CredentialStoreTests(unittest.TestCase):
             store.save("machine/with/slashes", "secret value")
             path = store.path_for("machine/with/slashes")
             self.assertEqual(store.read("machine/with/slashes"), bytearray(b"secret value"))
-            self.assertEqual(stat.S_IMODE(store.directory.stat().st_mode), 0o700)
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(store.directory.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(read_private(path), b"secret value")
             self.assertEqual(len(list(store.directory.iterdir())), 1)
             self.assertTrue(store.clear("machine/with/slashes"))
             self.assertIsNone(store.read("machine/with/slashes"))

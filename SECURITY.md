@@ -9,10 +9,16 @@ passwords in public issues.
 tmuxgate accepts authenticated requests only on `127.0.0.1`. Protect
 `~/.local/state/tmuxgate/mcp-token` as mode `0600` and treat any process that
 can read it as authorized to execute on every configured machine.
+Windows uses `%LOCALAPPDATA%\tmuxgate\mcp-token` with a protected DACL granting
+only the owning current user full control. All local state, credentials, and
+results use these ACLs instead of POSIX modes. Broad or inherited ACLs,
+reparse points, hardlinked files, and storage without persistent ACLs fail
+closed. See [Windows security and setup](docs/WINDOWS.md).
 
 Machine mappings are exact OpenSSH destinations. OpenSSH remains authoritative
 for keys, usernames, ports, ProxyJump, and known-host verification. tmuxgate
 never accepts a new host key or selects a fallback endpoint.
+`StrictHostKeyChecking=yes` is enforced even with permissive user SSH settings.
 
 Every job has a random local ID, one derived remote directory, and one derived
 remote tmux session. Unknown or ambiguous recovery evidence is fail-closed:
@@ -42,6 +48,13 @@ journalctl --user -u tmuxgate -n 200 --no-pager
 
 Logs may contain sanitized remote error text and job metadata. Avoid placing
 secrets in command output when possible.
+
+Windows runs the foreground broker as the ordinary user; Windows service
+installation is deferred. On both platforms a state-directory lock prevents
+concurrent recovery by multiple brokers. Same-user processes and privileged
+administrators remain within the trust boundary. Local Windows support does
+not enable Windows remote execution. Source development and CI use fake SSH
+and synthetic credentials; live host access is separate operational work.
 
 ## Security support
 

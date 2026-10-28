@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import tempfile
 from typing import Any, cast
 import unittest
@@ -112,6 +113,7 @@ class McpSurfaceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TokenTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Windows ACL rejection is tested in test_windows_storage")
     def test_token_file_must_be_owner_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)

@@ -37,11 +37,13 @@ async def run(
     environment = os.environ.copy()
     environment.pop("TMUXGATE_MCP_TOKEN", None)
     environment.pop("TMUXGATE_BEARER_TOKEN", None)
-    process = await asyncio.create_subprocess_exec(
+    launch = asyncio.create_task(asyncio.create_subprocess_exec(
         "ssh",
         "-T",
         "-o",
         "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
         "--",
         destination,
         remote_command(arguments),
@@ -53,28 +55,43 @@ async def run(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=environment,
-    )
+    ))
+    try:
+        process = await asyncio.shield(launch)
+    except asyncio.CancelledError:
+        # Cancellation can arrive while the native subprocess is still being
+        # created. Retain ownership until it can be reaped, including on Windows.
+        try:
+            process = await launch
+        except Exception:
+            raise asyncio.CancelledError from None
+        await _stop(process)
+        raise
     try:
         stdout, stderr = await process.communicate(input_data)
     except asyncio.CancelledError:
-        if process.returncode is None:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
-        try:
-            await asyncio.wait_for(process.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            await process.wait()
+        await _stop(process)
         raise
     returncode = process.returncode
     if returncode is None:
         raise RuntimeError("SSH subprocess ended without a return code")
     return SSHResult(returncode, stdout, stderr)
+
+
+async def _stop(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(process.communicate(), timeout=2)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.communicate()
 
 
 def sanitize_stderr(stderr: bytes, limit: int = 2000) -> str:

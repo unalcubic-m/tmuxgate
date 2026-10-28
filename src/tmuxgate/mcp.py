@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hmac
-import os
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +13,7 @@ from mcp.types import ToolAnnotations
 from tmuxgate import __version__
 from tmuxgate.config import UnknownMachineError
 from tmuxgate.service import ExecutionService, job_view
+from tmuxgate.storage import read_private
 
 
 MAX_MCP_REQUEST_BYTES = 24 * 1024 * 1024
@@ -60,13 +60,10 @@ class BearerAuthMiddleware:
 def load_bearer_token(state_dir: Path | str) -> str:
     path = Path(state_dir) / "mcp-token"
     try:
-        status = path.stat(follow_symlinks=False)
-        if not path.is_file() or status.st_uid != os.getuid() or status.st_mode & 0o077:
-            raise ValueError(f"MCP token must be an owner-only regular file: {path}")
-        token = path.read_text(encoding="ascii").strip()
+        token = read_private(path).decode("ascii").strip()
     except FileNotFoundError as exc:
         raise ValueError(
-            f"MCP token not found: {path}; create it with mode 0600"
+            f"MCP token not found: {path}; create an owner-only token file"
         ) from exc
     except (OSError, UnicodeError) as exc:
         raise ValueError(f"cannot read MCP token {path}: {exc}") from exc
