@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
 
@@ -15,7 +16,7 @@ from tmuxgate.mcp import load_bearer_token
 from tmuxgate.service import job_view
 from tmuxgate.storage import atomic_write, ensure_directory, read_private
 
-if os.name == "nt":
+if TYPE_CHECKING or os.name == "nt":
     import pywintypes
     import win32con
     import win32file

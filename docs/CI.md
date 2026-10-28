@@ -19,7 +19,8 @@ The quality job runs:
 
 ```bash
 ruff check src tests
-pyright
+pyright --pythonplatform Linux
+pyright --pythonplatform Windows
 shellcheck src/tmuxgate/assets/remote_job.sh
 coverage combine
 coverage report
