@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
-import tempfile
+
+from tmuxgate.storage import atomic_write, ensure_directory, read_private, remove_private
 
 
 class CredentialError(RuntimeError):
@@ -14,9 +14,10 @@ class CredentialError(RuntimeError):
 
 class CredentialStore:
     def __init__(self, state_dir: Path | str) -> None:
-        self.directory = Path(state_dir) / "sudo"
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.directory.chmod(0o700)
+        state = Path(state_dir)
+        ensure_directory(state)
+        self.directory = state / "sudo"
+        ensure_directory(self.directory)
 
     def path_for(self, machine: str) -> Path:
         digest = hashlib.sha256(machine.encode("utf-8")).hexdigest()
@@ -25,12 +26,7 @@ class CredentialStore:
     def read(self, machine: str) -> bytearray | None:
         path = self.path_for(machine)
         try:
-            status = path.stat(follow_symlinks=False)
-            if not path.is_file() or status.st_uid != os.getuid():
-                raise CredentialError(f"unsafe sudo credential file for {machine}")
-            if status.st_mode & 0o077:
-                raise CredentialError(f"sudo credential file for {machine} is not mode 0600")
-            value = bytearray(path.read_bytes())
+            value = bytearray(read_private(path))
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -47,29 +43,16 @@ class CredentialStore:
             value = bytes(password)
         if not value or b"\x00" in value or b"\n" in value or b"\r" in value:
             raise CredentialError("sudo password must be non-empty and single-line")
-        descriptor, name = tempfile.mkstemp(prefix=".credential.", dir=self.directory)
-        temporary = Path(name)
         try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "wb", closefd=True) as handle:
-                handle.write(value)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path_for(machine))
-            self.path_for(machine).chmod(0o600)
-        except BaseException:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+            atomic_write(self.path_for(machine), value)
+        except OSError as exc:
+            raise CredentialError(f"cannot store sudo credential for {machine}: {exc}") from exc
 
     def clear(self, machine: str) -> bool:
         try:
-            self.path_for(machine).unlink()
-            return True
-        except FileNotFoundError:
-            return False
+            return remove_private(self.path_for(machine))
+        except OSError as exc:
+            raise CredentialError(f"cannot clear sudo credential for {machine}: {exc}") from exc
 
 
 def _erase(value: bytearray | None) -> None:

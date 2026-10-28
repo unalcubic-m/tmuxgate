@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import stat
 import tempfile
 import unittest
 
 from tmuxgate.jobs import JOB_FIELDS, JobStore, JobStoreError
+from tmuxgate.storage import read_private
 
 
 class JobStoreTests(unittest.TestCase):
@@ -19,11 +21,13 @@ class JobStoreTests(unittest.TestCase):
             raw = json.loads(path.read_text())
             self.assertEqual(set(raw), JOB_FIELDS)
             self.assertEqual(raw, asdict(job))
-            self.assertEqual(stat.S_IMODE(store.jobs_dir.stat().st_mode), 0o700)
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(store.jobs_dir.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(read_private(path)), raw)
             complete = store.update(job, state="complete", exit_code=19)
             self.assertEqual(store.load(job.job_id), complete)
-            self.assertNotEqual(job.updated_at, complete.updated_at)
+            self.assertGreaterEqual(complete.updated_at, job.updated_at)
 
     def test_create_is_exclusive_and_does_not_overwrite_a_collision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

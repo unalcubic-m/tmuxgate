@@ -17,6 +17,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: System Administrators",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -27,6 +28,7 @@ classifiers = [
 dependencies = [
     "mcp==2.0.0",
     "uvicorn==0.52.0",
+    "pywin32==312; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -67,6 +69,10 @@ reportMissingImports = false
 [tool.coverage.run]
 branch = true
 source = ["tmuxgate"]
+relative_files = true
+
+[tool.coverage.paths]
+source = ["src/tmuxgate", "*/src/tmuxgate", '*\src\tmuxgate']
 
 [tool.coverage.report]
 fail_under = 75

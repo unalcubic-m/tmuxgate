@@ -12,8 +12,10 @@ import secrets
 from typing import Any, Mapping, Sequence
 
 from tmuxgate.config import Config
+from tmuxgate import pane_input, panes
 from tmuxgate.executor import RemoteExecutor, _validate_request
 from tmuxgate.jobs import Job, JobStore
+from tmuxgate.storage import read_private
 
 
 LOGGER = logging.getLogger(__name__)
@@ -33,6 +35,7 @@ class ExecutionService:
         self._semaphore = asyncio.Semaphore(CONCURRENCY)
         self._tasks: set[asyncio.Task[Job]] = set()
         self._closing = False
+        self._pane_writers: set[tuple[str, str, str]] = set()
 
     async def start(self) -> None:
         for job in self.store.recoverable():
@@ -178,6 +181,87 @@ class ExecutionService:
             sudo=sudo,
         )
 
+    async def list_tmux_panes(self, machine: str, timeout: float = panes.DEFAULT_TIMEOUT) -> dict[str, object]:
+        destination = self.config.destination(machine)
+        panes.validate_timeout(timeout)
+        if self._closing:
+            raise RuntimeError("execution service is shutting down")
+        try:
+            async with asyncio.timeout(timeout):
+                async with self._semaphore:
+                    inventory = await panes.list_panes(destination)
+            return {"machine": machine, "panes": [pane.view() for pane in inventory]}
+        except TimeoutError as exc:
+            raise panes.PaneError("inspection_timeout", "tmux inspection timed out") from exc
+
+    async def capture_tmux_pane(
+        self, machine: str, server_id: str, session_id: str, window_id: str,
+        pane_id: str, lines: int = 200, timeout: float = panes.DEFAULT_TIMEOUT,
+    ) -> dict[str, object]:
+        destination = self.config.destination(machine)
+        panes.validate_target(server_id, session_id, window_id, pane_id, lines)
+        panes.validate_timeout(timeout)
+        if self._closing:
+            raise RuntimeError("execution service is shutting down")
+        try:
+            async with asyncio.timeout(timeout):
+                async with self._semaphore:
+                    view = await panes.capture_pane(destination, server_id, session_id, window_id, pane_id, lines)
+            return {"machine": machine, **view}
+        except TimeoutError as exc:
+            raise panes.PaneError("inspection_timeout", "tmux inspection timed out") from exc
+
+    async def _send_tmux_input(
+        self, machine: str, server_id: str, session_id: str, window_id: str,
+        pane_id: str, pane_pid: int, keys: str, *, literal: bool, submit: bool,
+        timeout: float,
+    ) -> dict[str, object]:
+        destination = self.config.destination(machine)
+        panes.validate_target(server_id, session_id, window_id, pane_id, 1)
+        pane_input.validate_pid(pane_pid)
+        panes.validate_timeout(timeout)
+        if self._closing:
+            raise RuntimeError("execution service is shutting down")
+        # Linked session memberships and duplicate logical aliases for the same
+        # configured destination must share one local writer scope.
+        scope = (destination, server_id, pane_id)
+        identity = {"machine": machine, "server_id": server_id, "session_id": session_id,
+                    "window_id": window_id, "pane_id": pane_id, "pane_pid": pane_pid}
+        if scope in self._pane_writers:
+            return {**identity, **pane_input.outcome("not_sent", "pane_busy")}
+        self._pane_writers.add(scope)
+        dispatch = pane_input.Dispatch()
+        try:
+            async with asyncio.timeout(timeout):
+                async with self._semaphore:
+                    answer = await pane_input.send(destination, server_id, session_id, window_id, pane_id, pane_pid, keys,
+                                                   literal=literal, submit=submit, dispatch=dispatch)
+            return {**identity, **answer}
+        except TimeoutError:
+            answer = pane_input.outcome("unknown", "dispatch_unknown") if dispatch.started else pane_input.outcome("not_sent", "input_timeout")
+            return {**identity, **answer}
+        except panes.PaneError as exc:
+            return {**identity, **pane_input.outcome("not_sent", exc.code), "error_detail": exc.detail}
+        finally:
+            self._pane_writers.discard(scope)
+
+    async def send_tmux_text(
+        self, machine: str, server_id: str, session_id: str, window_id: str,
+        pane_id: str, pane_pid: int, text: str, multiline: bool = False,
+        submit: bool = False, timeout: float = panes.DEFAULT_TIMEOUT,
+    ) -> dict[str, object]:
+        keys = pane_input.text_keys(text, multiline, submit)
+        return await self._send_tmux_input(machine, server_id, session_id, window_id, pane_id, pane_pid, keys,
+                                           literal=True, submit=submit, timeout=timeout)
+
+    async def send_tmux_key(
+        self, machine: str, server_id: str, session_id: str, window_id: str,
+        pane_id: str, pane_pid: int, key: str, timeout: float = panes.DEFAULT_TIMEOUT,
+    ) -> dict[str, object]:
+        pane_input.validate_key(key)
+        return await self._send_tmux_input(machine, server_id, session_id, window_id, pane_id, pane_pid, key,
+                                           literal=False, submit=False, timeout=timeout)
+
     def get_job(self, job_id: str) -> Job:
         return self.store.load(job_id)
 
@@ -209,7 +293,7 @@ def job_view(job: Job, *, include_result: bool = True) -> dict[str, object]:
 
 
 def _output(path: Path) -> tuple[str, str]:
-    payload = path.read_bytes()
+    payload = read_private(path)
     try:
         return payload.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:

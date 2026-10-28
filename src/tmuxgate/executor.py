@@ -7,16 +7,15 @@ from dataclasses import dataclass
 import importlib.resources
 import io
 import logging
-import os
 from pathlib import Path
 import re
 import shlex
 import tarfile
-import tempfile
 from typing import Literal, Mapping, Sequence
 
 from tmuxgate.credentials import CredentialStore, _erase
 from tmuxgate.jobs import Job, JobStore
+from tmuxgate.storage import atomic_write
 from tmuxgate import ssh
 
 
@@ -527,20 +526,4 @@ def _read_result_archive(payload: bytes) -> CollectedResult:
 
 
 def _atomic_output(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
-    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    atomic_write(path, payload)

@@ -1,6 +1,6 @@
 # Architecture
 
-tmuxgate implements one execution path:
+tmuxgate implements one job execution path:
 
 ```text
 load config
@@ -30,11 +30,19 @@ clean the remote directory
   whole-job sudo, polls, collects, and cleans.
 - `service.py` owns startup recovery, background task lifetime, and the single
   `asyncio.Semaphore(3)`.
-- `mcp.py` defines exactly `run_argv`, `run_script`, `get_job`, and `list_jobs`
+- `mcp.py` defines `run_argv`, `run_script`, `get_job`, `list_jobs`,
+  `list_tmux_panes`, `capture_tmux_pane`, `send_tmux_text`, and `send_tmux_key`
   plus the bearer guard.
+- `panes.py` inspects existing panes directly over SSH without creating jobs,
+  scripts, remote directories, sessions, or local durable records.
+- `pane_input.py` validates bounded literal text or one allowlisted key and
+  dispatches it behind an immediate tmux-side identity guard, without retries.
 - `cli.py` defines only `serve`, `sudo set/test/clear`, and local `jobs`
   inspection.
 - `assets/remote_job.sh` is the complete remote result wrapper.
+- `storage.py` supplies protected files, durable atomic writes, and a broker
+  process lock. `windows_storage.py` implements its native Windows boundary
+  using pywin32; Linux retains POSIX ownership, modes, and directory fsync.
 
 ## Trust boundaries
 
@@ -50,9 +58,87 @@ into `run.sh`; passwords are not.
 
 OpenSSH is authoritative for hostnames, usernames, ports, identity files,
 ProxyJump, and known-host verification. A host-key verification error is fatal.
+The subprocess explicitly sets `StrictHostKeyChecking=yes`, `BatchMode=yes`,
+and no TTY. The local broker can run on Windows; remote command construction,
+paths, Bash wrapper, tmux, tar, UID/GID handling, and sudo remain Linux-only.
 
 Remote command output is untrusted data. Local result paths are derived only
 from a random hexadecimal job ID. Non-UTF-8 MCP output is base64 encoded.
+
+### Existing-pane read boundary
+
+Read-only inspection shares the configured alias lookup, bearer guard, sole
+OpenSSH helper, and three-slot semaphore with jobs. Its total timeout includes
+waiting for a slot; no background durable task or retry is created. SSH streams
+are read concurrently under a combined 64 KiB budget, with overflow terminating
+and reaping only the local SSH child. Existing job output collection is unchanged.
+
+Discovery runs `tmux -u list-panes -a` with a fixed numeric-only format. It
+never interpolates a session name, window name, title, or application output.
+IDs are strictly validated before use. `server_id` combines tmux server PID and
+start time to detect ordinary server restarts; IDs are not eternal capabilities
+or a cryptographic generation identity (PID/time reuse remains an OS limitation).
+Linked windows retain every session membership. Duplicate rows, inconsistent
+server identities, malformed metadata, and excessive inventories fail closed.
+
+Capture requires all four IDs, re-lists to check exact membership, then uses one
+tmux command queue with server/window/pane metadata before and after
+`capture-pane -p`. A final inventory check verifies membership again before any
+text is returned. Any mismatch discards the captured output; it never selects
+the first or active pane as a fallback. Concurrent application output and
+topology changes are not locked; this is an observation, not an atomic snapshot.
+tmux's `-p` writes stdout rather than creating a paste buffer. No input, attach,
+selection, interrupt, resize, kill, cleanup, or sudo operation is involved.
+Only the remote user's default socket is supported.
+
+Pane text is not logged or persisted. UTF-8 is decoded with replacement and
+terminal/bidi controls are escaped before returning explicitly untrusted text.
+It must never be interpreted as instructions or permission. The same bearer
+token grants both existing command execution and inspection; this release does
+not introduce per-tool authorization or a restricted read-only principal.
+See the [tmux manual](https://man.openbsd.org/tmux) for format IDs and capture
+semantics, and the README for the bounded inspection API.
+
+### Existing-pane write boundary
+
+Input requires the same explicit IDs plus discovery's `pane_pid` to detect
+ordinary pane respawns. The service validates all values before SSH, reserves
+an in-memory writer scope keyed by configured destination/server/pane (not
+session membership), and rejects a concurrent caller instead of queueing it.
+The existing three-slot semaphore and positive, at most 30-second deadline apply. Identical
+destination strings share the scope; different aliases that resolve to the
+same host do not. No distributed lock or lock against a human terminal exists.
+Text plus optional final Enter occupy one dispatch; separate tool calls have
+no transaction/lease across them.
+
+A fresh inventory validates exact membership and process ID. A single tmux
+`if-shell -F` then compares server PID/start time, exact session/window/pane IDs,
+pane process ID, liveness and absence of a tmux mode immediately before the
+send in the same server command queue. `-F` evaluates a fixed format, not a
+shell command. Any false guard takes only the rejection branch. Input is never
+redirected to an active, first, named or replacement pane. OS PID/start-time
+reuse is not a cryptographic generation identity; externally changing tmux
+topology or custom hooks remains outside the broker's exclusive control.
+
+Literal text is UTF-8 encoded under a 4096-byte limit and converted to numeric
+hex arguments for `send-keys -H`. No user text is parsed as shell or tmux code.
+Controls are rejected except LF with explicit `multiline=true`; raw LF may
+execute shell lines, independently of the explicit optional final Enter.
+Key events come from a fixed allowlist and cannot inject options or sequences.
+No clipboard/paste buffer, remote script/file, attach, select, resize, or
+session-kill operation is involved in the input API.
+
+Once mutation SSH starts, any lost/invalid acknowledgement, nonzero exit,
+output overflow, exception or timeout is `unknown`, never safe-to-retry.
+A guard rejection or preflight failure is `not_sent`; a clean fixed receipt
+is `sent`, confirming tmux command acceptance only. Local cancellation reaps
+SSH but cannot retract already sent bytes. No automatic replay, rollback,
+durable input queue or exactly-once claim is provided. A cancelled MCP caller
+or broker crash must treat an absent receipt as unknown too. Input and pane
+text are not persisted or logged; numeric encoding remains visible to trusted
+processes that can inspect argv. The bearer guard is unchanged and confers no
+per-tool roles: caller authorization for the precise target/action is still
+required, and terminal output never grants it or proves Codex readiness.
 
 ## Job identity and storage
 
@@ -80,6 +166,29 @@ The `Job` dataclass is the field authority. Initial publication is atomic and
 exclusive; every update writes a mode-`0600` temporary file, fsyncs it,
 atomically renames it, and fsyncs the jobs directory. Records with extra fields
 or non-derived paths are rejected.
+
+On Windows, configuration defaults to `%APPDATA%\tmuxgate\config.toml` and
+state to `%LOCALAPPDATA%\tmuxgate`; explicit CLI paths override both platforms'
+defaults. Windows requires a local fixed filesystem with persistent ACLs.
+Files and directories are created with a protected DACL granting the current
+token user SID full control, and that SID must own them. Existing broad,
+inherited, null, or unfamiliar ACLs are rejected rather than repaired. Secrets,
+job records, and result reads validate the same open handle's owner, DACL,
+type, reparse attributes, and single-link count. All reparse points, including
+ancestor junctions, are rejected. Ancestor handles deny delete sharing during
+operations so they cannot be replaced while paths are in use. File readers
+allow delete sharing so atomic replacement can proceed while an old handle is
+being read. Same-user processes and privileged OS administrators are trusted.
+
+Windows writes a private same-directory temporary file, flushes its contents
+with `FlushFileBuffers`, closes it, and publishes with
+`MoveFileEx(MOVEFILE_WRITE_THROUGH)`; initial publication omits
+`MOVEFILE_REPLACE_EXISTING`. Errors propagate; no cross-volume copy or ignored
+directory flush substitutes for durability. Linux continues to fsync contents,
+publish exclusively with a hard link or replace by rename, and fsync the
+containing directory. Result and credential publication now share these
+durability rules with job records. As with POSIX fsync, storage hardware and
+filesystem behavior bound crash guarantees.
 
 ## Remote lifecycle
 
@@ -128,6 +237,10 @@ duplicate execution when evidence is ambiguous.
 Service shutdown cancels only local SSH polling processes. It does not contact,
 kill, or clean the remote job; the durable `starting` or `running` record is
 left for conservative startup recovery.
+Subprocess creation is shielded so shutdown owns and reaps even a child whose
+native creation is still in flight. Cancellation terminates and drains the
+local SSH process, escalating to kill after a bounded wait; it never sends a
+remote job cancellation command.
 
 ## Whole-job sudo
 
@@ -141,6 +254,9 @@ SSH disconnects, unavailable sudo, and unsupported `requiretty` policies. A
 password-based start reads the credential again. Password bytes are passed only
 as SSH stdin and the bytearray is overwritten and cleared immediately after
 each subprocess completes.
+On Windows these stored bytes are protected by native owner-only ACLs instead
+of POSIX modes; they are not stored in environment variables or encrypted with
+a different credential backend.
 
 The remote normal user's UID and GID are obtained before sudo and passed as
 numeric wrapper arguments. The root `run.sh` changes stdout, stderr, exit-code,
@@ -163,6 +279,21 @@ server reads its credential only from the owner-only token file. `KillMode=mixed
 signals the server before its SSH monitor children, so graceful shutdown can
 leave running remote tmux jobs recoverable instead of misclassifying a killed
 local monitor as a remote failure.
+
+Before recovery, `serve` holds an exclusive `broker.lock` in its private state
+directory for the process lifetime. POSIX uses a nonblocking flock; Windows
+uses a validated native file handle with sharing disabled. A second broker
+fails before recovery even if configured for a different port. Exit or crash
+releases the lock without unlinking its name or changing job state. Native
+Windows initially supports foreground `serve` only; no service installation,
+SCM integration, or restart policy is provided. Ctrl+C follows the same local
+shutdown/recovery boundary. Standard asyncio's Windows Proactor loop supports
+the subprocess pipes; the broker does not select a Selector loop.
+
+Win32 design references: [CreateFile](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew),
+[GetSecurityInfo](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo),
+[persistent ACLs](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getvolumeinformationw),
+and [MoveFileEx](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw).
 
 Logging uses only the standard library. Records may contain job ID, machine,
 state, derived remote directory, error code, and bounded control-character-

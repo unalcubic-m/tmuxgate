@@ -17,15 +17,11 @@ from tmuxgate.credentials import CredentialStore
 class CliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.config = self.root / "config.toml"
         self.config.write_text('[machines]\nmachine = "machine"\n', encoding="utf-8")
         self.state = self.root / "state"
-        self.remote = FakeRemote(self.root / "fake")
-
-    def tearDown(self) -> None:
-        self.remote.stop()
-        self.temporary.cleanup()
 
     def arguments(self, *values: str) -> list[str]:
         return [
@@ -59,8 +55,11 @@ class CliTests(unittest.TestCase):
         )
         self.assertFalse(self.state.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX remote shell integration runs on Linux")
     def test_sudo_set_test_and_clear(self) -> None:
-        environment = self.remote.environment(sudo_mode="password")
+        remote = FakeRemote(self.root / "fake")
+        self.addCleanup(remote.stop)
+        environment = remote.environment(sudo_mode="password")
         with patch.dict(os.environ, environment, clear=False), patch(
             "getpass.getpass", return_value="correct horse"
         ), redirect_stdout(io.StringIO()):

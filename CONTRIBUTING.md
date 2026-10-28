@@ -31,3 +31,11 @@ Keep commits narrow with imperative subjects. Pull requests should explain
 behavior, security effects, deletion impact, tests, and any real-machine checks.
 Update `docs/ARCHITECTURE.md` whenever execution lifecycle, job recovery,
 credential handling, or authentication changes.
+
+For native Windows commands and security prerequisites, see
+[docs/WINDOWS.md](docs/WINDOWS.md). Run unittest discovery using the installed
+package; no POSIX PYTHONPATH syntax is needed. Linux remote-shell integration
+remains Linux-only; portable process tests and real Windows ACL tests must
+cover broker changes. CI combines Linux and Windows coverage before enforcing
+the coverage gate. Never use live hosts or operational credentials for source
+development.
